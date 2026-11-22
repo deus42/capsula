@@ -138,6 +138,8 @@ function sendFile(res: http.ServerResponse, file: string, cache = 'no-cache', re
 }
 
 const secureCookies = Boolean(authConfig?.baseURL.startsWith('https://'));
+/** Accounts mode: `www.` of the site's own host is sent to the site itself, so sign-in cookies stay on one host. */
+const WWW_HOST = authConfig ? `www.${new URL(authConfig.baseURL).host}` : null;
 // Accounts mode only: sign-in and uploads are rate-limited.
 const rateLimiter = ACCOUNTS ? createRateLimiter() : null;
 const TRUST_CLOUDFLARE = process.env.TRUST_PROXY === 'cloudflare';
@@ -280,6 +282,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   const url = new URL(req.url ?? '/', 'http://local');
   const method = req.method ?? 'GET';
   if (ACCOUNTS) for (const [name, value] of SECURITY_HEADERS) res.setHeader(name, value);
+  if (WWW_HOST && req.headers.host?.toLowerCase() === WWW_HOST) {
+    res.writeHead(301, { location: `${authConfig!.baseURL}${url.pathname}${url.search}`, 'cache-control': 'public, max-age=3600' });
+    return void res.end();
+  }
   // Uptime checks and the container health check: no data, no sign-in.
   if (url.pathname === '/health') return send(res, 200, { ok: true });
   if (!ACCOUNTS) {

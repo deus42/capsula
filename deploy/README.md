@@ -18,26 +18,34 @@ separate Mac pulls and encrypts. `user@server` below stands for an SSH login ove
    `sudo chmod 600` it. Production refuses to start without the OAuth client and `BETTER_AUTH_SECRET`. Without an
    OpenAI key it also needs `OWNER_EMAIL` and a closed `SIGNUP`; with one, the model names, `OPENAI_PRICES` and
    `MONTHLY_BUDGET_USD`.
-3. Tunnel: add an ingress rule `capsula.fit → http://127.0.0.1:4317` to the host's Cloudflare Tunnel. The
-   container publishes its port on loopback only; `TRUST_PROXY=cloudflare` lets the rate limits see the visitor's
-   address.
+3. Tunnel: add ingress rules `capsula.fit` and `www.capsula.fit → http://127.0.0.1:4317` to the host's Cloudflare
+   Tunnel and route both names to it. The app sends `www.` to the site itself. The container publishes its port on
+   loopback only; `TRUST_PROXY=cloudflare` lets the rate limits see the visitor's address.
 4. Snapshots: install [`capsula-backup.service`](capsula-backup.service) and
    [`capsula-backup.timer`](capsula-backup.timer) into `/etc/systemd/system`, then
    `sudo systemctl daemon-reload && sudo systemctl enable --now capsula-backup.timer`. `sqlite3` must be installed.
    The first deploy installs the script the service runs.
-5. The image is public on GHCR once its package visibility is set to public after the first push; otherwise run
+5. Health checks: install [`capsula-monitor.service`](capsula-monitor.service) and
+   [`capsula-monitor.timer`](capsula-monitor.timer) the same way and enable the timer. Every 5 minutes it checks the
+   container's health, the public `/health`, the newest snapshot (30 hours at most) and free disk space (2 GB at
+   least). A problem seen twice in a row is reported once, and so is the recovery, through `CAPSULA_ALERT_COMMAND`
+   in `/etc/capsula/monitor.env`: any command that reads `{"title", "body"}` JSON on stdin and sends it on. Without
+   a command it only writes to the journal.
+6. The image is public on GHCR once its package visibility is set to public after the first push; otherwise run
    `docker login ghcr.io` on the server with a read-only token.
 
 ## Deploy
 
-From a clean checkout on the Mac, logged in to GHCR with a token that can write packages:
+After the checks pass on `main`, CI builds `linux/amd64` and publishes `ghcr.io/deus42/capsula:sha-<commit>`
+(job «Container image»). Then, from a clean checkout at that pushed commit:
 
 ```sh
-DOCKER_CONTEXT=colima scripts/deploy.sh user@server
+scripts/deploy.sh user@server
 ```
 
-It builds `linux/amd64`, pushes `ghcr.io/deus42/capsula:sha-<commit>`, installs `compose.yaml` and the backup
-script, pulls that exact image, restarts and waits for `/health`; an unhealthy start goes back to the previous tag.
+It installs `compose.yaml` and the backup and monitor scripts, pulls that exact image, restarts and waits for
+`/health`; an unhealthy start goes back to the previous tag. To build on the Mac instead (logged in to GHCR with a
+token that can write packages): `CAPSULA_BUILD=local DOCKER_CONTEXT=colima scripts/deploy.sh user@server`.
 
 ## AI without an API key
 

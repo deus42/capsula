@@ -1,0 +1,9 @@
+[Unit]
+Description=Check Capsula every 5 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/5:00
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

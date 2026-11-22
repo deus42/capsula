@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Capsula: container health, public address, newest snapshot, free disk
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+# Optional settings, e.g. CAPSULA_ALERT_COMMAND (deploy/capsula-monitor.sh).
+EnvironmentFile=-/etc/capsula/monitor.env
+ExecStart=/usr/local/sbin/capsula-monitor

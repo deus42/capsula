@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
+import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { testAccounts, TEST_EMAIL_DOMAIN } from './test-accounts.ts';
@@ -154,6 +155,17 @@ function ownerLink(dir: string, base: string) {
   return { link, done: () => { db.prepare('DELETE FROM test_account WHERE userId = ?').run(row.id); db.close(); } };
 }
 
+/** A GET with a chosen Host header (fetch cannot set one): status and Location. */
+function getWithHost(base: string, pathname: string, host: string): Promise<{ status: number; location?: string }> {
+  return new Promise((resolve, reject) => {
+    const u = new URL(pathname, base);
+    http.get({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, headers: { host } }, (res) => {
+      res.resume();
+      resolve({ status: res.statusCode ?? 0, location: res.headers.location });
+    }).on('error', reject);
+  });
+}
+
 test('CODEX_ACCESS=accounts: the owner\'s subscription serves invited accounts too, so invites work', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capsula-shared-'));
   const { base, child } = await startServer(dir, { CODEX_ACCESS: 'accounts' });
@@ -167,6 +179,9 @@ test('CODEX_ACCESS=accounts: the owner\'s subscription serves invited accounts t
     assert.equal(res.status, 200);
     const invite = await fetch(`${base}/i/${(await res.json()).code}`, { redirect: 'manual' });
     assert.equal(invite.headers.get('location'), '/?invite=1', 'the invite link admits its holder to Google sign-up');
+    const www = await getWithHost(base, '/privacy?lang=en', `www.${new URL(base).host}`);
+    assert.deepEqual(www, { status: 301, location: `${base}/privacy?lang=en` }, 'www goes to the site itself, path and query kept');
+    assert.equal((await getWithHost(base, '/health', new URL(base).host)).status, 200);
   } finally {
     child.kill();
   }

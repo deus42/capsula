@@ -1,6 +1,7 @@
 /**
  * /privacy and /terms: one quiet page each, Ukrainian and English, open without signing in.
- * Facts here must match the running service: cookies (auth.ts, index.ts), processors (openai-engine.ts), deletion
+ * Facts here must match the running service: cookies (auth.ts, index.ts), the AI processor (capsula.fit runs Codex on
+ * the owner's ChatGPT account with model training turned off; openai-engine.ts with an API key), deletion
  * (DELETE /api/account) and the backup retention set at deployment (7 daily and 4 weekly copies).
  */
 type Lang = 'uk' | 'en';
@@ -8,12 +9,13 @@ interface Section { title: string; body: string[] }
 interface Doc { title: string; updated: string; sections: Section[] }
 
 const CONTACT = 'hello@capsula.fit';
-const OPENAI_DATA = 'https://developers.openai.com/api/docs/guides/your-data';
+const CONTROLLER = 'Oleksii Gapchenko';
+const OPENAI_DATA = 'https://help.openai.com/en/articles/7730893-data-controls-faq';
 
 const PRIVACY: Record<Lang, Doc> = {
   uk: {
     title: 'Приватність',
-    updated: 'Оновлено 20 листопада 2026',
+    updated: 'Оновлено 22 листопада 2026',
     sections: [
       { title: 'Що ми зберігаємо', body: [
         'Вхід через Google: ім’я, email і адресу фото профілю. Токенів доступу Google ми не зберігаємо.',
@@ -27,7 +29,7 @@ const PRIVACY: Record<Lang, Doc> = {
         'Обличчя й статура для примірок беруться лише з твоїх власних фото, ніколи зі згенерованих.',
       ] },
       { title: 'Хто ще бачить дані', body: [
-        `OpenAI: фото й текст, потрібні для розпізнавання, підбору й примірок, надсилаються в OpenAI API. За правилами OpenAI дані API не використовуються для навчання моделей, а журнали контролю зловживань зберігаються до 30 днів (${OPENAI_DATA}).`,
+        `OpenAI: фото й текст, потрібні для розпізнавання, підбору й примірок, обробляє Codex від OpenAI в акаунті ChatGPT власника Capsula. Навчання моделей на цих даних у цьому акаунті вимкнено (${OPENAI_DATA}).`,
         'Google: вхід в акаунт.',
         'Cloudflare: передає весь трафік до Capsula.',
         'Hetzner: розміщує наш сервер і дані.',
@@ -45,12 +47,13 @@ const PRIVACY: Record<Lang, Doc> = {
       { title: 'Вік і чужі фото', body: [
         'Capsula для людей від 18 років. Завантажуй фото лише себе або людей, які на це погодилися.',
       ] },
+      { title: 'Хто відповідає за дані', body: [`${CONTROLLER}, власник Capsula.`] },
       { title: 'Зв’язок', body: [`Питання й запити щодо даних: ${CONTACT}.`] },
     ],
   },
   en: {
     title: 'Privacy',
-    updated: 'Updated 20 November 2026',
+    updated: 'Updated 22 November 2026',
     sections: [
       { title: 'What we store', body: [
         'Google sign-in: your name, email and profile photo address. We do not store Google access tokens.',
@@ -64,7 +67,7 @@ const PRIVACY: Record<Lang, Doc> = {
         'The face and build in a try-on come only from your own photos, never from generated ones.',
       ] },
       { title: 'Who else sees the data', body: [
-        `OpenAI: the photos and text needed for recognition, styling and try-ons are sent to the OpenAI API. Under OpenAI’s rules, API data is not used to train models, and abuse-monitoring logs are kept for up to 30 days (${OPENAI_DATA}).`,
+        `OpenAI: the photos and text needed for recognition, styling and try-ons are processed by OpenAI’s Codex in the ChatGPT account of Capsula’s owner. Model training on this data is turned off in that account (${OPENAI_DATA}).`,
         'Google: signing in.',
         'Cloudflare: carries all traffic to Capsula.',
         'Hetzner: hosts our server and data.',
@@ -82,6 +85,7 @@ const PRIVACY: Record<Lang, Doc> = {
       { title: 'Age and other people’s photos', body: [
         'Capsula is for people aged 18 and over. Upload photos only of yourself or of people who agreed to it.',
       ] },
+      { title: 'Who is responsible for the data', body: [`${CONTROLLER}, the owner of Capsula.`] },
       { title: 'Contact', body: [`Questions and data requests: ${CONTACT}.`] },
     ],
   },
