@@ -36,7 +36,7 @@ async function parse<T>(res: Response): Promise<T> {
 /** `owner`: the site's owner, who is also its admin; `test`: one of the owner's test accounts. */
 export interface SessionUser { id: string; name: string; email: string; image: string | null; owner: boolean; test?: boolean }
 /** `invites: false` when only the owner may have an account. */
-export interface Session { mode: 'local' | 'accounts'; user: SessionUser | null; quota?: QuotaStatus | null; support?: string | null; invites?: boolean }
+export interface Session { mode: 'local' | 'accounts'; user: SessionUser | null; quota?: QuotaStatus | null; support?: string | null; invites?: boolean; aiEngine?: 'codex' | 'openai-api' }
 
 const QUOTA_OUT: Record<QuotaKind, string> = {
   tryon: 'Ліміт примірок на цей місяць вичерпано',
@@ -94,7 +94,7 @@ async function browserJpeg(file: File): Promise<File> {
 }
 
 export async function uploadFile(original: File, params: Record<string, string>) {
-  const file = convertUploads && params.kind !== 'worn' ? await browserJpeg(original) : original;
+  const file = convertUploads ? await browserJpeg(original) : original;
   const qs = new URLSearchParams(params).toString();
   const res = await fetch(`/api/upload?${qs}`, {
     method: 'POST',

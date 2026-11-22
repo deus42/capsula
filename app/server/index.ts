@@ -211,7 +211,7 @@ async function accountTenant(req: http.IncomingMessage, res: http.ServerResponse
   const user = await auth.userOf(req);
   if (method === 'GET' && url.pathname === '/api/session') {
     const tenant = user ? tenants.forUser(user.id, user.owner, user.test) : null;
-    send(res, 200, { mode: 'accounts', user, quota: tenant?.quota?.status(tenant.store.read()) ?? null, support: SUPPORT_URL, invites: !OWNER_ONLY });
+    send(res, 200, { mode: 'accounts', user, quota: tenant?.quota?.status(tenant.store.read()) ?? null, support: SUPPORT_URL, invites: !OWNER_ONLY, aiEngine: openAI ? 'openai-api' : 'codex' });
     return null;
   }
   if (!user) {
@@ -372,3 +372,21 @@ if (localTenant) {
 server.listen(PORT, HOST, () => {
   console.log(`${new Date().toISOString()} Capsula: http://${HOST}:${PORT}  (${ACCOUNTS ? `акаунти, ${authConfig!.baseURL}, AI: ${openAI ? 'OpenAI API' : OWNER_ONLY ? 'Codex, лише власник' : CODEX_PRODUCTION ? 'Codex, акаунти за запрошенням' : 'Codex'}` : `дані: ${path.relative(PROJECT_ROOT, DATA_DIR)}, Codex: ${localTenant!.runner.state.codexBin}`})`);
 });
+
+let shuttingDown = false;
+function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  tenants.stopAll();
+  const force = setTimeout(() => process.exit(0), 5000);
+  force.unref?.();
+  server.close(() => {
+    try { auth?.close(); } catch { /* already closed */ }
+    try { usage?.close(); } catch { /* already closed */ }
+    clearTimeout(force);
+    process.exit(0);
+  });
+  if (signal === 'SIGTERM' || signal === 'SIGINT') server.closeIdleConnections?.();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

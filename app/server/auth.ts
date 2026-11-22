@@ -98,6 +98,13 @@ export async function createAuth(cfg: AuthConfig) {
     const row = db.prepare('SELECT * FROM invite WHERE code = ?').get(code) as unknown as Invite | undefined;
     return row && !row.usedBy && !row.disabled && row.expiresAt > new Date().toISOString() ? row : null;
   };
+  /** Atomically claims an unused, non-expired invite so concurrent sign-ups cannot reuse one link. */
+  const claimInvite = (code: string | undefined, holder: string) => {
+    if (!code) return false;
+    const at = new Date().toISOString();
+    const res = db.prepare('UPDATE invite SET usedBy = ?, usedAt = ? WHERE code = ? AND usedBy IS NULL AND disabled = 0 AND expiresAt > ?').run(holder, at, code, at);
+    return Number(res.changes) === 1;
+  };
   const isOwner = (email: string | null | undefined) => Boolean(cfg.ownerEmail && email?.toLowerCase() === cfg.ownerEmail);
   const requestHeaders = (ctx: unknown) => {
     const c = ctx as { request?: Request; headers?: Headers } | null | undefined;
@@ -157,13 +164,19 @@ export async function createAuth(cfg: AuthConfig) {
       user: {
         create: {
           before: async (user, ctx) => {
+            const owner = isOwner(user.email);
             const code = cookieValue(requestHeaders(ctx)?.get('cookie'), INVITE_COOKIE);
-            if (!mayCreateAccount({ owner: isOwner(user.email), ownerOnly: cfg.ownerOnly, openSignup: cfg.openSignup, validInvite: Boolean(validInvite(code)) })) throw new APIError('FORBIDDEN', { message: 'invite_required' });
+            if (!owner) {
+              if (cfg.ownerOnly) throw new APIError('FORBIDDEN', { message: 'invite_required' });
+              if (!cfg.openSignup && !claimInvite(code, `pending:${user.email}`)) throw new APIError('FORBIDDEN', { message: 'invite_required' });
+            }
             return { data: user };
           },
           after: async (user, ctx) => {
             const code = cookieValue(requestHeaders(ctx)?.get('cookie'), INVITE_COOKIE);
-            if (code && !isOwner(user.email)) db.prepare('UPDATE invite SET usedBy = ?, usedAt = ? WHERE code = ? AND usedBy IS NULL').run(user.id, new Date().toISOString(), code);
+            if (code && !isOwner(user.email)) {
+              db.prepare('UPDATE invite SET usedBy = ?, usedAt = ? WHERE code = ? AND (usedBy = ? OR usedBy IS NULL)').run(user.id, new Date().toISOString(), code, `pending:${user.email}`);
+            }
           },
         },
       },

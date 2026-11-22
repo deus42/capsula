@@ -639,6 +639,7 @@ export const en: Record<string, string> = {
   "Не вдалося прочитати фото образу": "Could not read the photos of the look",
   "Це я?": "Is this me?",
   "Окуляри": "Eyewear",
+  "Це тестове посилання вже використане або застаріло.": "This test sign-in link has already been used or has expired.",
   "Прибрати фото образу": "Remove outfit photos",
   "Прибрати ці фото з образу? Оригінали залишаться в «Мої фото».": "Remove these photos from the look? The originals will stay in «My photos».",
 };

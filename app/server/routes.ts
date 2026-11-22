@@ -5,7 +5,7 @@ import type { Capsule, DB, Item, Job, Look, Need, Photo, PhotoKind, ReworkReason
 import { CATEGORIES, ITEM_STATUSES, LANGUAGES, MEASURE_KEYS, PHOTO_KINDS, REWORK_REASONS, SEASONS, SLOT_KEYS, WARDROBE_FOCUS } from './schema.ts';
 import type { Store } from './store.ts';
 import { HttpError, bump, findOr404, newId, now } from './store.ts';
-import { folderBytes, prewarm, saveUpload, type StorageLimits } from './media.ts';
+import { folderBytesAsync, prewarm, saveUpload, type StorageLimits } from './media.ts';
 import { pickTheme } from './analysis.ts';
 import { acceptSuggestion, dropReplacementsFor, keepItem, queueAdvice, rememberDeclined } from './advisor.ts';
 import { looksNeedingRender } from '../src/render-need.ts';
@@ -272,12 +272,12 @@ function history(item: Item, action: string, note?: string) {
   item.history.push({ at: now(), action, note });
 }
 
-function checkStorage(ctx: Ctx, limits: StorageLimits, bytes: number) {
+async function checkStorage(ctx: Ctx, limits: StorageLimits, bytes: number) {
   const mb = (n: number) => Math.round(n / 1024 ** 2);
   if (bytes > limits.fileBytes) throw new HttpError(413, `Фото більше за ${mb(limits.fileBytes)} МБ`);
   const uploads = ctx.store.read().photos.filter((p) => p.source === 'upload').length;
   if (uploads >= limits.photos) throw new HttpError(413, `Уже ${limits.photos} фото: більше в бета-версії не вміщається`);
-  if (folderBytes(ctx.store.dataDir) + bytes > limits.storageBytes) throw new HttpError(413, `Місце закінчилося: ${Math.round(limits.storageBytes / 1024 ** 3)} ГБ на акаунт`);
+  if ((await folderBytesAsync(ctx.store.dataDir)) + bytes > limits.storageBytes) throw new HttpError(413, `Місце закінчилося: ${Math.round(limits.storageBytes / 1024 ** 3)} ГБ на акаунт`);
 }
 
 export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, filename: string) {
@@ -290,7 +290,7 @@ export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, file
   const known = (db: DB) => (worn ? db.photos.find((p) => p.kind === 'worn' && p.sha256 === sha256) : undefined);
   const existing = known(ctx.store.read());
   if (existing) return existing;
-  if (ctx.limits) checkStorage(ctx, ctx.limits, buf.length);
+  if (ctx.limits) await checkStorage(ctx, ctx.limits, buf.length);
   if (intake) ctx.admit?.('intake');
   const id = newId('P');
   const saved = await saveUpload(ctx.projectRoot, ctx.store.dataDir, id, buf);

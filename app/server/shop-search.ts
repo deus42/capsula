@@ -258,6 +258,30 @@ async function publicUrl(u: URL) {
 
 const MAX_PHOTO = 8 * 1024 * 1024;
 
+/** Reads a response body up to `limit` bytes, aborting early if a chunked stream exceeds it. */
+export async function readCapped(res: Response, limit: number): Promise<Buffer | null> {
+  if (!res.body) return Buffer.alloc(0);
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel().catch(() => undefined);
+        return null;
+      }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 /** Fetches a product photo from a public https address; returns the saved file (relative) or null. */
 export async function fetchProductImage(projectRoot: string, dataDir: string, id: string, url: string): Promise<string | null> {
   let u = httpsUrl(url);
@@ -274,8 +298,8 @@ export async function fetchProductImage(projectRoot: string, dataDir: string, id
     }
     if (!res || !res.ok || !String(res.headers.get('content-type') ?? '').startsWith('image/')) return null;
     if (Number(res.headers.get('content-length') ?? 0) > MAX_PHOTO) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > MAX_PHOTO) return null;
+    const buf = await readCapped(res, MAX_PHOTO);
+    if (!buf || buf.length > MAX_PHOTO) return null;
     const type = detectImageType(buf);
     if (!type || type === 'heic') return null;
     const dir = path.join(dataDir, 'media', 'products');

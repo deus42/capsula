@@ -56,7 +56,7 @@ set --
 [ -d "$data/users" ] && set -- "$@" users
 [ -d "$data/imports" ] && set -- "$@" imports
 if [ "$#" -gt 0 ]; then
-  tar -cf "$final.tmp" --exclude='users/*/media/thumbs' --exclude='users/*.importing' -C "$work" . -C "$data" "$@"
+  tar -cf "$final.tmp" --exclude='users/*/media/thumbs' --exclude='users/*/jobs' --exclude='users/*.importing' -C "$work" . -C "$data" "$@"
 else
   tar -cf "$final.tmp" -C "$work" .
 fi

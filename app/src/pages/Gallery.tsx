@@ -5,6 +5,7 @@ import { api, media, thumb } from '../api.ts';
 import { useApp, useDb, useRoute } from '../store.tsx';
 import { Badge, ConfirmButton, Empty, Overlay, PageHead, RateButtons } from '../components/ui.tsx';
 import { hiddenLookIds } from '../rating.ts';
+import { fmtDay } from '../lib.ts';
 import './Gallery.css';
 import { t } from '../i18n.ts';
 
@@ -32,7 +33,7 @@ function entries(db: DB): Entry[] {
 }
 
 function dayKey(iso: string) {
-  return new Date(iso).toLocaleDateString('uk-UA', { day: 'numeric', month: 'long', year: 'numeric' });
+  return fmtDay(iso);
 }
 
 function Lightbox({ entry, onClose }: { entry: Entry; onClose: () => void }) {

@@ -7,6 +7,12 @@ import { HttpError } from './store.ts';
 
 const run = promisify(execFile);
 
+// Bound libvips native memory inside the production container.
+if (process.env.NODE_ENV === 'production') {
+  sharp.cache(false);
+  sharp.concurrency(1);
+}
+
 export const MAX_UPLOAD_BYTES = 40 * 1024 * 1024;
 
 /** Beta storage per account, the owner excepted. */
@@ -19,6 +25,23 @@ export function folderBytes(dir: string): number {
   for (const d of fs.existsSync(dir) ? fs.readdirSync(dir, { withFileTypes: true }) : []) {
     const p = path.join(dir, d.name);
     total += d.isDirectory() ? folderBytes(p) : d.isFile() ? fs.statSync(p).size : 0;
+  }
+  return total;
+}
+
+/** Async folder size walk so upload quota checks never block the event loop. */
+export async function folderBytesAsync(dir: string): Promise<number> {
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const d of entries) {
+    const p = path.join(dir, d.name);
+    if (d.isDirectory()) total += await folderBytesAsync(p);
+    else if (d.isFile()) total += (await fs.promises.stat(p).catch(() => ({ size: 0 }))).size;
   }
   return total;
 }

@@ -2265,3 +2265,19 @@ test('eyewear preference: blocked by default, allowed when enabled in profile', 
   const job = await call('POST', '/api/analyze', { itemIds: ['W-G'] });
   assert.equal(job.kind, 'analyze');
 });
+
+test('readCapped stops reading chunked responses once they exceed the byte limit', async () => {
+  const { readCapped } = await import('./shop-search.ts');
+  let pulls = 0;
+  const big = new ReadableStream<Uint8Array>({
+    pull(ctrl) {
+      pulls += 1;
+      ctrl.enqueue(new Uint8Array(64));
+      if (pulls > 100) ctrl.close();
+    },
+  });
+  assert.equal(await readCapped(new Response(big), 100), null);
+  assert.ok(pulls <= 3, `expected early abort, got ${pulls} pulls`);
+  const ok = await readCapped(new Response(Buffer.from('hello')), 100);
+  assert.equal(ok?.toString('utf8'), 'hello');
+});

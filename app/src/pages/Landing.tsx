@@ -10,6 +10,7 @@ export function Landing() {
   const params = new URLSearchParams(window.location.search);
   const invited = params.get('invite') === '1';
   const invalid = params.get('invite') === 'invalid';
+  const testInvalid = params.get('test') === 'invalid';
   const failed = params.has('error');
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState('');
@@ -33,7 +34,7 @@ export function Landing() {
     }
   };
 
-  const note = problem || (invalid ? t('Це запрошення вже використане або застаріло.') : failed ? t('Увійти не вдалося. Поки що Capsula відкрита за запрошенням.') : invited ? '' : t('Поки що за запрошенням.'));
+  const note = problem || (testInvalid ? t('Це тестове посилання вже використане або застаріло.') : invalid ? t('Це запрошення вже використане або застаріло.') : failed ? t('Увійти не вдалося. Поки що Capsula відкрита за запрошенням.') : invited ? '' : t('Поки що за запрошенням.'));
   return (
     <main className="landing">
       <div className="landing-inner">

@@ -126,5 +126,10 @@ export function createTenants(opts: { projectRoot: string; dataDir: string; seed
     opts.quota?.usage.forget(userId);
   }
 
-  return { local, forUser, remove, userRoot, summary };
+  /** Stops every open tenant's runner and background timers (graceful shutdown). */
+  function stopAll() {
+    for (const t of cache.values()) t.runner.stop();
+  }
+
+  return { local, forUser, remove, userRoot, summary, stopAll };
 }

@@ -3,7 +3,7 @@ import { hiddenLookIds, isCapsuleHidden } from './rating.ts';
 import { groupLookVariations } from './look-variation.ts';
 import { tooClose, withBuys } from './look-memory.ts';
 import { buysFitSet, capsulePieceRefs, combinationGains, fashionCapsules, inSavedSet } from './capsule-pieces.ts';
-import { LOOKS, plural, t } from './i18n.ts';
+import { LOOKS, currentLanguage, plural, t } from './i18n.ts';
 
 export const CATEGORY_LABEL: Record<Category, string> = {
   outerwear: 'Верхній одяг',
@@ -214,14 +214,17 @@ export function itemArt(db: DB, itemId: string) {
   return { art, photo };
 }
 
+/** Active BCP 47 locale for dates, numbers and currency. */
+export const activeLocale = () => (currentLanguage() === 'en' ? 'en-GB' : 'uk-UA');
+
 export function fmtDate(iso?: string) {
   if (!iso) return '—';
-  return new Date(iso).toLocaleString('uk-UA', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  return new Date(iso).toLocaleString(activeLocale(), { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 }
 
 export function fmtDay(iso?: string) {
   if (!iso) return '—';
-  return new Date(iso).toLocaleDateString('uk-UA', { day: 'numeric', month: 'long', year: 'numeric' });
+  return new Date(iso).toLocaleDateString(activeLocale(), { day: 'numeric', month: 'long', year: 'numeric' });
 }
 
 // Stable: the representative of near-copies does not change as pictures arrive.
@@ -311,8 +314,11 @@ export function bestLooks(db: DB): Look[] {
 export const isBestLook = (db: DB, id: string) => bestLooks(db).some((l) => l.id === id);
 
 /** The advisor's scores on cards and pages (owner, 19.11), written like the item line: «8/10», «8,6/10». */
-const scoreFormat = new Intl.NumberFormat('uk-UA', { maximumFractionDigits: 1 });
-export const scoreLabel = (n: number) => `${scoreFormat.format(n)}/10`;
+const scoreFormats = {
+  uk: new Intl.NumberFormat('uk-UA', { maximumFractionDigits: 1 }),
+  en: new Intl.NumberFormat('en-GB', { maximumFractionDigits: 1 }),
+};
+export const scoreLabel = (n: number) => `${scoreFormats[currentLanguage()].format(n)}/10`;
 /** A look's score counts only while it belongs to the pieces the look has now. */
 export const lookRating = (l: Look) => (l.advice && l.advice.version === l.version ? l.advice.score : null);
 /** A capsule's score: the mean of its shown looks' current scores (owner, 19.11). */

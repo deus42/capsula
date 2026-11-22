@@ -4,16 +4,28 @@
  * the owner's ChatGPT account with model training turned off; openai-engine.ts with an API key), deletion
  * (DELETE /api/account) and the backup retention set at deployment (7 daily and 4 weekly copies).
  */
+import { useApp } from '../store.tsx';
+
 type Lang = 'uk' | 'en';
+type Engine = 'codex' | 'openai-api';
 interface Section { title: string; body: string[] }
 interface Doc { title: string; updated: string; sections: Section[] }
 
 const CONTACT = 'hello@capsula.fit';
 const CONTROLLER = 'Oleksii Gapchenko';
-const OPENAI_DATA = 'https://help.openai.com/en/articles/7730893-data-controls-faq';
+const OPENAI_CODEX_DATA = 'https://help.openai.com/en/articles/7730893-data-controls-faq';
+const OPENAI_API_DATA = 'https://developers.openai.com/api/docs/guides/your-data';
 
-const PRIVACY: Record<Lang, Doc> = {
-  uk: {
+const openaiLine = (lang: Lang, engine: Engine) =>
+  lang === 'uk'
+    ? engine === 'openai-api'
+      ? `OpenAI: фото й текст, потрібні для розпізнавання, підбору й примірок, надсилаються в OpenAI API. За правилами OpenAI дані API не використовуються для навчання моделей, а журнали контролю зловживань зберігаються до 30 днів (${OPENAI_API_DATA}).`
+      : `OpenAI: фото й текст, потрібні для розпізнавання, підбору й примірок, обробляє Codex від OpenAI в акаунті ChatGPT власника Capsula. Навчання моделей на цих даних у цьому акаунті вимкнено (${OPENAI_CODEX_DATA}).`
+    : engine === 'openai-api'
+      ? `OpenAI: the photos and text needed for recognition, styling and try-ons are sent to the OpenAI API. Under OpenAI’s rules, API data is not used to train models, and abuse-monitoring logs are kept for up to 30 days (${OPENAI_API_DATA}).`
+      : `OpenAI: the photos and text needed for recognition, styling and try-ons are processed by OpenAI’s Codex in the ChatGPT account of Capsula’s owner. Model training on this data is turned off in that account (${OPENAI_CODEX_DATA}).`;
+
+const privacyDoc = (lang: Lang, engine: Engine): Doc => (lang === 'uk' ? {
     title: 'Приватність',
     updated: 'Оновлено 22 листопада 2026',
     sections: [
@@ -29,7 +41,7 @@ const PRIVACY: Record<Lang, Doc> = {
         'Обличчя й статура для примірок беруться лише з твоїх власних фото, ніколи зі згенерованих.',
       ] },
       { title: 'Хто ще бачить дані', body: [
-        `OpenAI: фото й текст, потрібні для розпізнавання, підбору й примірок, обробляє Codex від OpenAI в акаунті ChatGPT власника Capsula. Навчання моделей на цих даних у цьому акаунті вимкнено (${OPENAI_DATA}).`,
+        openaiLine('uk', engine),
         'Google: вхід в акаунт.',
         'Cloudflare: передає весь трафік до Capsula.',
         'Hetzner: розміщує наш сервер і дані.',
@@ -50,8 +62,7 @@ const PRIVACY: Record<Lang, Doc> = {
       { title: 'Хто відповідає за дані', body: [`${CONTROLLER}, власник Capsula.`] },
       { title: 'Зв’язок', body: [`Питання й запити щодо даних: ${CONTACT}.`] },
     ],
-  },
-  en: {
+  } : {
     title: 'Privacy',
     updated: 'Updated 22 November 2026',
     sections: [
@@ -67,7 +78,7 @@ const PRIVACY: Record<Lang, Doc> = {
         'The face and build in a try-on come only from your own photos, never from generated ones.',
       ] },
       { title: 'Who else sees the data', body: [
-        `OpenAI: the photos and text needed for recognition, styling and try-ons are processed by OpenAI’s Codex in the ChatGPT account of Capsula’s owner. Model training on this data is turned off in that account (${OPENAI_DATA}).`,
+        openaiLine('en', engine),
         'Google: signing in.',
         'Cloudflare: carries all traffic to Capsula.',
         'Hetzner: hosts our server and data.',
@@ -88,8 +99,7 @@ const PRIVACY: Record<Lang, Doc> = {
       { title: 'Who is responsible for the data', body: [`${CONTROLLER}, the owner of Capsula.`] },
       { title: 'Contact', body: [`Questions and data requests: ${CONTACT}.`] },
     ],
-  },
-};
+  });
 
 const TERMS: Record<Lang, Doc> = {
   uk: {
@@ -163,9 +173,11 @@ const linkify = (text: string) =>
     part.startsWith('https://') ? <a key={i} href={part} target="_blank" rel="noreferrer">{part.replace(/^https:\/\//, '')}</a> : part);
 
 export function LegalPage({ kind }: { kind: 'privacy' | 'terms' }) {
+  const { session } = useApp();
+  const engine: Engine = session?.aiEngine === 'openai-api' ? 'openai-api' : 'codex';
   const query = new URLSearchParams(window.location.search);
   const lang: Lang = query.get('lang') === 'en' || (!query.get('lang') && navigator.language.toLowerCase().startsWith('en')) ? 'en' : 'uk';
-  const doc = (kind === 'privacy' ? PRIVACY : TERMS)[lang];
+  const doc = kind === 'privacy' ? privacyDoc(lang, engine) : TERMS[lang];
   const other = lang === 'uk' ? 'en' : 'uk';
   return (
     <main className="legal">
@@ -182,7 +194,7 @@ export function LegalPage({ kind }: { kind: 'privacy' | 'terms' }) {
         </section>
       ))}
       <footer className="legal-foot">
-        <a href={kind === 'privacy' ? `/terms?lang=${lang}` : `/privacy?lang=${lang}`}>{kind === 'privacy' ? TERMS[lang].title : PRIVACY[lang].title}</a>
+        <a href={kind === 'privacy' ? `/terms?lang=${lang}` : `/privacy?lang=${lang}`}>{kind === 'privacy' ? TERMS[lang].title : privacyDoc(lang, engine).title}</a>
         <a href="https://github.com/deus42/capsula">{lang === 'uk' ? 'Код' : 'Code'}</a>
       </footer>
     </main>

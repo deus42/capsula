@@ -4,7 +4,7 @@ import type { Need, Product } from '../api.ts';
 import { api, thumb } from '../api.ts';
 import { useApp, useDb } from '../store.tsx';
 import { Badge, CategoryIcon, ConfirmButton, Empty, Img, JobBar, Modal, UploadButton } from '../components/ui.tsx';
-import { distinctLooks, fmtDay, itemArt, looksUsing, plainShopName, purchasePlan, purchaseRanking, shopLocation, shopStores, siteLooks, storeKey } from '../lib.ts';
+import { activeLocale, distinctLooks, fmtDay, itemArt, looksUsing, plainShopName, purchasePlan, purchaseRanking, shopLocation, shopStores, siteLooks, storeKey } from '../lib.ts';
 import { TermInfo } from './Glossary.tsx';
 import { t } from '../i18n.ts';
 
@@ -125,10 +125,10 @@ function PurchaseModal({ product, onClose }: { product: Product; onClose: () => 
   );
 }
 
-/** «29,99 €» — prices the way the owner reads them. */
+/** Prices formatted for the active interface language. */
 const money = (v: number, cur?: string) => {
   try {
-    return new Intl.NumberFormat('uk-UA', { style: 'currency', currency: cur || 'EUR', currencyDisplay: 'narrowSymbol' }).format(v);
+    return new Intl.NumberFormat(activeLocale(), { style: 'currency', currency: cur || 'EUR', currencyDisplay: 'narrowSymbol' }).format(v);
   } catch {
     return `${v} ${cur ?? ''}`.trim();
   }

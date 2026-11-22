@@ -101,3 +101,14 @@ test('t() falls back to Ukrainian, fills placeholders and picks plural forms in 
   assert.equal(plural(5, LOOKS), '5 looks');
   setLanguage('uk');
 });
+
+test('dates and scores follow the active interface language', async () => {
+  const { fmtDay, scoreLabel } = await import('../src/lib.ts');
+  setLanguage('uk');
+  assert.equal(scoreLabel(8.6), '8,6/10');
+  assert.match(fmtDay('2026-11-22T12:00:00.000Z'), /листопада/);
+  setLanguage('en');
+  assert.equal(scoreLabel(8.6), '8.6/10');
+  assert.match(fmtDay('2026-11-22T12:00:00.000Z'), /November/);
+  setLanguage('uk');
+});
