@@ -3,25 +3,26 @@ import { ArrowLeftRight, ImageOff, Pencil, Plus, RefreshCw, Trash2 } from 'lucid
 import type { DB, Job, Look, SlotKey, SlotRef } from '../api.ts';
 import { api, media, quotaNote, thumb } from '../api.ts';
 import { useApp, useDb } from '../store.tsx';
-import { Badge, CategoryIcon, Empty, LookArt, Missing, Modal, RateButtons } from '../components/ui.tsx';
+import { Badge, CategoryIcon, Empty, JobBar, LookArt, Missing, Modal, RateButtons } from '../components/ui.tsx';
 import type { ResolvedRef } from '../lib.ts';
-import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, distinctLooks, indoorOnly, lookRating, lookVariants, resolveRef, scoreLabel } from '../lib.ts';
+import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, lookRating, lookVariants, resolveRef, scoreLabel } from '../lib.ts';
 import { hiddenLookIds } from '../rating.ts';
 import { rendersPaused } from '../render-need.ts';
 import { EditLook } from './Capsules.tsx';
+import { AddWear, WearPair, WearReview } from '../components/Wear.tsx';
 import { InfoMark, TermInfo } from './Glossary.tsx';
 import { t } from '../i18n.ts';
 
 const SLOTS: SlotKey[] = ['layer', 'top', 'bottom', 'shoes', 'accessories'];
 const same = (a: SlotRef, b: SlotRef) => a.kind === b.kind && a.id === b.id;
 
-/** Kind of accessory from its title; glasses are never suggested (owner wears none). */
+/** Kind of accessory from its title (Ukrainian and English). */
 const ACCESSORY_KINDS: [string, RegExp][] = [
-  ['bag', /сумк|рюкзак/i],
-  ['watch', /годинник/i],
-  ['cap', /кепк|шапк|панам/i],
-  ['glasses', /окуляр/i],
-  ['belt', /ремін(?!ц)|ремен(?!ц)|пояс/i],
+  ['bag', /сумк|рюкзак|bag|backpack|tote|satchel|crossbody|pouch/i],
+  ['watch', /годинник|watch|timepiece/i],
+  ['cap', /кепк|шапк|панам|cap|beanie|hat|bucket|beret/i],
+  ['glasses', /окуляр|оправ|glasses|sunglasses|eyewear|frames/i],
+  ['belt', /ремін(?!ц)|ремен(?!ц)|пояс|belt/i],
 ];
 const accessoryKind = (title: string) => ACCESSORY_KINDS.find(([, re]) => re.test(title))?.[0];
 
@@ -29,15 +30,16 @@ const accessoryKind = (title: string) => ACCESSORY_KINDS.find(([, re]) => re.tes
  * Other accessories of the same kind the owner has, offered as one-tap swaps.
  * One different piece keeps it the same look (owner rule), so the rating stays.
  */
-const COLOURS = ['коричнев', 'чорн', 'бежев', 'сір', 'синь', 'синій', 'біл', 'зелен', 'олив', 'taupe', 'коньяч', 'кремов', 'молочн', 'бордов', 'червон', 'brown', 'black', 'tan'];
+const COLOURS = ['коричнев', 'чорн', 'бежев', 'сір', 'синь', 'синій', 'біл', 'зелен', 'олив', 'taupe', 'коньяч', 'кремов', 'молочн', 'бордов', 'червон', 'brown', 'black', 'tan', 'beige', 'sand', 'grey', 'gray', 'navy', 'blue', 'white', 'cream', 'ivory', 'green', 'olive', 'khaki', 'burgundy', 'red', 'cognac', 'camel'];
 
 function accessoryOptions(db: DB, look: Look) {
+  const noGlasses = eyewearBlocked(db);
   const inLook = new Set(look.slots.accessories.map((r) => `${r.kind}:${r.id}`));
   return look.slots.accessories
     .map((current) => {
       const title = resolveRef(db, current).title;
       const kind = accessoryKind(title);
-      if (!kind || kind === 'glasses') return null;
+      if (!kind || (noGlasses && kind === 'glasses')) return null;
       // Closest first: shared words (colour, material), then owner-confirmed.
       const stems = (t: string) => new Set(t.toLowerCase().split(/[^\p{L}]+/u).filter((w) => w.length >= 5).map((w) => w.slice(0, 6)));
       const mine = stems(title);
@@ -83,6 +85,8 @@ export function LookPage({ id }: { id: string }) {
   const cover = coverForLook(db, look);
   const stale = cover && cover.lookVersion !== look.version;
   const shown = currentCover(db, look);
+  // The person's own photos of this composition lead; the render they were compared with stays beside them.
+  const wear = currentWear(db, look);
   const hidden = hiddenLookIds(db).has(look.id);
   const variants = lookVariants(db, look);
   const siblings = capsule ? distinctLooks(db, capsuleLooks(db, capsule.lookIds)).filter((l) => l.id !== look.id && !variants.some((v) => v.id === l.id)) : [];
@@ -113,6 +117,12 @@ export function LookPage({ id }: { id: string }) {
     setKeptNow(`${look.id}:${look.version}`);
     void act(() => api('PATCH', `/api/looks/${look.id}`, { rev: look.rev, keptVersion: look.version }));
   };
+  const itsMe = (yes: boolean) =>
+    shown &&
+    act(
+      () => api('POST', `/api/results/${shown.id}/review`, yes ? { decision: 'accepted' } : { decision: 'rework', reason: 'face' }),
+      yes ? t('Прийнято') : t('Прибрано'),
+    );
   const swapAccessory = (current: SlotRef, id: string) =>
     act(() => api('PATCH', `/api/looks/${look.id}`, { rev: look.rev, slots: { ...look.slots, accessories: look.slots.accessories.map((r) => (same(r, current) ? { kind: 'item', id } : r)) } }));
 
@@ -158,15 +168,23 @@ export function LookPage({ id }: { id: string }) {
       <div className="look-page">
         <div className="look-hero">
           <div className="hero-pic">
-            <a className="cover" href={shown ? media(shown.imagePath) : undefined} target={shown ? '_blank' : undefined} rel="noreferrer">
+            {wear ? <WearPair wear={wear} /> : <a className="cover" href={shown ? media(shown.imagePath) : undefined} target={shown ? '_blank' : undefined} rel="noreferrer">
               <LookArt look={look} w={960} busy={busy} label />
-            </a>
-            {!paused && (
+            </a>}
+            {wear && busy && latest && <JobBar job={latest} label />}
+            {!paused && !wear && (
               <button className="refresh-btn" disabled={busy || Boolean(limit)} onClick={() => void update()} aria-label={t('Оновити картинку')} title={limit ?? t('Оновити картинку')}>
                 <RefreshCw size={15} />
               </button>
             )}
           </div>
+          {!wear && shown && shown.review === 'pending' && !busy && (
+            <div className="update-ask">
+              <span>{t('Це я?')}</span>
+              <button className="btn sm" onClick={() => void itsMe(false)}>{t('Ні')}</button>
+              <button className="btn sm primary" onClick={() => void itsMe(true)}>{t('Так')}</button>
+            </div>
+          )}
           {!busy && missingPhotos && <p className="miss" role="status" style={{ marginTop: 8 }}>{missingPhotos}</p>}
           {limit && <p className="miss" role="status" style={{ marginTop: 8 }}>{limit}{session?.support && <> · <a href={session.support} target="_blank" rel="noreferrer">{t('Підтримати')}</a></>}</p>}
           {askUpdate && (
@@ -183,6 +201,8 @@ export function LookPage({ id }: { id: string }) {
               <button className="btn sm primary" onClick={() => void act(() => api('POST', `/api/looks/${look.id}/advice`, { accept: true }))}>{t('Так')}</button>
             </div>
           )}
+          {wear && <WearReview wear={wear} />}
+          <AddWear look={look} />
         </div>
         <div className="look-side">
           <div className="section-head"><h2 className="h2">{t('Речі образу')} <span className="count">{own.length}</span></h2></div>
@@ -249,7 +269,7 @@ function SwapModal({ look, slot, current, onClose }: { look: Look; slot?: SlotKe
     const cats = slot ? SLOT_CATEGORIES[s] : SLOT_CATEGORIES[s].filter((c) => NATURAL[c] === s);
     const own = current?.kind === 'item' ? db.items.find((i) => i.id === current.id)?.category : current?.kind === 'need' ? db.needs.find((n) => n.id === current.id)?.category : undefined;
     return [
-      ...db.items.filter((i) => cats.includes(i.category) && i.status !== 'inactive' && !i.mergedInto && accessoryKind(i.title) !== 'glasses').sort((a, b) => Number(b.category === own) - Number(a.category === own)).map((i) => ({ ref: { kind: 'item' as const, id: i.id }, title: i.title, photo: art(i.packshotId) ?? art(i.photoIds[0]) })),
+      ...db.items.filter((i) => cats.includes(i.category) && i.status !== 'inactive' && !i.mergedInto && !(eyewearBlocked(db) && accessoryKind(i.title) === 'glasses')).sort((a, b) => Number(b.category === own) - Number(a.category === own)).map((i) => ({ ref: { kind: 'item' as const, id: i.id }, title: i.title, photo: art(i.packshotId) ?? art(i.photoIds[0]) })),
       ...db.needs.filter((n) => n.status === 'open' && cats.includes(n.category)).map((n) => ({ ref: { kind: 'need' as const, id: n.id }, title: `${n.title} · ${t('докупити')}`, photo: art(n.conceptPhotoId) })),
     ];
   };

@@ -14,6 +14,7 @@ import { ADVISE_SCHEMA, adviceDue, advisePrompt, applyAdvice, itemsToRate, queue
 import { sameIdentity, verifyReferenceFiles } from './identity.ts';
 import { FACE_CHECK_PROMPT, FACE_CHECK_SCHEMA, fitGarmentCards, GARMENT_BOUNDS_SCHEMA, prepareGarmentCrops, type GarmentCard } from './garment-references.ts';
 import { apiImagePrompt, type OpenAIEngine } from './openai-engine.ts';
+import { WEAR_REVIEW_SCHEMA, applyWearReview, pinnedRender, wearPhotos, wearReviewPrompt } from './wear-review.ts';
 
 const SLOT_LABEL: Record<string, string> = { top: 'Top', layer: 'Outer layer', bottom: 'Bottom', shoes: 'Shoes', accessories: 'Accessory' };
 const JOB_TIMEOUT_MS = 15 * 60 * 1000;
@@ -29,6 +30,23 @@ const WORKER_ISOLATION = [
   '-c', 'project_doc_max_bytes=0',
   '-c', 'developer_instructions="You are an unattended, sandboxed worker inside the local Capsula app. Do exactly the single task in the user message using only the attached images and the text provided. Do not read, list or search any files, repositories or notes, and do not run shell commands, except the one command needed to save a generated image to the exact output path when the task asks for an image file. Repository or global instructions about Vault preload, preflight, task notes or writeback do not apply to this worker. Finish with the requested JSON."',
 ];
+
+const WORKER_ISOLATION_SEARCH = [
+  '-c', 'project_doc_max_bytes=0',
+  '-c', 'developer_instructions="You are an unattended, sandboxed worker inside the local Capsula app. Do exactly the single task in the user message using the provided text and live web search. Do not read, list or search any local files, repositories or notes, and do not run shell commands. Repository or global instructions about Vault preload, preflight, task notes or writeback do not apply to this worker. Finish with the requested JSON."',
+];
+
+/** Drops heavy intermediate images from a finished job folder while keeping prompt, references and logs. */
+function cleanupJobDir(jobDir: string) {
+  for (const name of ['result.png', 'items', 'wear']) fs.rmSync(path.join(jobDir, name), { recursive: true, force: true });
+  try {
+    for (const f of fs.readdirSync(jobDir)) {
+      if (/^garment-preview-\d+\.jpg$/.test(f)) fs.rmSync(path.join(jobDir, f), { force: true });
+    }
+  } catch {
+    /* job folder already gone */
+  }
+}
 
 export interface RunnerState {
   running: boolean;
@@ -136,12 +154,12 @@ export function buildPrompt(job: Job, resultFile: string, refs?: ImageRefs) {
     refs ? refInstruction([...refs.identity, ...refs.garments]) : '',
     '',
     pinned
-      ? `Use case: identity-preserve. Image 1 is ${pinned.approvedPortrait ? "the exact OWNER-APPROVED PORTRAIT, the ONLY source for facial identity AND hairstyle. Copy this approved face and hair faithfully, do not reinterpret it from another photo" : 'an exact-pixel FACE crop from the selected ORIGINAL photograph, the ONLY facial identity source'}. The generated person must be recognisably this person. Preserve exact facial outline, eyelids, eyes, nose, mouth, jaw, ears, cheeks, real skin texture, apparent age, hair colour and hairline. ${pose} Image 2 is a headless crop of the owner's original photo, the ONLY physique source. Preserve shoulder width, torso shape, waist, real build and leg proportions. Keep the same physique consistently across outfits; flattering clothes and upright posture must not change anatomy. ${pinned.hair ? 'Image 3 is an ORIGINAL HAIR-ONLY crop: use only its neat swept-back/side styling, never another face, hairline, colour or age.' : ''} ${pinned.hairstyle ? `Hairstyle requested by owner: ${pinned.hairstyle}. Keep original length and colour; no new haircut, dye, extra density or hairline change.` : 'Preserve the reference hairstyle.'} Do not redesign, average or beautify the face, de-age, slim, stretch or muscularize. ${pinned.approvedPortrait ? 'The approved portrait is the sole owner-authorized generated identity reference; never use another render or garment reference for face, hair or physique.' : 'Never use an earlier render or a garment reference for identity or physique.'}`
-      : `Identity: the first ${refs?.identity.length ?? job.snapshot.basePhotoPaths.length} reference photo(s) are ORIGINAL photographs of the owner. Keep their exact facial features, hair, skin, apparent age and physique. Preserve the first original's head angle, gaze and expression. Never use generated images for identity or physique.`,
-    `Image standard: one person; full length from head to shoes with margin; body standing naturally, arms relaxed at the sides; ${pinned?.preserveHeadAngle === false ? 'head upright, direct front view and eye contact' : 'preserve the original head angle'}; pure white (#FFFFFF) seamless studio background; soft even light; subtle ground shadow; no text, labels or watermarks. Remove selfie phone, mirror and source environment. No additional accessories, bags, headwear or watches unless explicitly listed in this outfit. ${pinned?.noGlasses ? 'ABSOLUTELY NO GLASSES: no eyeglasses, sunglasses, eyewear on the face, head or clothing. The owner does not wear glasses, regardless of anything in the source photos or outfit text.' : 'No glasses unless explicitly listed.'} Preserve small original garment logos only where evidenced; do not add branding.`,
+      ? `Use case: identity-preserve. Image 1 is ${pinned.approvedPortrait ? "the exact OWNER-APPROVED PORTRAIT, the ONLY source for facial identity AND hairstyle. Copy this approved face and hair faithfully, do not reinterpret it from another photo" : 'an exact-pixel FACE crop from the selected ORIGINAL photograph, the ONLY facial identity source'}. The generated person must be recognisably this person. Preserve exact facial outline, face width, cheek and jaw proportions, head-to-shoulder scale, eyelids, eyes, nose, mouth, ears, real skin texture, apparent age, hair colour and hairline. ${pose} Image 2 is a headless crop of the owner's original photo, the ONLY physique source. Preserve shoulder width, torso shape, waist, real build and leg proportions. Keep the same physique consistently across outfits; flattering clothes and upright posture must not change anatomy. ${pinned.hair ? 'Image 3 is an ORIGINAL HAIR-ONLY crop: use only its neat swept-back/side styling, never another face, hairline, colour or age.' : ''} ${pinned.hairstyle ? `Hairstyle requested by owner: ${pinned.hairstyle}. Keep original length and colour; no new haircut, dye, extra density or hairline change.` : 'Preserve the reference hairstyle.'} Do not redesign, average, narrow or beautify the face, de-age, slim, stretch or muscularize. ${pinned.approvedPortrait ? 'The approved portrait is the sole owner-authorized generated identity reference; never use another render or garment reference for face, hair or physique.' : 'Never use an earlier render or a garment reference for identity or physique.'}`
+      : `Identity: the first ${refs?.identity.length ?? job.snapshot.basePhotoPaths.length} reference photo(s) are ORIGINAL photographs of the owner. Keep their exact facial features, face width, hair, skin, apparent age and physique. Preserve the first original's head angle, gaze and expression. Never use generated images for identity or physique.`,
+    `Image standard: one person; full length from head to shoes with balanced ~8% white margin above the head and below the shoes; body standing naturally in a relaxed studio lookbook stance with natural weight balance and relaxed hands (avoid stiff symmetrical arms-out poses); ${pinned?.preserveHeadAngle === false ? 'head upright, direct front view and eye contact' : 'preserve the original head angle'}; strictly uniform pure white (#FFFFFF) seamless studio background with no gray tint or vignette; soft even studio light; subtle natural ground shadow; no text, labels or watermarks. Remove selfie phone, mirror and source environment. No additional accessories, bags, headwear or watches unless explicitly listed in this outfit. ${pinned?.noGlasses ? 'ABSOLUTELY NO GLASSES: no eyeglasses, sunglasses, eyewear on the face, head or clothing. The owner does not wear glasses, regardless of anything in the source photos or outfit text.' : 'No glasses unless explicitly listed.'} Preserve small original garment logos only where evidenced; do not add branding.`,
     '',
     `Outfit "${job.snapshot.lookName}" — exactly these pieces, nothing else visible:`,
-    'Garment photographs take precedence over descriptions for visible colour, cut, panel and stripe placement, closures and details.',
+    'Garment photographs take precedence over descriptions for visible colour, cut, panel and stripe placement, closures and details. If any garment photo was taken in a mirror, orient chest logos, pockets, plackets and lettering naturally as worn in real life, never horizontally mirrored. Wear garments naturally for the style (e.g. casual polos and tees untucked unless a belt or tuck fits a tailored look; outer layers neatly framed so inner pieces remain visible).',
     outfit || '- (no pieces listed)',
     '',
     job.instructions ? `Owner instructions: ${job.instructions}` : '',
@@ -308,6 +326,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     const logFile = path.join(jobDir, 'codex.jsonl');
     const schemaFile = path.join(jobDir, 'schema.json');
     const images: string[] = [];
+    let wearRenderId: string | undefined;
     let prompt: string;
     let schema: object;
     if (job.kind === 'intake') {
@@ -324,6 +343,31 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     } else if (job.kind === 'discover') {
       prompt = discoverPrompt(db0, job);
       schema = DISCOVER_SCHEMA;
+    } else if (job.kind === 'wearreview') {
+      // The person's own photos of one appearance, then the pinned render of the same look version when it is still shown.
+      const wear = db0.wears?.find((w) => w.id === job.wearId);
+      if (!wear) throw Error('Образ у житті вже прибрано');
+      const photos = wearPhotos(db0, wear);
+      if (!photos.length) throw Error('Немає фото образу');
+      const render = pinnedRender(db0, wear);
+      const dir = path.join(jobDir, 'wear');
+      fs.mkdirSync(dir, { recursive: true });
+      const copy = async (rel: string, name: string) => {
+        resolveAllowed(projectRoot, store.dataDir, rel);
+        const t = await thumbnail(projectRoot, store.dataDir, rel, rel, 1280);
+        const dest = path.join(dir, `${name}.jpg`);
+        fs.copyFileSync(t, dest);
+        images.push(dest);
+      };
+      try {
+        for (const [i, p] of photos.entries()) await copy(p.path, `photo-${i + 1}`);
+        if (render) await copy(render.imagePath, 'render');
+      } catch {
+        throw Error('Не вдалося прочитати фото образу');
+      }
+      prompt = wearReviewPrompt(db0, job, { photos: photos.length, render: Boolean(render) });
+      wearRenderId = render?.id;
+      schema = WEAR_REVIEW_SCHEMA;
     } else if (job.kind === 'advise') {
       // The advisor sees the catalogue photos of the items it rates now (never personal photos).
       const dir = path.join(jobDir, 'items');
@@ -364,18 +408,19 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     fs.writeFileSync(path.join(jobDir, 'prompt.txt'), prompt);
     fs.writeFileSync(schemaFile, JSON.stringify(schema));
     const settings = db0.settings;
+    const webSearch = job.kind === 'shopsearch' || job.kind === 'storefind';
     const args = [
       // Shop search needs live web search; the other analyses stay offline.
-      ...(job.kind === 'shopsearch' || job.kind === 'storefind' ? ['--search'] : []),
+      ...(webSearch ? ['--search'] : []),
       'exec', '--ignore-user-config', '--skip-git-repo-check', '--ephemeral', '--color', 'never', '--json',
-      '-s', 'read-only', '-C', jobDir, '-m', settings.codexModel, '-c', `model_reasoning_effort="${settings.reasoningEffort}"`, ...WORKER_ISOLATION, ...noCommands,
+      '-s', 'read-only', '-C', jobDir, '-m', settings.codexModel, '-c', `model_reasoning_effort="${settings.reasoningEffort}"`, ...(webSearch ? WORKER_ISOLATION_SEARCH : WORKER_ISOLATION), ...noCommands,
       '--output-schema', schemaFile, '-o', lastMsg, ...images.flatMap((p) => ['-i', p]),
     ];
     await store.mutate((db) => {
       const j = db.jobs.find((x) => x.id === jobId)!;
       j.state = 'running';
       j.startedAt = now();
-      j.stateNote = job.kind === 'intake' ? 'Розпізнаю речі на фото…' : job.kind === 'shopsearch' ? 'Шукаю варіанти в магазинах…' : job.kind === 'storefind' ? 'Шукаю найближчі магазини…' : job.kind === 'discover' ? 'Шукаю нові образи…' : job.kind === 'advise' ? 'Порадник оцінює гардероб…' : 'Складаю образи з твоїх речей…';
+      j.stateNote = job.kind === 'intake' ? 'Розпізнаю речі на фото…' : job.kind === 'shopsearch' ? 'Шукаю варіанти в магазинах…' : job.kind === 'storefind' ? 'Шукаю найближчі магазини…' : job.kind === 'discover' ? 'Шукаю нові образи…' : job.kind === 'advise' ? 'Порадник оцінює гардероб…' : job.kind === 'wearreview' ? 'Стиліст дивиться фото образу…' : 'Складаю образи з твоїх речей…';
       j.logPath = path.relative(projectRoot, logFile);
     });
     let exit: { code: number | null; err?: string };
@@ -405,6 +450,12 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
       if (reply.status === 'error') {
         j.state = 'error';
         j.stateNote = String(reply.reason || 'Codex не зміг виконати аналіз');
+        return;
+      }
+      if (j.kind === 'wearreview') {
+        const out = applyWearReview(db, j, reply, wearRenderId);
+        j.state = out.ok ? 'done' : 'error';
+        j.stateNote = out.note;
         return;
       }
       if (j.kind === 'advise') {
@@ -465,6 +516,8 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
       j.state = 'done';
       j.stateNote = `Підбірка готова: ${db.capsules.find((c) => c.id === capsuleId)?.lookIds.length ?? 0} образів${renders.length ? ` — примірки в черзі: ${renders.length}` : ''}`;
     });
+    // Drop intermediate copies (item thumbnails, wear copies) once the analysis is done.
+    cleanupJobDir(jobDir);
     // Product photos come from the shops' pages; the server fetches them after the reply is saved.
     for (const img of productImages) {
       const rel = await fetchProductImage(projectRoot, store.dataDir, img.productId, img.url);
@@ -482,7 +535,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
   async function runOne(jobId: string) {
     const db0 = store.read();
     const job = db0.jobs.find((j) => j.id === jobId)!;
-    if (job.kind === 'intake' || job.kind === 'analyze' || job.kind === 'shopsearch' || job.kind === 'advise' || job.kind === 'storefind' || job.kind === 'discover') return runAnalysis(jobId);
+    if (job.kind === 'intake' || job.kind === 'analyze' || job.kind === 'shopsearch' || job.kind === 'advise' || job.kind === 'storefind' || job.kind === 'discover' || job.kind === 'wearreview') return runAnalysis(jobId);
     const isPackshot = job.kind === 'packshot';
     if (!isPackshot && (db0.profile.identity?.disabledReason || job.snapshot.identity?.disabledReason)) throw Error(db0.profile.identity?.disabledReason || job.snapshot.identity!.disabledReason);
     const jobDir = path.join(store.dataDir, 'jobs', job.id);
@@ -607,7 +660,8 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     }
     let image = fs.existsSync(resultFile) ? resultFile : null;
     const note = reply.notes;
-    if (isPackshot && (reply.status !== 'done' || exit.code !== 0 || (image && detectImageType(fs.readFileSync(image)) !== 'png'))) {
+    if (image && detectImageType(fs.readFileSync(image)) !== 'png') image = null;
+    if (isPackshot && (reply.status !== 'done' || exit.code !== 0)) {
       image = null;
     }
 
@@ -672,7 +726,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         lookId: j.lookId!,
         lookVersion: j.lookVersion,
         imagePath: path.relative(projectRoot, target),
-        tool: 'Codex CLI exec · built-in image generation',
+        tool: opts.engine ? 'OpenAI Images API' : 'Codex CLI exec · built-in image generation',
         model: opts.engine ? opts.engine.imageLabel : settings.codexModel,
         prompt,
         sources: uniqueImages.map((p) => path.relative(projectRoot, p)),
@@ -686,6 +740,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
       j.state = 'done';
       j.stateNote = 'Готово — чекає твоєї перевірки';
     });
+    if (image) cleanupJobDir(jobDir);
   }
 
   async function runSafe(jobId: string) {
@@ -708,8 +763,28 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
 
   let draining = false;
   let stopped = false;
+  let wakeup: (() => void) | null = null;
+  const nudge = () => {
+    const fn = wakeup;
+    wakeup = null;
+    fn?.();
+  };
+  const waitForNudge = (ms: number) => new Promise<void>((resolve) => {
+    const t = setTimeout(() => {
+      wakeup = null;
+      resolve();
+    }, ms);
+    t.unref?.();
+    wakeup = () => {
+      clearTimeout(t);
+      resolve();
+    };
+  });
   async function drain() {
-    if (draining) return;
+    if (draining) {
+      nudge();
+      return;
+    }
     draining = true;
     state.lastError = null;
     try {
@@ -720,7 +795,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         // What the owner starts by hand (photo intake, analyzer) goes first, then try-ons, then packshots.
         // Shop searches take minutes: they come after uploads and «Підібрати», one at a time, so a slot stays free.
         // The advisor is background text work: after try-ons, alongside packshots.
-        const batch = (k?: string) => (k === 'intake' || k === 'analyze' || k === 'discover' ? 0 : k === 'shopsearch' || k === 'storefind' ? 0.5 : k === 'packshot' || k === 'advise' ? 2 : 1);
+        const batch = (k?: string) => (k === 'intake' || k === 'analyze' || k === 'discover' || k === 'wearreview' ? 0 : k === 'shopsearch' || k === 'storefind' ? 0.5 : k === 'packshot' || k === 'advise' ? 2 : 1);
         const queued = db.jobs
           .filter((j) => j.state === 'queued' && !active.has(j.id) && (!opts.canStart || opts.canStart(j)))
           // Within try-ons the newest request goes first, so a picture the owner just asked for does not wait behind a batch.
@@ -739,9 +814,10 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
           void (opts.limiter ? opts.limiter.run(() => runSafe(next.id)) : runSafe(next.id)).finally(() => {
             active.delete(next.id);
             sync();
+            nudge();
           });
         }
-        await new Promise((r) => setTimeout(r, 400));
+        await waitForNudge(active.size > 0 ? 5000 : 1000);
       }
     } finally {
       draining = false;
@@ -781,6 +857,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
   /** A deleted account's queue stops: no new jobs start and the weekly review ends. */
   const stop = () => {
     stopped = true;
+    nudge();
     for (const t of timers) clearTimeout(t);
   };
 

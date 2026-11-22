@@ -21,7 +21,7 @@ export interface Store {
   recovered(): boolean;
 }
 
-const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * File store: one JSON document, cross-process lock, atomic replace and a
@@ -34,6 +34,16 @@ export function createStore(dataDir: string, seed: () => DB): Store {
   const prev = path.join(dataDir, 'db.prev.json');
   const lockFile = path.join(dataDir, 'db.lock');
   let fellBack = false;
+  let cache: { key: string; db: DB } | null = null;
+
+  function statKey(f: string): string | null {
+    try {
+      const s = fs.statSync(f);
+      return `${s.ino}:${s.size}:${s.mtimeMs}`;
+    } catch {
+      return null;
+    }
+  }
 
   function parseValid(f: string): DB | null {
     try {
@@ -53,24 +63,34 @@ export function createStore(dataDir: string, seed: () => DB): Store {
     } finally {
       fs.closeSync(fd);
     }
-    if (fs.existsSync(file) && parseValid(file)) fs.copyFileSync(file, prev);
+    const existingKey = statKey(file);
+    if (existingKey && ((cache && cache.key === existingKey) || parseValid(file))) fs.copyFileSync(file, prev);
     fs.renameSync(tmp, file);
+    const nextKey = statKey(file);
+    cache = nextKey ? { key: nextKey, db: structuredClone(db) } : null;
   }
 
   function load(): DB {
-    if (!fs.existsSync(file) && !fs.existsSync(prev)) {
+    const key = statKey(file);
+    if (key && cache && cache.key === key) {
+      fellBack = false;
+      return structuredClone(cache.db);
+    }
+    if (!key && !fs.existsSync(prev)) {
       const db = seed();
       const err = validateDb(db);
       if (err) throw new Error(`Початкові дані невалідні: ${err}`);
       writeAtomic(db);
       fellBack = false;
-      return db;
+      return structuredClone(db);
     }
-    const current = fs.existsSync(file) ? parseValid(file) : null;
+    const current = key ? parseValid(file) : null;
     if (current) {
       fellBack = false;
-      return current;
+      cache = key ? { key, db: current } : null;
+      return structuredClone(current);
     }
+    cache = null;
     const backup = fs.existsSync(prev) ? parseValid(prev) : null;
     if (backup) {
       fellBack = true;
@@ -79,7 +99,7 @@ export function createStore(dataDir: string, seed: () => DB): Store {
     throw new Error('db.json пошкоджений і валідної резервної копії немає — дані не перезаписано');
   }
 
-  function acquire(): () => void {
+  async function acquire(): Promise<() => void> {
     const started = Date.now();
     for (;;) {
       try {
@@ -95,7 +115,7 @@ export function createStore(dataDir: string, seed: () => DB): Store {
           /* lock vanished between checks */
         }
         if (Date.now() - started > 10_000) throw new HttpError(503, 'Сховище зайняте іншим процесом');
-        sleep(25);
+        await wait(25);
       }
     }
   }
@@ -107,8 +127,8 @@ export function createStore(dataDir: string, seed: () => DB): Store {
     read: () => load(),
     recovered: () => fellBack,
     mutate<T>(fn: (db: DB) => T): Promise<T> {
-      const run = chain.then(() => {
-        const release = acquire();
+      const run = chain.then(async () => {
+        const release = await acquire();
         try {
           const db = load();
           const out = fn(db);

@@ -7,7 +7,7 @@ import { CATEGORIES, emptySlots } from './schema.ts';
 import { HttpError, newId, now } from './store.ts';
 import { focusLine, replyLanguage } from './person.ts';
 import { CATEGORY_UK, ownedItems } from './analysis.ts';
-import { PERIOD_LABEL, PERIOD_TEMP, SLOT_CATEGORIES, currentPeriod, isEyewear, weakPiece } from '../src/lib.ts';
+import { PERIOD_LABEL, PERIOD_TEMP, SLOT_CATEGORIES, currentPeriod, eyewearBlocked, isBlockedEyewear, weakPiece } from '../src/lib.ts';
 import { hiddenLookIds, isCapsuleHidden } from '../src/rating.ts';
 import { alreadySeen, refusedPieces, seenCompositions, withBuys } from '../src/look-memory.ts';
 import { freePlaces, normalizePiece, pieceCategory, pieceGroup, pieceKey, sameTitle } from '../src/capsule-pieces.ts';
@@ -48,7 +48,7 @@ export interface DiscoverReply {
 
 /** The fashion capsules a search can fill. */
 export const searchCapsules = (db: DB) => db.capsules.filter((c) => !c.redirectCapsuleIds && c.kind !== 'selection' && !isCapsuleHidden(db, c));
-const pieces = (db: DB) => ownedItems(db).filter((i) => !isEyewear(i.title));
+const pieces = (db: DB) => ownedItems(db).filter((i) => !isBlockedEyewear(db, i.title));
 const text = (v: unknown, n: number) => String(v ?? '').trim().slice(0, n);
 
 /** One search at a time; the owner's words, a capsule and picked pieces are optional. */
@@ -60,7 +60,7 @@ export function queueDiscover(db: DB, opts: { prompt?: string; capsuleId?: strin
     const item = db.items.find((i) => i.id === id);
     if (!item) throw new HttpError(404, 'Річ не знайдено');
     if (item.status === 'inactive' || item.mergedInto) throw new HttpError(400, 'Неактуальну річ не можна брати в образ');
-    if (isEyewear(item.title)) throw new HttpError(400, 'Окуляри в образи не беру');
+    if (isBlockedEyewear(db, item.title)) throw new HttpError(400, 'Окуляри в образи не беру');
     return item;
   });
   const j: Job = {
@@ -88,7 +88,7 @@ export function discoverPrompt(db: DB, job: Job) {
     `Today: ${new Date().toISOString().slice(0, 10)}; current weather period: ${PERIOD_LABEL[period]} (${PERIOD_TEMP[period]})${db.profile.location ? `, near ${db.profile.location}` : ''}.`,
     'The owner wants NEW looks in distinct FASHION capsules (refined modern direction). Each look must clearly belong to its capsule\'s aesthetic, palette and weather periods below, and must differ from every outfit listed under "Never again" and "Existing" (owner\'s rule: identical, one piece different, or one core piece different ignoring accessories = the same look).',
     focusLine(db),
-    'No eyewear of any kind.',
+    eyewearBlocked(db) ? 'No eyewear of any kind.' : '',
     `Profile — comfort: ${prefs.comfort || '—'}; materials: ${prefs.materials || '—'}; fit: ${prefs.fit || '—'}; branding: ${prefs.branding || '—'}.`,
     job.instructions ? `The owner asks: ${job.instructions}` : `No request: start with the capsules of the current period and the ones with the fewest looks.`,
     required.length ? `Every look MUST contain these owned pieces: ${required.join(', ')}.` : '',

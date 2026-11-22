@@ -77,6 +77,20 @@ func saveImage(_ image: CGImage, to file: String, type: UTType = .png, options: 
     return CGImageDestinationFinalize(out)
 }
 
+func downscale(_ image: CGImage, maxEdge: Int) -> CGImage {
+    let longest = max(image.width, image.height)
+    guard longest > maxEdge else { return image }
+    let scale = CGFloat(maxEdge) / CGFloat(longest)
+    let w = max(1, Int((CGFloat(image.width) * scale).rounded()))
+    let h = max(1, Int((CGFloat(image.height) * scale).rounded()))
+    guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+          let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                              space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return image }
+    ctx.interpolationQuality = .high
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return ctx.makeImage() ?? image
+}
+
 func crop(_ entry: Crop, image: CGImage, faces sourceFaces: [CGRect]) throws -> Bool {
     let b = entry.box
     guard b.x >= 0, b.y >= 0, b.width > 0, b.height > 0, b.x + b.width <= 1, b.y + b.height <= 1 else { return false }
@@ -86,7 +100,7 @@ func crop(_ entry: Crop, image: CGImage, faces sourceFaces: [CGRect]) throws -> 
     // A face truncated by a crop may not be detected on the crop itself.
     guard !sourceFaces.contains(where: { $0.insetBy(dx: -$0.width * 0.04, dy: -$0.height * 0.04).intersects(area) }),
           let piece = image.cropping(to: rect), try faces(in: piece).isEmpty else { return false }
-    return saveImage(piece, to: entry.destination)
+    return saveImage(downscale(piece, maxEdge: 1536), to: entry.destination)
 }
 
 func makeSheet(_ entry: Sheet) throws {

@@ -509,9 +509,10 @@ test('a new selection gets a try-on for every look; missing renders are queued o
   const { dir, store, call } = setup();
   const crop = sourceCropFixture(dir);
   const fake = path.join(dir, 'fake-codex.sh');
+  fs.writeFileSync(path.join(dir, 'fixture.png'), SAMPLE_PNG);
   fs.writeFileSync(
     fake,
-    '#!/bin/sh\nschema=""\nwhile [ $# -gt 0 ]; do case "$1" in -C) d="$2"; shift;; -o) o="$2"; shift;; --output-schema) schema="$2"; shift;; esac; shift; done\ncat >/dev/null\nif [ -n "$schema" ]; then echo \'{"status":"done","reason":"","name":"Вихідні","description":"","looks":[{"name":"A","occasion":"","season":"all","top":[],"layer":["W-J"],"bottom":["W-1"],"shoes":["W-S"],"accessories":[],"why":""},{"name":"B","occasion":"","season":"all","top":["W-T"],"layer":[],"bottom":["W-2"],"shoes":["W-S"],"accessories":[],"why":""}]}\' > "$o"; else printf PNG > "$d/result.png"; echo \'{"status":"done"}\' > "$o"; fi\n',
+    '#!/bin/sh\nschema=""\nwhile [ $# -gt 0 ]; do case "$1" in -C) d="$2"; shift;; -o) o="$2"; shift;; --output-schema) schema="$2"; shift;; esac; shift; done\ncat >/dev/null\nif [ -n "$schema" ]; then echo \'{"status":"done","reason":"","name":"Вихідні","description":"","looks":[{"name":"A","occasion":"","season":"all","top":[],"layer":["W-J"],"bottom":["W-1"],"shoes":["W-S"],"accessories":[],"why":""},{"name":"B","occasion":"","season":"all","top":["W-T"],"layer":[],"bottom":["W-2"],"shoes":["W-S"],"accessories":[],"why":""}]}\' > "$o"; else cp "$d/../../fixture.png" "$d/result.png"; echo \'{"status":"done"}\' > "$o"; fi\n',
     { mode: 0o755 },
   );
   await store.mutate((db) => {
@@ -2191,4 +2192,76 @@ test('accounts: uploads stop at the beta\'s photo size, photo count and folder s
   assert.equal(t('Фото більше за 15 МБ'), 'The photo is larger than 15 MB');
   assert.equal(t('Місце закінчилося: 2 ГБ на акаунт'), 'Out of space: 2 GB per account');
   setLanguage('uk');
+});
+
+test('garment cards create missing sheet folder, crops cap resolution, and try-on cleans temp files and validates PNG', async () => {
+  const { fitGarmentCards, sharpImaging } = await import('./garment-references.ts');
+  const sharp = (await import('sharp')).default;
+  const { dir, store, call } = setup();
+  // fitGarmentCards creates the sheet parent directory even when every crop was already cached.
+  const imgA = path.join(dir, 'a.png');
+  const imgB = path.join(dir, 'b.png');
+  const imgC = path.join(dir, 'c.png');
+  for (const p of [imgA, imgB, imgC]) fs.writeFileSync(p, await sharp({ create: { width: 80, height: 80, channels: 3, background: '#335577' } }).png().toBuffer());
+  const slots = [
+    { slot: 'layer' as const, kind: 'item' as const, id: '1', title: 'Coat', description: '', owned: true, photoPaths: ['a.png'] },
+    { slot: 'top' as const, kind: 'item' as const, id: '2', title: 'Tee', description: '', owned: true, photoPaths: ['b.png'] },
+    { slot: 'bottom' as const, kind: 'item' as const, id: '3', title: 'Pants', description: '', owned: true, photoPaths: ['c.png'] },
+  ];
+  const sheetPath = path.join(dir, 'missing-parent', 'nested', 'garments.png');
+  const cards = await fitGarmentCards(slots, 2, dir, sheetPath, (p) => path.join(dir, p));
+  assert.ok(fs.existsSync(sheetPath), 'missing sheet parent directory is created');
+  assert.equal(cards.filter((c) => c.file === sheetPath).length, 2);
+
+  // Oversized crops are capped at 1536 px on the longest side.
+  const huge = path.join(dir, 'huge.png');
+  const cropped = path.join(dir, 'cropped.png');
+  await sharp({ create: { width: 2400, height: 1800, channels: 3, background: '#224466' } }).png().toFile(huge);
+  const okKeys = (await sharpImaging('crop', [{ key: 0, source: huge, destination: cropped, box: { x: 0, y: 0, width: 1, height: 1 } }], async () => [false])) as number[];
+  assert.deepEqual(okKeys, [0]);
+  const meta = await sharp(cropped).metadata();
+  assert.equal(meta.width, 1536);
+  assert.equal(meta.height, 1152);
+
+  // Try-on via OpenAI engine records its real tool name and cleans up jobDir/result.png.
+  const crop = sourceCropFixture(dir);
+  await store.mutate((db) => {
+    db.items[0].tryonReference = crop;
+    db.looks[0].slots.top = [];
+    db.looks[0].versions[0].slots = db.looks[0].slots;
+  });
+  const engine = {
+    label: 'gpt-test', imageLabel: 'gpt-image-test',
+    json: async () => ({ reply: { faces: [false] } }),
+    image: async (req: { resultFile: string }) => {
+      fs.writeFileSync(req.resultFile, SAMPLE_PNG);
+      return { ok: true };
+    },
+  } as never;
+  const job = await call('POST', '/api/jobs', { lookId: 'L-1', basePhotoIds: ['P-1'] });
+  await createRunner(store, dir, '/usr/bin/false', { engine }).drain();
+  const db = store.read();
+  const res = db.results.find((r) => r.jobId === job.id)!;
+  assert.equal(res.tool, 'OpenAI Images API');
+  assert.equal(fs.existsSync(path.join(dir, 'jobs', job.id, 'result.png')), false, 'duplicate result.png cleaned from job dir');
+  assert.equal(fs.existsSync(path.join(dir, res.imagePath)), true, 'final render kept in media/renders');
+  // stateView strips heavy try-on slot snapshots while keeping identity for currentCover.
+  const view = stateView(db);
+  assert.deepEqual(view.jobs.find((j) => j.id === job.id)!.snapshot.slots, []);
+});
+
+test('eyewear preference: blocked by default, allowed when enabled in profile', async () => {
+  const { store, call } = setup();
+  await store.mutate((db) => {
+    db.items.push({ id: 'W-G', rev: 1, category: 'accessories', title: 'Tortoise sunglasses', status: 'confirmed', photoIds: [], origin: 'manual', rating: { score: 8, note: 'Sharp.', rev: 1, at, scale: 2 }, history: [], createdAt: at, updatedAt: at });
+  });
+  assert.equal(itemRating(store.read().items.find((i) => i.id === 'W-G')!, store.read()), null);
+  await assert.rejects(call('POST', '/api/analyze', { itemIds: ['W-G'] }), /Окуляри/);
+  await call('PATCH', '/api/profile', { rev: store.read().profile.rev, allowEyewear: true });
+  const db = store.read();
+  assert.equal(db.profile.allowEyewear, true);
+  assert.equal(itemRating(db.items.find((i) => i.id === 'W-G')!, db), 8);
+  assert.ok(itemVerdict(db, db.items.find((i) => i.id === 'W-G')!));
+  const job = await call('POST', '/api/analyze', { itemIds: ['W-G'] });
+  assert.equal(job.kind, 'analyze');
 });

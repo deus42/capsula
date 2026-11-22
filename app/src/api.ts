@@ -94,7 +94,7 @@ async function browserJpeg(file: File): Promise<File> {
 }
 
 export async function uploadFile(original: File, params: Record<string, string>) {
-  const file = convertUploads ? await browserJpeg(original) : original;
+  const file = convertUploads && params.kind !== 'worn' ? await browserJpeg(original) : original;
   const qs = new URLSearchParams(params).toString();
   const res = await fetch(`/api/upload?${qs}`, {
     method: 'POST',

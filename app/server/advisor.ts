@@ -7,7 +7,7 @@ import { CATEGORIES, SEASONS, emptySlots } from './schema.ts';
 import { newId, now } from './store.ts';
 import { focusLine, replyLanguage } from './person.ts';
 import { CATEGORY_UK, ownedItems } from './analysis.ts';
-import { SCORE_SCALE, SLOT_CATEGORIES, currentPeriod, hasPieces, isComplete, isEyewear, itemUsage, openSuggestions, siteLooks, weakPiece } from '../src/lib.ts';
+import { SCORE_SCALE, SLOT_CATEGORIES, currentPeriod, eyewearBlocked, hasPieces, isBlockedEyewear, isComplete, itemUsage, openSuggestions, siteLooks, weakPiece } from '../src/lib.ts';
 import { hiddenLookIds, isCapsuleHidden } from '../src/rating.ts';
 import { placeLook, placePurchaseInSet, requireParentCapsule } from './capsule-membership.ts';
 import { alreadySeen, refusedPieces } from '../src/look-memory.ts';
@@ -66,8 +66,8 @@ export const itemsToRate = (db: DB) => advisable(db).filter((i) => !i.rating || 
 export const looksToScore = (db: DB) => siteLooks(db).filter((l) => hasPieces(l) && (!l.advice || l.advice.version !== l.version || l.advice.scale !== SCORE_SCALE));
 const currentLookScore = (l: { advice?: { score: number; version: number; scale?: number }; version: number }) => (l.advice && l.advice.version === l.version && l.advice.scale === SCORE_SCALE ? l.advice.score : null);
 
-/** Owned items the advisor works with: eyewear stays out of looks entirely (owner rule). */
-const advisable = (db: DB) => ownedItems(db).filter((i) => !isEyewear(i.title));
+/** Owned items the advisor works with (respecting the profile's eyewear setting). */
+const advisable = (db: DB) => ownedItems(db).filter((i) => !isBlockedEyewear(db, i.title));
 
 /** Open «замінить» purchases at a time: the rest stay as a line on the item page (no flood in «Покупки»). */
 export const MAX_OPEN_REPLACEMENTS = 3;
@@ -136,7 +136,7 @@ export function advisePrompt(db: DB, job: Job, attached: string[]) {
     `3. newLooks — up to 3 new outfits from owned item ids only. First, every item with no shown look yet (${unused.join(', ') || 'none'}) that fits a listed capsule gets one outfit; then items rated 7+ with 0–1 shown looks. Every outfit requires the id of a listed capsule whose style and season fits. If none fits, propose a new capsule in newCapsules. Each needs a bottom and shoes; at most one item per slot except accessories (max 2). why: which owned pieces it brings into use and why it works.`,
     `5. newNeeds — at most 2: a piece to BUY when a listed capsule clearly lacks something for its style and season (e.g. no warm layer, no fitting shoes) and no owned item can fill it. capsuleId, title (short ${replyLanguage(db)} name of the piece), category (${CATEGORIES.join(' | ')}), why (one sentence). Never repeat the open purchases or the declined purchases listed below. Usually empty.`,
     '4. newCapsules — at most 1, only when 3 or more strong outfits of one style and season are not covered by any listed capsule: a name, season (all | warm | transitional | cold), why and 3–5 looks (same rules). Usually empty.',
-    'Never use eyewear (glasses, sunglasses, frames) anywhere — the owner wears none in looks.',
+    eyewearBlocked(db) ? 'Never use eyewear (glasses, sunglasses, frames) anywhere — the owner wears none in looks.' : '',
     'Same-look rule (the owner\'s): two outfits are the SAME look when identical or different by only one piece. Every new outfit must be a different look from each other, from every listed look and from every rejected outfit.',
     'Return status "error" only if the wardrobe cannot be read.',
     '',
@@ -254,7 +254,7 @@ export function applyAdvice(db: DB, job: Job, reply: AdviseReply, seen?: Map<str
   // Search results («Нові») do not take the advisor's places.
   const room = Math.max(0, MAX_OPEN_PROPOSALS - keep.filter((s) => s.status === 'open' && s.source !== 'search').length);
   const fresh: Suggestion[] = [];
-  const eyewear = new Set(db.items.filter((i) => isEyewear(i.title)).map((i) => i.id));
+  const eyewear = new Set(db.items.filter((i) => isBlockedEyewear(db, i.title)).map((i) => i.id));
   const take = (o: Outfit) => {
     const slots = slotsFrom(o, owned, eyewear);
     if (!slots || Object.values(slots).flat().some((r) => refused.has(r.id) || weakPiece(owned.get(r.id)!))) return null;

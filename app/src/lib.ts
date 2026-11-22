@@ -1,4 +1,4 @@
-import type { Capsule, Category, DB, Item, Job, Look, MeasureKey, Need, Period, Result, Season, SlotKey, SlotRef } from './api.ts';
+import type { Capsule, Category, DB, Item, Job, Look, MeasureKey, Need, Period, Result, Season, SlotKey, SlotRef, Wear } from './api.ts';
 import { hiddenLookIds, isCapsuleHidden } from './rating.ts';
 import { groupLookVariations } from './look-variation.ts';
 import { tooClose, withBuys } from './look-memory.ts';
@@ -142,6 +142,23 @@ export function currentCover(db: DB, look: Look): Result | undefined {
   return cover && (cover.lookVersion === look.version || look.keptVersion === look.version) ? cover : undefined;
 }
 
+/**
+ * «Додати мій образ»: the latest real appearance of the look's current composition. Photos of an older version
+ * show other pieces, so they never stand for the look once it changes.
+ */
+export function currentWear(db: DB, look: Look): Wear | undefined {
+  return (db.wears ?? []).filter((w) => w.lookId === look.id && w.lookVersion === look.version).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+}
+
+/** The person's own photos of a wear, in the order they were added. */
+export const wearPhotoPaths = (db: DB, wear: Wear) => wear.photoIds.map((id) => db.photos.find((p) => p.id === id && p.kind === 'worn')?.path).filter((p): p is string => Boolean(p));
+
+/** The render pinned beside a wear, while it is still shown (a hidden or deleted one is gone from the state). */
+export const wearRenderOf = (db: DB, wear: Wear) => (wear.resultId ? db.results.find((r) => r.id === wear.resultId && !r.hiddenAt && r.review !== 'rework' && r.lookId === wear.lookId && r.lookVersion === wear.lookVersion) : undefined);
+
+/** The latest review job of a wear. */
+export const wearJob = (db: DB, wearId: string) => db.jobs.filter((j) => j.kind === 'wearreview' && j.wearId === wearId).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
+
 /** A try-on of this look is being made right now (a queued one is not shown as work in progress). */
 export const lookBusy = (db: DB, lookId: string) => db.jobs.some((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === lookId && j.state === 'running');
 
@@ -149,7 +166,7 @@ export const lookBusy = (db: DB, lookId: string) => db.jobs.some((j) => (j.kind 
 export const lookJob = (db: DB, lookId: string, includeQueued = false) =>
   db.jobs.filter((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === lookId && (j.state === 'running' || (includeQueued && j.state === 'queued'))).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
 
-const FALLBACK_SECONDS: Record<string, number> = { tryon: 140, packshot: 80, intake: 25, analyze: 60, shopsearch: 320, advise: 240, storefind: 240, discover: 120 };
+const FALLBACK_SECONDS: Record<string, number> = { tryon: 140, packshot: 80, intake: 25, analyze: 60, shopsearch: 320, advise: 240, storefind: 240, discover: 120, wearreview: 60 };
 
 /** How long a job of this kind usually takes here: the median of the last 20 finished ones (owner, 18.11). */
 export function expectedSeconds(db: DB, kind: Job['kind']) {
@@ -303,8 +320,8 @@ export function capsuleRating(db: DB, c: Pick<Capsule, 'lookIds'>) {
   const scores = distinctLooks(db, capsuleLooks(db, c.lookIds)).filter(hasPieces).map(lookRating).filter((s): s is number => s !== null);
   return scores.length ? Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 10) / 10 : null;
 }
-/** An item's score, like its verdict line: none for glasses or pieces no longer in the wardrobe. */
-export const itemRating = (item: Item) => (item.rating && item.status !== 'inactive' && !item.mergedInto && !isEyewear(item.title) ? item.rating.score : null);
+/** An item's score, like its verdict line: none for blocked glasses or pieces no longer in the wardrobe. */
+export const itemRating = (item: Item, db?: DB) => (item.rating && item.status !== 'inactive' && !item.mergedInto && !(db ? isBlockedEyewear(db, item.title) : isEyewear(item.title)) ? item.rating.score : null);
 export const bestCapsule = (db: DB) => ({ id: BEST_CAPSULE_ID, name: BEST_CAPSULE_NAME, lookIds: bestLooks(db).map((l) => l.id), favorite: false });
 /** The site's own capsules (no data of their own): «Найкращі» and «З моїх речей». */
 export const isAutoCapsule = (id: string) => id === BEST_CAPSULE_ID || id === WARDROBE_CAPSULE_ID;
@@ -364,8 +381,7 @@ export function itemUsage(db: DB, itemId: string, ready = wardrobeCapsule(db)) {
 /** The item page's quiet line (owner, 18.11): «8/10 · сильна річ», «гарна, мало образів», «варто замінити: …»; the count lives in «Де використано». */
 export function itemVerdict(db: DB, item: Item): { line: string; note: string; kind: 'strong' | 'underused' | 'replace' | 'plain'; need?: Need } | null {
   const r = item.rating;
-  // Eyewear is never used in looks (owner, 17.11), so it gets no verdict either.
-  if (!r || item.status === 'inactive' || item.mergedInto || isEyewear(item.title)) return null;
+  if (!r || item.status === 'inactive' || item.mergedInto || isBlockedEyewear(db, item.title)) return null;
   const n = itemUsage(db, item.id).looks;
   const reason = r.replace ? `${r.replace.charAt(0).toLowerCase()}${r.replace.slice(1)}`.replace(/[.\s]+$/, '') : '';
   if (r.replace && !r.kept) return { kind: 'replace', line: `${r.score}/10 · ${t('варто замінити')}: ${reason}`, note: r.note, need: db.needs.find((x) => x.replaces === item.id && x.status === 'open') };
@@ -374,16 +390,18 @@ export function itemVerdict(db: DB, item: Item): { line: string; note: string; k
   return { kind: 'plain', line: `${r.score}/10`, note: r.note };
 }
 
-/** Glasses never go into the owner's looks (owner rule: no eyewear of any kind). */
 /** The honest rank scale's version (owner, 19.11); ratings made with an older scale are redone once. */
 export const SCORE_SCALE = 2;
 /** A so-so piece (owner, 19.11: «відсіяти так собі речі»): honest score under 6, or still «варто замінити». New looks are not built with it. */
 export const weakPiece = (item: Item) => Boolean(item.rating && ((item.rating.scale === SCORE_SCALE && item.rating.score < 6) || (item.rating.replace && !item.rating.kept)));
 export const isEyewear = (title: string) => /окуляр|оправ|glasses|eyewear/i.test(title);
+/** Whether eyewear is kept out of looks for this profile (default: yes, unless enabled in preferences). */
+export const eyewearBlocked = (db: DB) => !db.profile.allowEyewear;
+export const isBlockedEyewear = (db: DB, title: string) => eyewearBlocked(db) && isEyewear(title);
 
-/** Advisor proposals still worth showing: open and made only of active owned pieces, never eyewear. */
+/** Advisor proposals still worth showing: open and made only of active owned pieces. */
 export function openSuggestions(db: DB) {
-  const active = new Set(db.items.filter((i) => i.status !== 'inactive' && !i.mergedInto && !isEyewear(i.title) && !weakPiece(i)).map((i) => i.id));
+  const active = new Set(db.items.filter((i) => i.status !== 'inactive' && !i.mergedInto && !isBlockedEyewear(db, i.title) && !weakPiece(i)).map((i) => i.id));
   const parents = new Set(db.capsules.filter((c) => !isCapsuleHidden(db, c)).map((c) => c.id));
   // A proposal that a look made meanwhile already covers is not shown (look memory, owner 19.11).
   // A proposal for a capsule with a closed set shows only while its owned pieces are in that set (owner, 20.11).

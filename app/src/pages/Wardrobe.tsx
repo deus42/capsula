@@ -4,7 +4,7 @@ import type { Category, Item, ItemStatus, Job } from '../api.ts';
 import { api, media, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
 import { Badge, CategoryIcon, ConfirmButton, Empty, JobBar, LookArt, Missing, Modal, PageHead, SubNav, UploadButton } from '../components/ui.tsx';
-import { CATEGORY_LABEL, capsuleCount, isEyewear, itemPlacements, itemRating, itemVerdict, scoreLabel, usageLabel, wardrobeCapsule } from '../lib.ts';
+import { CATEGORY_LABEL, capsuleCount, isBlockedEyewear, itemPlacements, itemRating, itemVerdict, scoreLabel, usageLabel, wardrobeCapsule } from '../lib.ts';
 
 import { InfoMark, TermInfo } from './Glossary.tsx';
 import { t } from '../i18n.ts';
@@ -91,7 +91,7 @@ function ItemPage({ item }: { item: Item }) {
 
       <div className="section-head">
         <h2 className="h2">{t('Де використано')} <span className="count">{usageLabel(capsuleCount(capsules), looks.length)}</span></h2>
-        {item.status !== 'inactive' && !isEyewear(item.title) && (
+        {item.status !== 'inactive' && !isBlockedEyewear(db, item.title) && (
           <button className="btn sm" onClick={async () => { const ok = await act(() => api('POST', '/api/discover', { itemIds: [item.id] }), t('Шукаю нові образи з цією річчю')); if (ok) go('/capsules?tab=new'); }}>
             <Sparkles size={13} /> {t('Ще образ')}
           </button>
@@ -238,7 +238,7 @@ export function WardrobePage({ openId }: { openId?: string }) {
   const cat = CATS.includes(view as Category) ? (view as Category) : null;
   // Inactive items only appear in the «Неактуальні» filter.
   const list = db.items.filter(
-    (i) => !i.mergedInto && !(mode === 'compose' && isEyewear(i.title)) && (view !== 'new' || isNew(i)) && (!cat || i.category === cat) && (status ? i.status === status : i.status !== 'inactive') && `${i.title} ${i.id} ${i.brand ?? ''}`.toLowerCase().includes(q.trim().toLowerCase()),
+    (i) => !i.mergedInto && !(mode === 'compose' && isBlockedEyewear(db, i.title)) && (view !== 'new' || isNew(i)) && (!cat || i.category === cat) && (status ? i.status === status : i.status !== 'inactive') && `${i.title} ${i.id} ${i.brand ?? ''}`.toLowerCase().includes(q.trim().toLowerCase()),
   );
   const visible = db.items.filter((i) => i.status !== 'inactive' && !i.mergedInto);
   const open = openId ? db.items.find((i) => i.id === openId) : undefined;
@@ -323,7 +323,7 @@ export function WardrobePage({ openId }: { openId?: string }) {
                       {st?.state === 'running' && <JobBar job={st} />}
                     </div>
                     <span className="nm">{i.title}<TermInfo texts={[i.title]} /></span>
-                    {usage && <span className="sub">{[itemRating(i) !== null ? scoreLabel(itemRating(i)!) : '', usageLabel(capsuleCount(usage.capsules), usage.looks.length)].filter(Boolean).join(' · ')}</span>}
+                    {usage && <span className="sub">{[itemRating(i, db) !== null ? scoreLabel(itemRating(i, db)!) : '', usageLabel(capsuleCount(usage.capsules), usage.looks.length)].filter(Boolean).join(' · ')}</span>}
                   </button>
                 );
               })}

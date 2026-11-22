@@ -1,5 +1,7 @@
 import path from 'node:path';
-import type { Capsule, DB, Item, Job, Look, Need, Photo, PhotoKind, ReworkReason, SlotKey, SlotRef, Slots, SnapshotSlot, Language, WardrobeFocus } from './schema.ts';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import type { Capsule, DB, Item, Job, Look, Need, Photo, PhotoKind, ReworkReason, SlotKey, SlotRef, Slots, SnapshotSlot, Language, WardrobeFocus, Wear } from './schema.ts';
 import { CATEGORIES, ITEM_STATUSES, LANGUAGES, MEASURE_KEYS, PHOTO_KINDS, REWORK_REASONS, SEASONS, SLOT_KEYS, WARDROBE_FOCUS } from './schema.ts';
 import type { Store } from './store.ts';
 import { HttpError, bump, findOr404, newId, now } from './store.ts';
@@ -7,7 +9,7 @@ import { folderBytes, prewarm, saveUpload, type StorageLimits } from './media.ts
 import { pickTheme } from './analysis.ts';
 import { acceptSuggestion, dropReplacementsFor, keepItem, queueAdvice, rememberDeclined } from './advisor.ts';
 import { looksNeedingRender } from '../src/render-need.ts';
-import { isEyewear } from '../src/lib.ts';
+import { isBlockedEyewear } from '../src/lib.ts';
 import { productKey, queueStoreFind } from './shop-search.ts';
 import { quotaKind, type QuotaKind } from './quota.ts';
 import { STYLE_CATALOGUE, styleBrief } from '../src/style-catalogue.ts';
@@ -15,6 +17,7 @@ import { tooClose, withBuys } from '../src/look-memory.ts';
 import { queueDiscover } from './discover.ts';
 import { sameIdentity } from './identity.ts';
 import { assertLookFits, placeLook, replaceInSets, requireParentCapsule, setCapsulePieces, stripFromSets } from './capsule-membership.ts';
+import { MAX_WEAR_PHOTOS, newWearId, queueWearReview, reviewPending, wearRender } from './wear-review.ts';
 
 type Body = Record<string, unknown>;
 export interface Ctx {
@@ -281,16 +284,29 @@ export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, file
   const intake = query.get('kind') === 'intake';
   const kind = (intake ? 'item' : (query.get('kind') ?? 'item')) as PhotoKind;
   if (!PHOTO_KINDS.includes(kind) || kind === 'source' || kind === 'packshot') throw new HttpError(400, 'Невідомий тип фото');
+  // A photo of a worn look is kept once: the same file chosen again (a retry after a reload) is the same photo.
+  const worn = kind === 'worn';
+  const sha256 = worn ? createHash('sha256').update(buf).digest('hex') : undefined;
+  const known = (db: DB) => (worn ? db.photos.find((p) => p.kind === 'worn' && p.sha256 === sha256) : undefined);
+  const existing = known(ctx.store.read());
+  if (existing) return existing;
   if (ctx.limits) checkStorage(ctx, ctx.limits, buf.length);
   if (intake) ctx.admit?.('intake');
   const id = newId('P');
   const saved = await saveUpload(ctx.projectRoot, ctx.store.dataDir, id, buf);
   prewarm(ctx.projectRoot, ctx.store.dataDir, [saved.path]);
-  const itemId = query.get('item');
-  const productId = query.get('product');
+  // A worn photo is never a garment or product source.
+  const itemId = worn ? null : query.get('item');
+  const productId = worn ? null : query.get('product');
   let queuedPackshot = false;
+  let duplicate = false;
   return ctx.store.mutate((db) => {
-    const photo: Photo = { id, kind, path: saved.path, originalPath: saved.originalPath, originalName: path.basename(filename || 'upload').slice(0, 200), source: 'upload', preserveAsReference: true, meetsStandard: kind === 'base' ? null : undefined, createdAt: now() };
+    const same = known(db);
+    if (same) {
+      duplicate = true;
+      return same;
+    }
+    const photo: Photo = { id, kind, path: saved.path, originalPath: saved.originalPath, originalName: path.basename(filename || 'upload').slice(0, 200), source: 'upload', preserveAsReference: true, meetsStandard: kind === 'base' ? null : undefined, ...(sha256 ? { sha256 } : {}), createdAt: now() };
     db.photos.push(photo);
     if (kind === 'base') {
       db.profile.basePhotoIds.push(id);
@@ -313,6 +329,8 @@ export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, file
     }
     return photo;
   }).then((photo) => {
+    // Two requests with the same file at once: the second copy on disk is dropped.
+    if (duplicate) for (const rel of [saved.path, saved.originalPath]) if (rel) fs.rmSync(path.join(ctx.projectRoot, rel), { force: true });
     if ((intake || queuedPackshot) && query.get('run') !== '0') ctx.drain();
     return photo;
   });
@@ -329,9 +347,19 @@ function dropJobs(db: DB, pred: (j: Job) => boolean) {
   const resultIds = new Set(db.results.filter((r) => gone.has(r.jobId)).map((r) => r.id));
   db.results = db.results.filter((r) => !resultIds.has(r.id));
   db.comparisons = db.comparisons.filter((c) => !resultIds.has(c.resultA) && !resultIds.has(c.resultB));
+  unpinRenders(db);
   db.jobs = db.jobs.filter((j) => !gone.has(j.id));
   for (const j of db.jobs) if (j.retryOf && gone.has(j.retryOf)) delete j.retryOf;
   return gone;
+}
+
+/** A deleted render leaves the wears it was beside: the real photos and the review stay. */
+function unpinRenders(db: DB) {
+  for (const w of db.wears ?? []) {
+    if (!w.resultId || db.results.some((r) => r.id === w.resultId)) continue;
+    delete w.resultId;
+    if (w.review) delete w.review.resultId;
+  }
 }
 
 export function deleteLook(db: DB, id: string) {
@@ -345,9 +373,13 @@ export function deleteLook(db: DB, id: string) {
     seen.add(key);
     db.lookMemory = [...(db.lookMemory ?? []), { slots, outcome: 'deleted' as const, ref: look.id, name: look.name, at }];
   }
-  busyJob(db, (j) => j.lookId === id);
-  dropJobs(db, (j) => j.lookId === id);
+  const wears = new Set((db.wears ?? []).filter((w) => w.lookId === id).map((w) => w.id));
+  busyJob(db, (j) => j.lookId === id || (j.kind === 'wearreview' && wears.has(j.wearId ?? '')));
+  dropJobs(db, (j) => j.lookId === id || (j.kind === 'wearreview' && wears.has(j.wearId ?? '')));
+  // The real photos stay in «Мої фото»; only their link to the deleted look goes.
+  if (db.wears) db.wears = db.wears.filter((w) => !wears.has(w.id));
   db.results = db.results.filter((r) => r.lookId !== id);
+  unpinRenders(db);
   db.comparisons = db.comparisons.filter((c) => db.results.some((r) => r.id === c.resultA) && db.results.some((r) => r.id === c.resultB));
   for (const c of db.capsules) c.lookIds = c.lookIds.filter((l) => l !== id);
   for (const n of db.needs) if (n.coveredLookIds?.includes(id)) n.coveredLookIds = n.coveredLookIds.filter((l) => l !== id);
@@ -433,7 +465,7 @@ on('PATCH', '/api/items/:id', async (ctx, [id], b) => {
     if (b.status && ITEM_STATUSES.includes(b.status as never)) item.status = b.status as Item['status'];
     // «Це моя річ? — Ні»: a rejected item no longer covers a recommendation; its looks get the stand-in back.
     if (item.status === 'inactive' && before !== 'inactive') for (const n of db.needs) if (n.coveredByItem === item.id && n.status === 'covered' && !db.products.some((p) => p.needId === n.id && p.status === 'purchased')) uncoverNeed(db, n.id);
-    if (Array.isArray(b.photoIds)) item.photoIds = (b.photoIds as string[]).filter((pid) => db.photos.some((p) => p.id === pid));
+    if (Array.isArray(b.photoIds)) item.photoIds = (b.photoIds as string[]).filter((pid) => db.photos.some((p) => p.id === pid && p.kind !== 'worn'));
     clearDetachedCrop(db, item);
     if (!item.title) throw new HttpError(400, 'Назва не може бути порожньою');
     history(item, before !== item.status ? `status:${item.status}` : 'edited');
@@ -640,6 +672,88 @@ on('PATCH', '/api/looks/:id', async (ctx, [id], b) => {
   return out.look;
 });
 
+// ── «Додати мій образ»: real photos of a saved look ─────────────────────────
+const sameSet = (a: string[], b: string[]) => a.length === b.length && a.every((x) => b.includes(x));
+
+/** The stylist may read it now: refusals (allowance, budget, AI only for the owner) leave the photos saved without a review. */
+function mayReview(ctx: Ctx): string | null {
+  try {
+    ctx.admit?.('styling');
+    return null;
+  } catch (e) {
+    if (e instanceof HttpError && (e.status === 429 || e.status === 403)) return e.message;
+    throw e;
+  }
+}
+
+/**
+ * One appearance, one or more photos, one request. The same request again (the same key, or the same photos for
+ * the same look version after a reload) returns the same wear and never a second review.
+ */
+on('POST', '/api/looks/:id/wears', async (ctx, [id], b) => {
+  const key = str(b.key, 80);
+  if (!key) throw new HttpError(400, 'Немає ключа запиту');
+  const ids = [...new Set((Array.isArray(b.photoIds) ? b.photoIds : []).filter((x): x is string => typeof x === 'string'))];
+  if (!ids.length || ids.length > MAX_WEAR_PHOTOS) throw new HttpError(400, 'Додай від 1 до 6 власних фото образу');
+  const refused = mayReview(ctx);
+  const out = await ctx.store.mutate((db) => {
+    const look = findOr404(db.looks, id, 'Образ');
+    if (!ids.every((pid) => db.photos.some((p) => p.id === pid && p.kind === 'worn' && p.source === 'upload'))) throw new HttpError(400, 'Додай власні фото образу');
+    db.wears ??= [];
+    let wear = db.wears.find((w) => w.key === key);
+    if (wear && wear.lookId !== look.id) throw new HttpError(409, 'Цей запит уже належить іншому образу');
+    if (!wear && b.lookVersion !== undefined && b.lookVersion !== look.version) throw new HttpError(409, 'Склад образу змінився. Переглянь його й додай фото ще раз.');
+    wear ??= db.wears.find((w) => w.lookId === look.id && w.lookVersion === look.version && sameSet(w.photoIds, ids));
+    if (!wear) {
+      const render = wearRender(db, look);
+      wear = { id: newWearId(), lookId: look.id, lookVersion: look.version, photoIds: ids, ...(render ? { resultId: render.id } : {}), key, createdAt: now() } satisfies Wear;
+      db.wears.push(wear);
+    }
+    const alreadyRequested = db.jobs.some((j) => j.kind === 'wearreview' && j.wearId === wear.id);
+    const job = !wear.review && !alreadyRequested && !refused ? queueWearReview(db, wear) : undefined;
+    return { wear, job: job?.id };
+  });
+  const queued = out.job ? kept(ctx, [out.job]).length > 0 : false;
+  if (queued) ctx.drain();
+  return { wear: ctx.store.read().wears?.find((w) => w.id === out.wear.id) ?? out.wear, queued, note: refused ?? undefined };
+});
+
+// «Ще раз»: a review that failed is asked once more; a finished one is never repeated.
+on('POST', '/api/wears/:id/review', async (ctx, [id]) => {
+  const current = findOr404(ctx.store.read().wears ?? [], id, 'Образ у житті');
+  if (current.review) throw new HttpError(409, 'Розбір уже є');
+  if (!reviewPending(ctx.store.read(), id)) ctx.admit?.('styling');
+  const job = await ctx.store.mutate((db) => {
+    const wear = findOr404(db.wears ?? [], id, 'Образ у житті');
+    if (reviewPending(db, wear.id)) return db.jobs.filter((j) => j.kind === 'wearreview' && j.wearId === wear.id).at(-1)!;
+    return queueWearReview(db, wear);
+  });
+  ctx.drain();
+  return job;
+});
+
+// «Одягну знову?»: the person's own answer; null clears it.
+on('PATCH', '/api/wears/:id', (ctx, [id], b) =>
+  ctx.store.mutate((db) => {
+    const wear = findOr404(db.wears ?? [], id, 'Образ у житті');
+    if (b.again === null) delete wear.again;
+    else if (typeof b.again === 'boolean') wear.again = b.again;
+    else throw new HttpError(400, 'Відповідь: так, ні або null');
+    return wear;
+  }),
+);
+
+// Removes a wear entry from its look while keeping the uploaded original photos in the archive.
+on('DELETE', '/api/wears/:id', (ctx, [id]) =>
+  ctx.store.mutate((db) => {
+    const wear = findOr404(db.wears ?? [], id, 'Образ у житті');
+    busyJob(db, (j) => j.kind === 'wearreview' && j.wearId === wear.id);
+    dropJobs(db, (j) => j.kind === 'wearreview' && j.wearId === wear.id);
+    db.wears = (db.wears ?? []).filter((w) => w.id !== wear.id);
+    return { ok: true };
+  }),
+);
+
 // ── Try-on queue ───────────────────────────────────────────────────────────
 on('POST', '/api/jobs', async (ctx, _p, b) => {
   ctx.admit?.('tryon');
@@ -662,6 +776,11 @@ on('POST', '/api/jobs/:id/retry', async (ctx, [id], b) => {
       const j: Job = { id: newId('J'), kind: prev.kind, inputPhotoIds: prev.inputPhotoIds, lookVersion: 0, snapshot: prev.snapshot, instructions: [prev.instructions, str(b.instructions)].filter(Boolean).join('\n'), state: 'queued', origin: 'site', retryOf: prev.id, createdAt: now() };
       db.jobs.push(j);
       return j;
+    }
+    if (prev.kind === 'wearreview') {
+      const wear = findOr404(db.wears ?? [], prev.wearId ?? '', 'Образ у житті');
+      if (reviewPending(db, wear.id)) throw new HttpError(409, 'Завдання ще виконується');
+      return queueWearReview(db, wear);
     }
     if (prev.kind === 'packshot') return packshotJob(db, { itemId: prev.itemId, needId: prev.needId }, [prev.instructions, str(b.instructions)].filter(Boolean).join('\n'), prev.id, prev.snapshot);
     const look = findOr404(db.looks, prev.lookId ?? '', 'Образ');
@@ -700,7 +819,7 @@ on('POST', '/api/analyze', async (ctx, _p, b) => {
     const required = (Array.isArray(b.itemIds) ? (b.itemIds as string[]) : []).slice(0, 4);
     const picked = required.map((id) => findOr404(db.items, id, 'Річ'));
     if (picked.some((i) => i.status === 'inactive')) throw new HttpError(400, 'Неактуальну річ не можна брати в образ');
-    if (picked.some((i) => isEyewear(i.title))) throw new HttpError(400, 'Окуляри в образи не беру');
+    if (picked.some((i) => isBlockedEyewear(db, i.title))) throw new HttpError(400, 'Окуляри в образи не беру');
     const instructions = asked || (picked.length ? `Доповнити: ${picked.map((i) => i.title).join(', ')}` : `Тема: ${pickTheme(db)}`);
     const j: Job = { id: newId('J'), kind: 'analyze', requiredItemIds: picked.length ? required : undefined, lookVersion: 0, snapshot: { lookName: picked.length ? 'Доповнити образ' : 'Підбірка з моїх речей', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions, state: 'queued', origin: 'site', createdAt: now() };
     db.jobs.push(j);
@@ -896,7 +1015,7 @@ on('POST', '/api/products/:id/purchase', async (ctx, [id], b) => {
     if (need.status !== 'open') throw new HttpError(409, `«${need.title}» уже закрито`);
     const at = now();
     const ownPhoto = str(b.photoId);
-    const photos = [p.photoId, ownPhoto].filter((x): x is string => Boolean(x) && db.photos.some((ph) => ph.id === x));
+    const photos = [p.photoId, ownPhoto].filter((x): x is string => Boolean(x) && db.photos.some((ph) => ph.id === x && ph.kind !== 'worn'));
     const item: Item = {
       id: newId('W'),
       rev: 1,
@@ -981,7 +1100,7 @@ on('PATCH', '/api/profile', (ctx, _p, b) =>
       const pr = b.preferences as Record<string, unknown>;
       for (const k of ['comfort', 'materials', 'fit', 'branding'] as const) if (typeof pr[k] === 'string') prof.preferences[k] = str(pr[k])!;
     }
-    if (Array.isArray(b.basePhotoIds)) prof.basePhotoIds = (b.basePhotoIds as string[]).filter((id) => db.photos.some((p) => p.id === id));
+    if (Array.isArray(b.basePhotoIds)) prof.basePhotoIds = (b.basePhotoIds as string[]).filter((id) => db.photos.some((p) => p.id === id && p.kind !== 'worn'));
     // First sign-in and «Побажання»: language, what to dress the person in, the consent, the hemisphere.
     if (b.language !== undefined) {
       if (!LANGUAGES.includes(b.language as never)) throw new HttpError(400, 'Невідома мова');
@@ -993,6 +1112,7 @@ on('PATCH', '/api/profile', (ctx, _p, b) =>
     }
     if (b.consent === true && !prof.consentAt) prof.consentAt = now();
     if (b.hemisphere === 'north' || b.hemisphere === 'south') prof.hemisphere = b.hemisphere;
+    if (typeof b.allowEyewear === 'boolean') prof.allowEyewear = b.allowEyewear;
     return prof;
   }),
 );
@@ -1063,6 +1183,7 @@ on('DELETE', '/api/results/:id', (ctx, [id]) =>
     db.comparisons = db.comparisons.filter((c) => c.resultA !== id && c.resultB !== id);
     for (const j of db.jobs) if (j.resultId === id) delete j.resultId;
     db.results = db.results.filter((x) => x.id !== r.id);
+    unpinRenders(db);
   }),
 );
 

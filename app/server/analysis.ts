@@ -6,7 +6,7 @@ import { CATEGORIES, SEASONS, SLOT_KEYS, emptySlots } from './schema.ts';
 import { newId, now } from './store.ts';
 import { focusLine, replyLanguage } from './person.ts';
 import { hiddenLookIds, lookKeys } from '../src/rating.ts';
-import { isEyewear, weakPiece } from '../src/lib.ts';
+import { isBlockedEyewear, weakPiece } from '../src/lib.ts';
 import { alreadySeen, refusedPieces } from '../src/look-memory.ts';
 
 export const CATEGORY_UK: Record<Category, string> = {
@@ -134,8 +134,8 @@ const lookItems = (l: Look) => new Set(SLOT_KEYS.flatMap((k) => l.slots[k].filte
 
 const outfitLine = (l: Look) => `- ${[...lookItems(l)].join(', ')}`;
 
-/** Owned pieces the analyzer may put into looks: eyewear never (owner rule: no glasses in looks). */
-export const lookPieces = (db: DB) => ownedItems(db).filter((i) => !isEyewear(i.title));
+/** Owned pieces the analyzer may put into looks (respecting the profile's eyewear setting). */
+export const lookPieces = (db: DB) => ownedItems(db).filter((i) => !isBlockedEyewear(db, i.title));
 
 export function analyzePrompt(db: DB, job: Job, attached: string[]) {
   // So-so pieces stay out unless the owner picked them himself (owner, 19.11).

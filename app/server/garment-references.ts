@@ -75,7 +75,11 @@ export async function sharpImaging(mode: 'preview' | 'crop' | 'sheet', request: 
         const width = Math.min(info.width - left, Math.round(e.box.width * info.width));
         const height = Math.min(info.height - top, Math.round(e.box.height * info.height));
         if (width < 48 || height < 48) continue;
-        await sharp(data).extract({ left, top, width, height }).png().toFile(e.destination);
+        await sharp(data)
+          .extract({ left, top, width, height })
+          .resize({ width: 1536, height: 1536, fit: 'inside', withoutEnlargement: true })
+          .png({ compressionLevel: 9 })
+          .toFile(e.destination);
         cut.push(e);
       } catch {
         /* a rectangle outside the photo is skipped */
@@ -208,6 +212,7 @@ export async function fitGarmentCards(slots: SnapshotSlot[], limit: number, dir:
   if (cards.length <= limit) return cards;
   const direct = cards.slice(0, limit - 1);
   const grouped = cards.slice(limit - 1);
+  fs.mkdirSync(path.dirname(sheet), { recursive: true, mode: 0o700 });
   await imaging('sheet', dir, { sources: grouped.map((c) => c.file), destination: sheet });
   return [...direct, ...grouped.map((c, i) => ({ slotIndex: c.slotIndex, file: sheet, card: i + 1 }))];
 }

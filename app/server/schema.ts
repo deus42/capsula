@@ -10,7 +10,8 @@ export type Category = (typeof CATEGORIES)[number];
 export const ITEM_STATUSES = ['needs_confirmation', 'confirmed', 'inactive'] as const;
 export type ItemStatus = (typeof ITEM_STATUSES)[number];
 
-export const PHOTO_KINDS = ['source', 'base', 'item', 'label', 'detail', 'product', 'packshot'] as const;
+/** 'worn': the person's own photo of a look actually worn; never a base, identity or garment source. */
+export const PHOTO_KINDS = ['source', 'base', 'item', 'label', 'detail', 'product', 'packshot', 'worn'] as const;
 export type PhotoKind = (typeof PHOTO_KINDS)[number];
 
 export const SLOT_KEYS = ['top', 'layer', 'bottom', 'shoes', 'accessories'] as const;
@@ -97,6 +98,8 @@ export interface Photo {
   /** Owner-supplied face references are separate from full-body sources. */
   referenceRole?: 'face';
   observation?: string;
+  /** SHA-256 of the stored original (worn photos): the same file chosen again reuses this photo. */
+  sha256?: string;
   /** Owner's check against the base-photo standard; null = not checked. */
   meetsStandard?: boolean | null;
   note?: string;
@@ -301,8 +304,10 @@ export interface SnapshotSlot {
 export interface Job {
   id: string;
   /** Missing kind means a try-on (records created before packshots). */
-  kind?: 'tryon' | 'packshot' | 'intake' | 'analyze' | 'shopsearch' | 'advise' | 'storefind' | 'discover';
+  kind?: 'tryon' | 'packshot' | 'intake' | 'analyze' | 'shopsearch' | 'advise' | 'storefind' | 'discover' | 'wearreview';
   lookId?: string;
+  /** wearreview: the worn look whose real photos are read. */
+  wearId?: string;
   /** intake: uploaded photos to recognise. */
   inputPhotoIds?: string[];
   /** intake: wardrobe candidates created from the photo. */
@@ -368,6 +373,46 @@ export interface Comparison {
   createdAt: string;
 }
 
+/** Where one difference between the real photo and the look comes from. */
+export const WEAR_CAUSES = ['outfit', 'render', 'substitution', 'unknown'] as const;
+export type WearCause = (typeof WEAR_CAUSES)[number];
+
+export interface WearText {
+  /** With a render: what matches; without: what the real clothing shows. */
+  seen: string;
+  differences: { cause: WearCause; text: string }[];
+  /** One styling adjustment that is easy to try. */
+  adjust: string;
+}
+
+/** The stylist's one read of a wear, in both interface languages; pinned to what it compared. */
+export interface WearReview {
+  uk: WearText;
+  en: WearText;
+  /** The render it compared with; absent when it read the real photos alone. */
+  resultId?: string;
+  at: string;
+}
+
+/**
+ * «Додати мій образ»: one appearance in one saved look, one or more of the person's own photos.
+ * It stays pinned to the look version and the render that were current when it was added.
+ */
+export interface Wear {
+  id: string;
+  lookId: string;
+  lookVersion: number;
+  photoIds: string[];
+  /** The current-version render beside it; never changes after the wear is added. */
+  resultId?: string;
+  /** The client's key for this one action: a repeated request returns the same wear. */
+  key: string;
+  review?: WearReview;
+  /** «Одягну знову?»: the person's own answer, apart from the stylist. */
+  again?: boolean;
+  createdAt: string;
+}
+
 export interface Measurement {
   value: number | null;
   date?: string;
@@ -406,6 +451,8 @@ export interface Profile {
   consentAt?: string;
   /** Weather periods follow the hemisphere; unset = northern. */
   hemisphere?: 'north' | 'south';
+  /** Whether glasses/sunglasses may be used in looks and suggestions; unset/false keeps them out. */
+  allowEyewear?: boolean;
 }
 
 export const LANGUAGES = ['uk', 'en'] as const;
@@ -461,6 +508,8 @@ export interface DB {
   lookMemory?: { slots: Slots; outcome: 'deleted'; ref: string; name: string; at: string }[];
   /** Where the nearest physical store of each shop is (owner, 19.11), keyed by the shop's plain name. */
   stores?: StorePlace[];
+  /** Real photos of saved looks (optional: older databases have none). */
+  wears?: Wear[];
 }
 
 export function emptySlots(): Slots {
@@ -497,6 +546,23 @@ export function validateDb(db: unknown): string | null {
     if (!isRelativeSafe(p.path)) return `Фото ${p.id}: недозволений шлях`;
     if (p.originalPath && !isRelativeSafe(p.originalPath)) return `Фото ${p.id}: недозволений шлях оригіналу`;
     if (p.referenceRole && (p.referenceRole !== 'face' || p.source === 'generated' || p.inspiration)) return `Фото ${p.id}: референс обличчя повинен бути власним оригіналом`;
+    if (p.kind === 'worn' && (p.source !== 'upload' || p.referenceRole || p.inspiration)) return `Фото ${p.id}: фото образу повинно бути власним завантаженням`;
+  }
+  const worn = new Set(d.photos.filter((p) => p.kind === 'worn').map((p) => p.id));
+  if (d.wears !== undefined) {
+    if (!Array.isArray(d.wears)) return 'Колекція wears пошкоджена';
+    const seen = new Set<string>();
+    for (const w of d.wears) {
+      if (!w || typeof w.id !== 'string' || !w.id || seen.has(w.id)) return 'wears: запис без id або повторний id';
+      seen.add(w.id);
+      const look = d.looks.find((l) => l.id === w.lookId);
+      if (!look) return `Образ у житті ${w.id}: немає образу`;
+      if (!Number.isInteger(w.lookVersion) || !look.versions.some((v) => v.version === w.lookVersion)) return `Образ у житті ${w.id}: немає версії образу`;
+      if (!Array.isArray(w.photoIds) || !w.photoIds.length || w.photoIds.some((id) => !worn.has(id))) return `Образ у житті ${w.id}: потрібні власні фото`;
+      if (w.resultId && !has('results', w.resultId)) return `Образ у житті ${w.id}: немає рендера`;
+      if (w.review?.resultId && w.review.resultId !== w.resultId) return `Образ у житті ${w.id}: розбір іншого рендера`;
+      if (w.again !== undefined && typeof w.again !== 'boolean') return `Образ у житті ${w.id}: некоректна відповідь`;
+    }
   }
   for (const i of d.items) {
     if (!CATEGORIES.includes(i.category)) return `Річ ${i.id}: невідома категорія`;
@@ -550,6 +616,7 @@ export function validateDb(db: unknown): string | null {
     if (j.kind === 'packshot' && !((j.itemId && has('items', j.itemId)) || (j.needId && has('needs', j.needId)))) return `Завдання ${j.id}: немає речі`;
     if (j.kind === 'shopsearch' && !(j.needId && has('needs', j.needId))) return `Завдання ${j.id}: немає покупки`;
     if (j.photoId && !has('photos', j.photoId)) return `Завдання ${j.id}: немає фото результату`;
+    if (j.kind === 'wearreview' && !(j.wearId && d.wears?.some((w) => w.id === j.wearId))) return `Завдання ${j.id}: немає образу в житті`;
     if (j.kind === 'intake' && !(j.inputPhotoIds?.length && j.inputPhotoIds.every((p) => has('photos', p)))) return `Завдання ${j.id}: немає фото для розпізнавання`;
     for (const id of j.createdItemIds ?? []) if (!has('items', id)) return `Завдання ${j.id}: немає створеної речі ${id}`;
     for (const id of j.attachedItemIds ?? []) if (!has('items', id)) return `Завдання ${j.id}: немає речі ${id}`;
@@ -569,10 +636,11 @@ export function validateDb(db: unknown): string | null {
   }
   if (!d.profile || !Array.isArray(d.profile.basePhotoIds)) return 'Профіль пошкоджений';
   for (const pid of d.profile.basePhotoIds) if (!has('photos', pid)) return `Профіль: немає базового фото ${pid}`;
+  if (d.profile.basePhotoIds.some((pid) => worn.has(pid))) return 'Профіль: фото образу не може бути базовим';
   if (d.profile.identity) {
     const ref = d.profile.identity;
     const p = d.photos.find((p) => p.id === ref.sourcePhotoId);
-    if (!validIdentity(ref) || !p || p.source === 'generated' || p.inspiration || ref.original.path !== p.path) return 'Профіль: зовнішність повинна походити з власного оригіналу';
+    if (!validIdentity(ref) || !p || p.source === 'generated' || p.inspiration || p.kind === 'worn' || ref.original.path !== p.path) return 'Профіль: зовнішність повинна походити з власного оригіналу';
     const originalPhoto = (file: HashedFile) => d.photos.some((p) => p.source !== 'generated' && !p.inspiration && p.path === file.path);
     if (ref.bodyOriginal && !originalPhoto(ref.bodyOriginal)) return 'Профіль: статура повинна походити з власного оригіналу';
     if (ref.hair && !d.photos.some((p) => p.id === ref.hair!.sourcePhotoId && p.source !== 'generated' && !p.inspiration && p.path === ref.hair!.original.path)) return 'Профіль: зачіска повинна походити з власного оригіналу';

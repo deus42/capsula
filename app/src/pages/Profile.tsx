@@ -307,11 +307,12 @@ function Preferences() {
     ['branding', t('Брендування'), t('Наскільки помітними можуть бути логотипи.')],
   ] as const;
   // Language, what to dress the person in and the hemisphere save at once, like every quiet toggle.
-  const choose = (patch: Record<string, string>) => void act(() => api('PATCH', '/api/profile', { rev: prof.rev, ...patch }));
-  const rows: { label: string; key: 'language' | 'wardrobeFocus' | 'hemisphere'; current?: string; options: [string, string][] }[] = [
+  const choose = (patch: Record<string, string | boolean>) => void act(() => api('PATCH', '/api/profile', { rev: prof.rev, ...patch }));
+  const rows: { label: string; key: 'language' | 'wardrobeFocus' | 'hemisphere' | 'allowEyewear'; current?: string; options: [string, string][] }[] = [
     { label: t('Мова'), key: 'language', current: currentLanguage(), options: [['uk', t('Українська')], ['en', 'English']] },
     { label: t('Одяг'), key: 'wardrobeFocus', current: prof.wardrobeFocus, options: [['men', t('Чоловічий')], ['women', t('Жіночий')], ['any', t('Будь-який')]] },
     { label: t('Півкуля'), key: 'hemisphere', current: prof.hemisphere ?? 'north', options: [['north', t('Північна')], ['south', t('Південна')]] },
+    { label: t('Окуляри'), key: 'allowEyewear', current: prof.allowEyewear ? 'yes' : 'no', options: [['no', t('Ні')], ['yes', t('Так')]] },
   ];
   return (
     <Section actions={<button className="btn primary" onClick={() => void act(() => api('PATCH', '/api/profile', { rev: prof.rev, preferences: prefs }), t('Побажання збережено'))}>{t('Зберегти')}</button>}>
@@ -321,7 +322,7 @@ function Preferences() {
             <span>{t(r.label)}</span>
             <div className="filters start">
               {r.options.map(([value, label]) => (
-                <button key={value} className={r.current === value ? 'on' : ''} aria-pressed={r.current === value} onClick={() => r.current !== value && choose({ [r.key]: value })}>{value === 'en' || value === 'uk' ? label : t(label)}</button>
+                <button key={value} className={r.current === value ? 'on' : ''} aria-pressed={r.current === value} onClick={() => r.current !== value && choose({ [r.key]: r.key === 'allowEyewear' ? value === 'yes' : value })}>{value === 'en' || value === 'uk' ? label : t(label)}</button>
               ))}
             </div>
           </div>
