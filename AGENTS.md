@@ -17,7 +17,8 @@ Guidance for people and coding agents working on Capsula, a capsule-wardrobe web
 ## Two modes
 
 - Without Google credentials the server runs one local wardrobe with its data in `.local/app-data/`, and AI work goes through the local Codex CLI.
-- With them it runs accounts: Google sign-in by invitation, one folder per account, the OpenAI API, monthly allowances and a budget. Without an API key, production runs Codex on the owner's ChatGPT subscription for the owner only: the subscription may not be shared. [`deploy/capsula.env.example`](deploy/capsula.env.example) lists the settings.
+- With them it runs accounts: Google sign-in by invitation, one folder per account, the OpenAI API, monthly allowances and a budget. Without an API key, production runs Codex on the owner's ChatGPT subscription, for the owner only unless `CODEX_ACCESS=accounts`. [`deploy/capsula.env.example`](deploy/capsula.env.example) lists the settings.
+- The owner is the admin (Profile → «Адмін»). To try processing in accounts mode, use a test account with made-up data: `node scripts/test-account.ts create|link|list` prints a one-time sign-in link (see [`deploy/README.md`](deploy/README.md#admin-and-test-accounts)). Never use the owner's own wardrobe for tests.
 
 ## Product rules
 

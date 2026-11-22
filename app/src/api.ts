@@ -33,7 +33,8 @@ async function parse<T>(res: Response): Promise<T> {
 }
 
 /** Accounts mode signs people in with Google; the owner's local site has no accounts. */
-export interface SessionUser { id: string; name: string; email: string; image: string | null; owner: boolean }
+/** `owner`: the site's owner, who is also its admin; `test`: one of the owner's test accounts. */
+export interface SessionUser { id: string; name: string; email: string; image: string | null; owner: boolean; test?: boolean }
 /** `invites: false` when only the owner may have an account. */
 export interface Session { mode: 'local' | 'accounts'; user: SessionUser | null; quota?: QuotaStatus | null; support?: string | null; invites?: boolean }
 

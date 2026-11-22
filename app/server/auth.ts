@@ -1,16 +1,18 @@
 // Accounts: Google sign-in only, through better-auth with
 // Node's built-in SQLite. Sign-up needs an invite link while the beta is closed (`SIGNUP=open` opens it); the
-// owner, named by `OWNER_EMAIL`, needs none. Google tokens are never stored, and there are no
-// passwords, emails or account linking.
+// owner, named by `OWNER_EMAIL`, needs none and is the admin. Google tokens are never stored, and there are no
+// passwords, emails or account linking. The owner's test accounts sign in with one-time links (test-accounts.ts).
 import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import type http from 'node:http';
-import { betterAuth, type BetterAuthOptions } from 'better-auth';
-import { APIError } from 'better-auth/api';
+import { betterAuth, type BetterAuthOptions, type BetterAuthPlugin } from 'better-auth';
+import { APIError, createAuthEndpoint } from 'better-auth/api';
+import { setSessionCookie } from 'better-auth/cookies';
 import { getMigrations } from 'better-auth/db/migration';
 import { fromNodeHeaders, toNodeHandler } from 'better-auth/node';
 import { google, verifyGoogleIdToken } from 'better-auth/social-providers';
+import { testAccounts } from './test-accounts.ts';
 
 export const INVITE_COOKIE = 'capsula_invite';
 /** Marks a Google callback already relayed to the canonical address, so it is handled there and not relayed again. */
@@ -81,6 +83,8 @@ function cookieValue(header: string | null | undefined, name: string) {
 }
 
 export interface Invite { code: string; createdAt: string; expiresAt: string; usedBy: string | null; usedAt: string | null; disabled: number }
+/** An account as the admin sees it: who, since when, the last sign-in, and whether it is one of the owner's test accounts. */
+export interface AccountRow { id: string; name: string; email: string; image: string | null; createdAt: string; lastSignIn: string | null; owner: boolean; test: boolean }
 
 export async function createAuth(cfg: AuthConfig) {
   const db = new DatabaseSync(path.join(cfg.dataDir, 'app.sqlite'));
@@ -104,6 +108,22 @@ export async function createAuth(cfg: AuthConfig) {
     data: { ...account, accessToken: null, refreshToken: null, idToken: null, accessTokenExpiresAt: null, refreshTokenExpiresAt: null },
   });
   const provider = google({ clientId: cfg.googleClientId, clientSecret: cfg.googleClientSecret });
+  const tests = testAccounts(db);
+  // `/t/<code>` (index.ts) lands here: a valid one-time code opens a session for its test account, nothing else.
+  const testSignIn = {
+    id: 'capsula-test-sign-in',
+    endpoints: {
+      testSignIn: createAuthEndpoint('/test-sign-in', { method: 'GET' }, async (c) => {
+        const code = c.request ? new URL(c.request.url).searchParams.get('code') : null;
+        const userId = code ? tests.consume(code) : null;
+        const user = userId ? await c.context.internalAdapter.findUserById(userId) : null;
+        if (!user) throw c.redirect('/?test=invalid');
+        const session = await c.context.internalAdapter.createSession(user.id);
+        await setSessionCookie(c, { session, user });
+        throw c.redirect('/');
+      }),
+    },
+  } satisfies BetterAuthPlugin;
 
   const options: BetterAuthOptions = {
     appName: 'Capsula',
@@ -153,6 +173,7 @@ export async function createAuth(cfg: AuthConfig) {
       },
     },
     onAPIError: { errorURL: `${cfg.baseURL}/` },
+    plugins: [testSignIn],
   };
 
   const migrations = await getMigrations(options);
@@ -166,7 +187,7 @@ export async function createAuth(cfg: AuthConfig) {
       const session = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
       if (!session) return null;
       const { id, name, email, image } = session.user;
-      return { id, name, email, image: image ?? null, owner: isOwner(email) };
+      return { id, name, email, image: image ?? null, owner: isOwner(email), test: tests.isTest(id) };
     },
     validInvite: (code: string | undefined) => (cfg.ownerOnly ? null : validInvite(code)),
     invites: {
@@ -179,6 +200,13 @@ export async function createAuth(cfg: AuthConfig) {
         return validInvite(code)!;
       },
       disable: (code: string) => void db.prepare('UPDATE invite SET disabled = 1 WHERE code = ?').run(code),
+    },
+    admin: {
+      users: () => (db.prepare(`SELECT u.id, u.name, u.email, u.image, u.createdAt,
+          (SELECT MAX(s.createdAt) FROM session s WHERE s.userId = u.id) AS lastSignIn,
+          EXISTS (SELECT 1 FROM test_account t WHERE t.userId = u.id) AS test
+        FROM user u ORDER BY u.createdAt`).all() as unknown as (Omit<AccountRow, 'owner' | 'test'> & { test: number })[]).map((u) => ({ ...u, owner: isOwner(u.email), test: Boolean(u.test) })) as AccountRow[],
+      tests,
     },
     /** Removes the account's sign-in records; its wardrobe folder is removed by the caller. */
     deleteUser(userId: string) {

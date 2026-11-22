@@ -62,16 +62,16 @@ export const AI_OWNER_ONLY = 'AI поки працює лише для влас�
 /** Account ids come from the auth database; anything else is refused before it can name a folder. */
 const SAFE_ID = /^[A-Za-z0-9_-]{6,64}$/;
 
-/** `aiOwnerOnly`: AI runs on the owner's own subscription, so no other account may queue or start AI work. */
+/** `aiOwnerOnly`: AI runs on the owner's own subscription, so only the owner and their test accounts may queue or start AI work. */
 export function createTenants(opts: { projectRoot: string; dataDir: string; seed: () => DB; limiter?: Limiter; codexBin?: string; engine?: OpenAIEngine; quota?: { cfg: QuotaConfig; usage: Usage }; aiOwnerOnly?: boolean }) {
   const cache = new Map<string, Tenant>();
 
-  function open(id: string, root: string, dataDir: string, seed: () => DB, account?: { owner: boolean }): Tenant {
+  function open(id: string, root: string, dataDir: string, seed: () => DB, account?: { owner: boolean; test?: boolean }): Tenant {
     const raw = createStore(dataDir, seed);
     const quota = account && opts.quota ? accountQuota(opts.quota.cfg, opts.quota.usage, id, account.owner) : undefined;
     const store = quota ? meteredStore(raw, quota) : raw;
     const engine = quota && opts.engine ? meteredEngine(opts.engine, quota.cost) : opts.engine;
-    const noAI = Boolean(opts.aiOwnerOnly && account && !account.owner);
+    const noAI = Boolean(opts.aiOwnerOnly && account && !account.owner && !account.test);
     // Accounts start try-ons themselves: no automatic try-on of every new look.
     const runner = createRunner(store, root, opts.codexBin, { limiter: opts.limiter, engine, autoTryOn: !account, canStart: noAI ? () => false : quota?.canStart });
     const admit = noAI
@@ -97,13 +97,24 @@ export function createTenants(opts: { projectRoot: string; dataDir: string; seed
     return path.join(opts.dataDir, 'users', userId);
   };
 
-  function forUser(userId: string, owner = false): Tenant {
+  /** `test`: one of the owner's test accounts, with an ordinary account's allowances. */
+  function forUser(userId: string, owner = false, test = false): Tenant {
     let t = cache.get(userId);
     if (!t) {
       const root = userRoot(userId);
-      cache.set(userId, (t = open(userId, root, root, emptyDb, { owner })));
+      cache.set(userId, (t = open(userId, root, root, emptyDb, { owner, test })));
     }
     return t;
+  }
+
+  /** What an account holds, for the admin: read from its file without opening it, so no queue starts. */
+  function summary(userId: string): { photos: number; items: number; looks: number; capsules: number } | null {
+    try {
+      const db = JSON.parse(fs.readFileSync(path.join(userRoot(userId), 'db.json'), 'utf8')) as DB;
+      return { photos: db.photos.length, items: db.items.length, looks: db.looks.length, capsules: db.capsules.length };
+    } catch {
+      return null;
+    }
   }
 
   /** Account deletion: the queue stops, the whole folder goes and its counts are forgotten. */
@@ -115,5 +126,5 @@ export function createTenants(opts: { projectRoot: string; dataDir: string; seed
     opts.quota?.usage.forget(userId);
   }
 
-  return { local, forUser, remove, userRoot };
+  return { local, forUser, remove, userRoot, summary };
 }

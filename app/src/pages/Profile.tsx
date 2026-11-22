@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Camera, Check, CircleCheck, Copy, Heart, Loader2, LocateFixed, MapPin, Minus, Plus, Ruler, Store, Trash2, TriangleAlert, UserRound, X } from 'lucide-react';
+import { Camera, Check, CircleCheck, Copy, Heart, Link2, Loader2, LocateFixed, MapPin, Minus, Plus, Ruler, Store, Trash2, TriangleAlert, UserRound, Users, X } from 'lucide-react';
 import type { MeasureKey, QuotaKind, QuotaStatus } from '../api.ts';
 import { api, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
@@ -8,7 +8,7 @@ import { Badge, ConfirmButton, PageHead, PhotoPicker, SubNav } from '../componen
 import { useIntake } from './Home.tsx';
 import { InfoMark } from './Glossary.tsx';
 import { MEASURES, fmtDay, plainShopName, shopLocation, wardrobeBrands } from '../lib.ts';
-import { currentLanguage, t } from '../i18n.ts';
+import { LOOKS, currentLanguage, plural, t } from '../i18n.ts';
 
 const STANDARD = [
   '2–3 фото на повний зріст спереду',
@@ -339,25 +339,14 @@ function Preferences() {
   );
 }
 
-/** Accounts mode: who is signed in, sign out, delete the account; the owner makes invite links. */
+/** Accounts mode: who is signed in, sign out, delete the account. */
 function Account() {
-  const { session, act, toast } = useApp();
-  const [invites, setInvites] = useState<{ code: string; expiresAt: string; usedBy: string | null; disabled: number }[]>([]);
-  const owner = Boolean(session?.user?.owner);
-  const invitesOn = owner && session?.invites !== false;
-  const load = () => void api<typeof invites>('GET', '/api/invites').then(setInvites).catch(() => undefined);
-  useEffect(() => { if (invitesOn) load(); }, [invitesOn]);
+  const { session, act } = useApp();
   if (!session?.user) return null;
-  const link = (code: string) => `${window.location.origin}/i/${code}`;
-  const copy = async (code: string) => {
-    await navigator.clipboard?.writeText(link(code)).catch(() => undefined);
-    toast('Посилання скопійовано');
-  };
   const signOut = async () => {
     await fetch('/api/auth/sign-out', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => undefined);
     window.location.href = '/';
   };
-  const open = invites.filter((i) => !i.usedBy && !i.disabled && i.expiresAt > new Date().toISOString());
   return (
     <div className="stack" style={{ gap: 28 }}>
       <section className="account-row">
@@ -368,23 +357,6 @@ function Account() {
         <button className="quiet-toggle" onClick={() => void signOut()}>{t('Вийти')}</button>
       </section>
       {session.quota && <MonthUsage quota={session.quota} support={session.support ?? null} />}
-      {invitesOn && (
-        <section className="stack" style={{ gap: 10 }}>
-          <div className="section-head" style={{ margin: 0 }}>
-            <h2 className="h2">{t('Запрошення')} <span className="count">{open.length}</span></h2>
-            <button className="quiet-toggle" onClick={() => void act(() => api<{ code: string }>('POST', '/api/invites')).then((inv) => { if (inv) { load(); void copy(inv.code); } })}>{t('Нове запрошення')}</button>
-          </div>
-          <ul className="set-list">
-            {open.map((i) => (
-              <li key={i.code}>
-                <span className="set-name">{link(i.code).replace(/^https?:\/\//, '')}<span className="buy"> {t('· до')} {fmtDay(i.expiresAt)}</span></span>
-                <button className="icon-btn" aria-label={t('Скопіювати посилання')} onClick={() => void copy(i.code)}><Copy size={13} /></button>
-                <button className="icon-btn" aria-label={t('Скасувати запрошення')} onClick={() => void act(() => api('DELETE', `/api/invites/${encodeURIComponent(i.code)}`)).then(load)}><X size={13} /></button>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
       <section>
         <ConfirmButton
           className="btn ghost danger"
@@ -397,6 +369,96 @@ function Account() {
         >
           <Trash2 size={14} /> {t('Видалити акаунт')}
         </ConfirmButton>
+      </section>
+    </div>
+  );
+}
+
+interface AdminAccount {
+  id: string; name: string; email: string; createdAt: string; lastSignIn: string | null; owner: boolean; test: boolean;
+  wardrobe: { photos: number; items: number; looks: number; capsules: number } | null;
+  ai: Record<QuotaKind, number> | null;
+}
+interface Invite { code: string; expiresAt: string; usedBy: string | null; disabled: number }
+const ITEMS = { one: '{n} річ', few: '{n} речі', many: '{n} речей' };
+const TRYONS = { one: '{n} примірка', few: '{n} примірки', many: '{n} примірок' };
+
+/** One quiet line under a name: what the account holds, this month's try-ons and the last sign-in. */
+function accountLine(a: AdminAccount, withEmail: boolean) {
+  return [
+    withEmail && a.email,
+    a.wardrobe && `${plural(a.wardrobe.items, ITEMS)} · ${plural(a.wardrobe.looks, LOOKS)}`,
+    a.ai?.tryon ? plural(a.ai.tryon, TRYONS) : null,
+    a.lastSignIn && `${t('вхід')} ${fmtDay(a.lastSignIn)}`,
+  ].filter(Boolean).join(' · ');
+}
+
+/** Profile → «Адмін», the owner only: everyone with an account, invite links, and test accounts with one-time sign-in links. */
+function Admin() {
+  const { session, act, toast } = useApp();
+  const [accounts, setAccounts] = useState<AdminAccount[]>([]);
+  const [invites, setInvites] = useState<Invite[]>([]);
+  const invitesOn = session?.invites !== false;
+  const loadAccounts = () => void api<AdminAccount[]>('GET', '/api/admin/users').then(setAccounts).catch(() => undefined);
+  const loadInvites = () => void api<Invite[]>('GET', '/api/invites').then(setInvites).catch(() => undefined);
+  useEffect(() => {
+    loadAccounts();
+    if (invitesOn) loadInvites();
+  }, [invitesOn]);
+  const copy = async (text: string, note: string) => {
+    await navigator.clipboard?.writeText(text).catch(() => undefined);
+    toast(note);
+  };
+  const inviteLink = (code: string) => `${window.location.origin}/i/${code}`;
+  const SIGN_IN_COPIED = 'Посилання входу скопійовано: одноразове, 10 хв. Відкрий його в приватному вікні';
+  const people = accounts.filter((a) => !a.test);
+  const tests = accounts.filter((a) => a.test);
+  const open = invites.filter((i) => !i.usedBy && !i.disabled && i.expiresAt > new Date().toISOString());
+  return (
+    <div className="stack" style={{ gap: 28 }}>
+      <section className="stack" style={{ gap: 10 }}>
+        <h2 className="h2">{t('Люди')} <span className="count">{people.length}</span></h2>
+        <ul className="set-list">
+          {people.map((a) => (
+            <li key={a.id}>
+              <span className="set-name">{a.name}{a.owner && <span className="buy"> · {t('адмін')}</span>}<br /><span className="buy">{accountLine(a, true)}</span></span>
+            </li>
+          ))}
+        </ul>
+      </section>
+      {invitesOn && (
+        <section className="stack" style={{ gap: 10 }}>
+          <div className="section-head" style={{ margin: 0 }}>
+            <h2 className="h2">{t('Запрошення')} <span className="count">{open.length}</span></h2>
+            <button className="quiet-toggle" onClick={() => void act(() => api<Invite>('POST', '/api/invites')).then((inv) => { if (inv) { loadInvites(); void copy(inviteLink(inv.code), 'Посилання скопійовано'); } })}>{t('Нове запрошення')}</button>
+          </div>
+          <ul className="set-list">
+            {open.map((i) => (
+              <li key={i.code}>
+                <span className="set-name">{inviteLink(i.code).replace(/^https?:\/\//, '')}<span className="buy"> {t('· до')} {fmtDay(i.expiresAt)}</span></span>
+                <button className="icon-btn" aria-label={t('Скопіювати посилання')} onClick={() => void copy(inviteLink(i.code), 'Посилання скопійовано')}><Copy size={13} /></button>
+                <button className="icon-btn" aria-label={t('Скасувати запрошення')} onClick={() => void act(() => api('DELETE', `/api/invites/${encodeURIComponent(i.code)}`)).then(loadInvites)}><X size={13} /></button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+      <section className="stack" style={{ gap: 10 }}>
+        <div className="section-head" style={{ margin: 0 }}>
+          <h2 className="h2">{t('Тестові акаунти')} <span className="count">{tests.length}</span></h2>
+          <button className="quiet-toggle" onClick={() => void act(() => api<{ link: string }>('POST', '/api/admin/test-accounts', { name: `${t('Тест')} ${tests.length + 1}` })).then((made) => { if (made) { loadAccounts(); void copy(made.link, SIGN_IN_COPIED); } })}>{t('Новий тестовий')}</button>
+        </div>
+        <ul className="set-list">
+          {tests.map((a) => (
+            <li key={a.id}>
+              <span className="set-name">{a.name}{accountLine(a, false) && <><br /><span className="buy">{accountLine(a, false)}</span></>}</span>
+              <button className="icon-btn" aria-label={t('Посилання входу')} onClick={() => void act(() => api<{ link: string }>('POST', `/api/admin/test-accounts/${encodeURIComponent(a.id)}/link`)).then((made) => { if (made) void copy(made.link, SIGN_IN_COPIED); })}><Link2 size={13} /></button>
+              <ConfirmButton className="icon-btn" title={t('Видалити тестовий акаунт')} message={<>{t('Видалити «{name}» і все в ньому назавжди?', { name: a.name })}</>} onConfirm={async () => { await act(() => api('DELETE', `/api/admin/test-accounts/${encodeURIComponent(a.id)}`)); loadAccounts(); }}>
+                <X size={13} />
+              </ConfirmButton>
+            </li>
+          ))}
+        </ul>
       </section>
     </div>
   );
@@ -425,7 +487,8 @@ function MonthUsage({ quota, support }: { quota: QuotaStatus; support: string | 
 
 export function ProfilePage({ tab }: { tab?: string }) {
   const { session } = useApp();
-  const tabs = session?.mode === 'accounts' ? [...TABS, { key: 'account', label: t('Акаунт'), icon: <UserRound size={17} /> }] : TABS;
+  const accountTabs = [{ key: 'account', label: t('Акаунт'), icon: <UserRound size={17} /> }, ...(session?.user?.owner ? [{ key: 'admin', label: t('Адмін'), icon: <Users size={17} /> }] : [])];
+  const tabs = session?.mode === 'accounts' ? [...TABS, ...accountTabs] : TABS;
   const current = tabs.some((t) => t.key === tab) ? tab! : 'base';
   return (
     <div className="page">
@@ -438,6 +501,7 @@ export function ProfilePage({ tab }: { tab?: string }) {
           {current === 'shops' && <Shops />}
           {current === 'preferences' && <Preferences />}
           {current === 'account' && <Account />}
+          {current === 'admin' && <Admin />}
         </div>
       </div>
     </div>

@@ -41,9 +41,10 @@ script, pulls that exact image, restarts and waits for `/health`; an unhealthy s
 
 ## AI without an API key
 
-Without `OPENAI_API_KEY` the container runs Codex on the owner's ChatGPT subscription. The subscription's terms
-do not allow making the account available to others, so only `OWNER_EMAIL` can sign in and use AI, and invites
-are off. Sign Codex in once after the first deploy:
+Without `OPENAI_API_KEY` the container runs Codex on the owner's ChatGPT subscription. By default only
+`OWNER_EMAIL` and the owner's test accounts can sign in and use AI, and invites are off. `CODEX_ACCESS=accounts`
+lets invited accounts use it too, each within its monthly allowances; whether a subscription may serve other people
+is for its owner to check against the provider's terms. Sign Codex in once after the first deploy:
 
 ```sh
 cd /srv/capsula
@@ -54,6 +55,22 @@ Open the address it prints, enter the code and sign in with the owner's ChatGPT 
 checks it. The sign-in lives in `/srv/capsula/data/codex` and is not in the backups: after a restore, sign in
 again. Codex has no command sandbox inside the container, so it runs without commands: the app collects each
 generated image from Codex's own folder.
+
+## Admin and test accounts
+
+The owner is the admin: Profile → «Адмін» lists everyone with an account (what they hold, this month's try-ons,
+the last sign-in), makes invite links and manages test accounts. Test accounts are the owner's own, for trying the
+site and its AI work with made-up data. They have no Google sign-in and no lasting key: each sign-in is a one-time
+link, single use and valid for 10 minutes. Open it in a private window, since it replaces the browser's session.
+Agents with shell access to the host make accounts and links from the command line:
+
+```sh
+sudo docker exec capsula-capsula-1 node /srv/capsula/scripts/test-account.ts create "Agent"
+sudo docker exec capsula-capsula-1 node /srv/capsula/scripts/test-account.ts link "Agent"
+sudo docker exec capsula-capsula-1 node /srv/capsula/scripts/test-account.ts list
+```
+
+Removing a test account is done in «Адмін», which also removes its folder.
 
 ## Moving the owner's data (once)
 

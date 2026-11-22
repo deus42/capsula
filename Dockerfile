@@ -25,8 +25,8 @@ COPY --from=build /srv/capsula/app/node_modules ./node_modules
 COPY --from=build /srv/capsula/app/dist ./dist
 COPY --from=build /srv/capsula/app/server ./server
 COPY --from=build /srv/capsula/app/src ./src
-# The one-time owner import runs inside the container (deploy/README.md).
-COPY scripts/import-user.ts /srv/capsula/scripts/import-user.ts
+# The one-time owner import and the owner's test accounts run inside the container (deploy/README.md).
+COPY scripts/import-user.ts scripts/test-account.ts /srv/capsula/scripts/
 RUN mkdir -p /data && chown node:node /data
 USER node
 VOLUME /data

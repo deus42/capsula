@@ -29,11 +29,14 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 // Generation: the OpenAI API when configured, else Codex.
 const openAI = openAIConfigFromEnv(process.env);
 const PRODUCTION = process.env.NODE_ENV === 'production';
-// Without an API key, production accounts run on the owner's own ChatGPT subscription through Codex. Its terms
-// do not allow making an account available to others, so only the owner signs in and uses AI; invites wait.
-const OWNER_ONLY = ACCOUNTS && PRODUCTION && !openAI;
-if (OWNER_ONLY && (!authConfig!.ownerEmail || authConfig!.openSignup)) throw new Error('Without OPENAI_API_KEY, production runs on the owner\'s Codex subscription: set OWNER_EMAIL and keep SIGNUP closed.');
-if (OWNER_ONLY && process.env.CODEX_HOME) fs.mkdirSync(process.env.CODEX_HOME, { recursive: true, mode: 0o700 });
+// Without an API key, production accounts run on the owner's own ChatGPT subscription through Codex. By default
+// only the owner (and the owner's test accounts) sign in and use AI. `CODEX_ACCESS=accounts` lets invited accounts
+// use it too, each within its monthly allowances; whether the subscription may serve other people is for its owner
+// to check against the provider's terms. Sign-up stays invite-only either way.
+const CODEX_PRODUCTION = ACCOUNTS && PRODUCTION && !openAI;
+const OWNER_ONLY = CODEX_PRODUCTION && process.env.CODEX_ACCESS !== 'accounts';
+if (CODEX_PRODUCTION && (!authConfig!.ownerEmail || authConfig!.openSignup)) throw new Error('Without OPENAI_API_KEY, production runs on the owner\'s Codex subscription: set OWNER_EMAIL and keep SIGNUP closed.');
+if (CODEX_PRODUCTION && process.env.CODEX_HOME) fs.mkdirSync(process.env.CODEX_HOME, { recursive: true, mode: 0o700 });
 // Accounts have monthly allowances; production with the API also needs the budget and the prices it is counted with.
 const quotaConfig = ACCOUNTS ? quotaConfigFromEnv(process.env) : null;
 if (ACCOUNTS && PRODUCTION && openAI && (quotaConfig!.budgetUsd === null || !openAI.prices)) throw new Error('Accounts in production need MONTHLY_BUDGET_USD and OPENAI_PRICES.');
@@ -168,7 +171,13 @@ const SECURITY_HEADERS: [string, string][] = [
 async function accountTenant(req: http.IncomingMessage, res: http.ServerResponse, url: URL, method: string): Promise<Tenant | null> {
   if (!auth) return localTenant;
   const address = clientAddress(req, TRUST_CLOUDFLARE);
-  if ((url.pathname.startsWith('/api/auth/') || url.pathname.startsWith('/i/')) && limited(res, [[`sign-in:${address}`, RATE_RULES.signIn]])) return null;
+  if ((url.pathname.startsWith('/api/auth/') || url.pathname.startsWith('/i/') || url.pathname.startsWith('/t/')) && limited(res, [[`sign-in:${address}`, RATE_RULES.signIn]])) return null;
+  // A test account's one-time link: better-auth opens the session (auth.ts, test-sign-in).
+  if (method === 'GET' && url.pathname.startsWith('/t/')) {
+    req.url = `/api/auth/test-sign-in?code=${encodeURIComponent(decodeURIComponent(url.pathname.slice(3)))}`;
+    await auth.handler(req, res);
+    return null;
+  }
   if (url.pathname.startsWith('/api/auth/')) {
     const relay = method === 'GET' ? callbackRelay(authConfig!, url) : null;
     if (relay) {
@@ -199,7 +208,7 @@ async function accountTenant(req: http.IncomingMessage, res: http.ServerResponse
   if (!needsAccount) return null;
   const user = await auth.userOf(req);
   if (method === 'GET' && url.pathname === '/api/session') {
-    const tenant = user ? tenants.forUser(user.id, user.owner) : null;
+    const tenant = user ? tenants.forUser(user.id, user.owner, user.test) : null;
     send(res, 200, { mode: 'accounts', user, quota: tenant?.quota?.status(tenant.store.read()) ?? null, support: SUPPORT_URL, invites: !OWNER_ONLY });
     return null;
   }
@@ -221,6 +230,11 @@ async function accountTenant(req: http.IncomingMessage, res: http.ServerResponse
     else send(res, 405, { error: 'Метод не підтримується' });
     return null;
   }
+  // The owner is the admin: everyone with an account, and the owner's test accounts with their one-time links.
+  if (url.pathname.startsWith('/api/admin/')) {
+    await admin(req, res, url, method, user.owner);
+    return null;
+  }
   if (method === 'POST' && url.pathname === '/api/upload' && !user.owner && limited(res, [[`upload:${user.id}`, RATE_RULES.uploadAccount], [`upload-address:${address}`, RATE_RULES.uploadAddress]])) return null;
   if (method === 'DELETE' && url.pathname === '/api/account') {
     tenants.remove(user.id);
@@ -228,7 +242,38 @@ async function accountTenant(req: http.IncomingMessage, res: http.ServerResponse
     send(res, 200, { ok: true });
     return null;
   }
-  return tenants.forUser(user.id, user.owner);
+  return tenants.forUser(user.id, user.owner, user.test);
+}
+
+/** `/api/admin/…`, the owner only: accounts with what they hold and this month's AI work; test accounts. */
+async function admin(req: http.IncomingMessage, res: http.ServerResponse, url: URL, method: string, owner: boolean) {
+  if (!owner) return send(res, 403, { error: 'Лише для власника' });
+  const [, , , what, id, action] = url.pathname.split('/').map((p) => decodeURIComponent(p));
+  const tests = auth!.admin.tests;
+  const link = (code: string) => `${authConfig!.baseURL}/t/${code}`;
+  if (what === 'users' && !id && method === 'GET') {
+    return send(res, 200, auth!.admin.users().map((u) => ({ ...u, wardrobe: tenants.summary(u.id), ai: usage?.done(u.id) ?? null })), req);
+  }
+  if (what !== 'test-accounts') return send(res, 404, { error: 'Не знайдено' });
+  if (!id && method === 'POST') {
+    let name: string | undefined;
+    try {
+      const body = JSON.parse((await readBody(req, 4096)).toString('utf8') || '{}') as { name?: unknown };
+      name = typeof body.name === 'string' ? body.name : undefined;
+    } catch {
+      throw new HttpError(400, 'Неправильний JSON');
+    }
+    const account = tests.create(name);
+    return send(res, 200, { ...account, link: link(tests.link(account.id)!) });
+  }
+  if (!id || !tests.isTest(id)) return send(res, 404, { error: 'Тестового акаунта немає' });
+  if (action === 'link' && method === 'POST') return send(res, 200, { link: link(tests.link(id)!) });
+  if (!action && method === 'DELETE') {
+    tenants.remove(id);
+    tests.remove(id);
+    return send(res, 200, { ok: true });
+  }
+  return send(res, 405, { error: 'Метод не підтримується' });
 }
 
 async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -241,9 +286,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     const denied = authorize(req);
     if (denied) return send(res, 403, { error: denied });
   }
-  const isTenantPath = url.pathname.startsWith('/api/') || url.pathname.startsWith('/media/') || url.pathname.startsWith('/thumb/') || url.pathname.startsWith('/i/');
+  const isTenantPath = url.pathname.startsWith('/api/') || url.pathname.startsWith('/media/') || url.pathname.startsWith('/thumb/') || url.pathname.startsWith('/i/') || (ACCOUNTS && url.pathname.startsWith('/t/'));
   const tenant = isTenantPath ? await accountTenant(req, res, url, method) : localTenant;
-  if (isTenantPath && !tenant) return; // answered: sign-in, invite, session, owner tools or account deletion
+  if (isTenantPath && !tenant) return; // answered: sign-in, invite, test link, session, admin tools or account deletion
   const { store, runner, ctx, root } = tenant ?? localTenant ?? ({} as Tenant);
 
   if (url.pathname.startsWith('/api/')) {
@@ -319,5 +364,5 @@ if (localTenant) {
   prewarm(PROJECT_ROOT, DATA_DIR, [...db.photos.map((p) => p.path), ...db.results.map((r) => r.imagePath)]);
 }
 server.listen(PORT, HOST, () => {
-  console.log(`${new Date().toISOString()} Capsula: http://${HOST}:${PORT}  (${ACCOUNTS ? `акаунти, ${authConfig!.baseURL}, AI: ${openAI ? 'OpenAI API' : OWNER_ONLY ? 'Codex, лише власник' : 'Codex'}` : `дані: ${path.relative(PROJECT_ROOT, DATA_DIR)}, Codex: ${localTenant!.runner.state.codexBin}`})`);
+  console.log(`${new Date().toISOString()} Capsula: http://${HOST}:${PORT}  (${ACCOUNTS ? `акаунти, ${authConfig!.baseURL}, AI: ${openAI ? 'OpenAI API' : OWNER_ONLY ? 'Codex, лише власник' : CODEX_PRODUCTION ? 'Codex, акаунти за запрошенням' : 'Codex'}` : `дані: ${path.relative(PROJECT_ROOT, DATA_DIR)}, Codex: ${localTenant!.runner.state.codexBin}`})`);
 });
