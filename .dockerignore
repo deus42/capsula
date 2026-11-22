@@ -8,5 +8,6 @@
 !app/server/
 !app/src/
 !scripts/import-user.ts
+!scripts/test-account.ts
 app/server/*.test.ts
 app/server/*.swift
