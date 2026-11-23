@@ -175,7 +175,7 @@ const PACKSHOT_SHAPE: Record<SnapshotSlot['slot'], string> = {
   top: 'Dress an invisible torso. Show rounded shoulders, a naturally filled chest, hollow sleeve openings where visible and a shaped neckline or collar with depth. Smooth storage creases while keeping the original cut and ordinary worn drape.',
   layer: 'Dress an invisible torso. Show the true depth of shoulders and body, natural sleeves and a shaped opening, collar or hood as appropriate. Preserve the real cut, length and closure.',
   bottom: 'Dress an invisible lower body. Show a shaped waistband and hips, separate legs with round volume, and natural drape. Preserve the real rise, width and length.',
-  shoes: 'Show the original pair at a slight three-quarter angle so the toe, side panels and sole thickness are clear. Keep the original shape and details.',
+  shoes: 'Show the original pair side by side from the front and slightly above, toes pointing at the camera, symmetric and centred, so the toe shape, opening and sole edge are clear. Keep the original shape and details.',
   accessories: 'Show the original accessory in a natural display position with enough angle and light to show its shape, thickness and hardware.',
 };
 

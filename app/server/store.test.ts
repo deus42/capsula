@@ -9,7 +9,7 @@ import { createStore } from './store.ts';
 import { stateView } from './state-view.ts';
 import { createJob, dispatch, queueMissingRenders, snapshotSlots, upload } from './routes.ts';
 import { sameIdentity, verifyReferenceFiles } from './identity.ts';
-import { MAX_IMAGE_REFS, buildPrompt, createRunner, pickRefs } from './runner.ts';
+import { MAX_IMAGE_REFS, buildPackshotPrompt, buildPrompt, createRunner, pickRefs } from './runner.ts';
 import { analyzePrompt, applyAnalyze, applyIntake, intakePrompt } from './analysis.ts';
 import { hiddenLookIds, isCapsuleHidden, sameLook } from '../src/rating.ts';
 import { createHash } from 'node:crypto';
@@ -662,6 +662,13 @@ test('a bought item without its own photo offers its shop photo to the try-on, n
   assert.deepEqual(bottom().originalPhotoPaths, ['media/products/S-1.png']);
   db.items[1].photoIds = ['P-shop', 'P-2'];
   assert.deepEqual(bottom().originalPhotoPaths, ['assets/photos/b.jpeg'], 'the owner’s own photo wins over the shop photo');
+});
+
+test('shoe packshots show the pair from the front, like the rest of the wardrobe', () => {
+  const job = { id: 'J', kind: 'packshot', itemId: 'W-S', lookVersion: 0, snapshot: { lookName: 'Vans', slots: [{ slot: 'shoes', kind: 'item', id: 'W-S', title: 'Vans', description: '', owned: true, photoPaths: ['assets/photos/a.jpeg'] }], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'queued', origin: 'site', createdAt: at } as Parameters<typeof buildPackshotPrompt>[0];
+  const prompt = buildPackshotPrompt(job, '/tmp/result.png');
+  assert.match(prompt, /from the front and slightly above, toes pointing at the camera/);
+  assert.doesNotMatch(prompt, /three-quarter/);
 });
 
 test('pinned reference integrity fails before generation when a file changes', () => {
