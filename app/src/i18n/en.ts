@@ -604,6 +604,8 @@ export const en: Record<string, string> = {
   "Не вдалося прочитати HEIC — завантаж це фото як JPEG": "Could not read the HEIC file: upload this photo as JPEG",
   "Аналізатор уже працює — зачекай на поточну підбірку": "The analyser is already running: wait for the current selection",
   "Пошук уже йде": "A search is already running",
+  "У наборі цієї капсули бракує вибраних речей. Додай їх до набору або вибери іншу капсулу.": "Some selected pieces are missing from this capsule. Add them to the set or choose another capsule.",
+  "Жодна капсула не містить усіх вибраних речей. Додай їх до набору капсули.": "No capsule contains all the selected pieces. Add them to a capsule’s set.",
   "Ця покупка вже закрита": "This purchase is already closed",
   "Завдання ще виконується": "The job is still running",
   "Неправильне місце": "Invalid location",

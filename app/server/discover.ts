@@ -10,7 +10,7 @@ import { CATEGORY_UK, ownedItems } from './analysis.ts';
 import { PERIOD_LABEL, PERIOD_TEMP, SLOT_CATEGORIES, currentPeriod, eyewearBlocked, isBlockedEyewear, weakPiece } from '../src/lib.ts';
 import { hiddenLookIds, isCapsuleHidden } from '../src/rating.ts';
 import { alreadySeen, refusedPieces, seenCompositions, withBuys } from '../src/look-memory.ts';
-import { freePlaces, normalizePiece, pieceCategory, pieceGroup, pieceKey, sameTitle } from '../src/capsule-pieces.ts';
+import { freePlaces, inSavedSet, normalizePiece, pieceCategory, pieceGroup, pieceKey, sameTitle } from '../src/capsule-pieces.ts';
 
 const SLOT_KEYS = ['top', 'layer', 'bottom', 'shoes', 'accessories'] as const;
 const str = { type: 'string' } as const;
@@ -51,6 +51,17 @@ export const searchCapsules = (db: DB) => db.capsules.filter((c) => !c.redirectC
 const pieces = (db: DB) => ownedItems(db).filter((i) => !isBlockedEyewear(db, i.title));
 const text = (v: unknown, n: number) => String(v ?? '').trim().slice(0, n);
 
+function eligibleCapsules(db: DB, { capsuleId, requiredItemIds = [] }: Pick<Job, 'capsuleId' | 'requiredItemIds'>) {
+  const caps = searchCapsules(db).filter((capsule) => (!capsuleId || capsule.id === capsuleId) &&
+    (!capsule.pieces || requiredItemIds.every((id) => inSavedSet(db, capsule, { kind: 'item', id }))));
+  if (requiredItemIds.length && !caps.length) {
+    throw new HttpError(409, capsuleId
+      ? 'У наборі цієї капсули бракує вибраних речей. Додай їх до набору або вибери іншу капсулу.'
+      : 'Жодна капсула не містить усіх вибраних речей. Додай їх до набору капсули.');
+  }
+  return caps;
+}
+
 /** One search at a time; the owner's words, a capsule and picked pieces are optional. */
 export function queueDiscover(db: DB, opts: { prompt?: string; capsuleId?: string; itemIds?: string[] }): Job {
   if (db.jobs.some((j) => j.kind === 'discover' && (j.state === 'queued' || j.state === 'running'))) throw new HttpError(409, 'Пошук уже йде — зачекай на результат');
@@ -69,6 +80,7 @@ export function queueDiscover(db: DB, opts: { prompt?: string; capsuleId?: strin
     instructions: text(opts.prompt, 400) || (picked.length ? `Доповнити: ${picked.map((i) => i.title).join(', ')}` : ''),
     state: 'queued', origin: 'site', createdAt: now(),
   };
+  eligibleCapsules(db, j);
   db.jobs.push(j);
   return j;
 }
@@ -80,7 +92,7 @@ export function discoverPrompt(db: DB, job: Job) {
   const period = currentPeriod(new Date(), db.profile.hemisphere);
   const required = job.requiredItemIds ?? [];
   const items = pieces(db).filter((i) => !weakPiece(i) || required.includes(i.id));
-  const caps = searchCapsules(db).filter((c) => !job.capsuleId || c.id === job.capsuleId);
+  const caps = eligibleCapsules(db, job);
   const refused = [...refusedPieces(db, hiddenLookIds(db))].filter((id) => !required.includes(id));
   const prefs = db.profile.preferences;
   return [
@@ -92,6 +104,7 @@ export function discoverPrompt(db: DB, job: Job) {
     `Profile — comfort: ${prefs.comfort || '—'}; materials: ${prefs.materials || '—'}; fit: ${prefs.fit || '—'}; branding: ${prefs.branding || '—'}.`,
     job.instructions ? `The owner asks: ${job.instructions}` : `No request: start with the capsules of the current period and the ones with the fewest looks.`,
     required.length ? `Every look MUST contain these owned pieces: ${required.join(', ')}.` : '',
+    required.length ? 'For picked pieces, use a weather period of their capsule. A capsule for another period is valid unless the owner explicitly asks for a particular period or weather.' : '',
     `Return up to ${MAX_SEARCH_RESULTS} looks. Each: capsuleId (one of the capsules below), a short elegant ${replyLanguage(db)} name, why (one ${replyLanguage(db)} sentence: the idea of the look), owned item ids per slot (top, layer, bottom, shoes, accessories — at most 1 per slot, 2 accessories), and buy: at most 2 pieces the owner does not have that make the look work (slot, a short ${replyLanguage(db)} name with colour and material, category). Prefer owned pieces; a look needs a top or an outer layer, a bottom and shoes (owned or to buy).`,
     refused.length ? `Pieces the owner keeps refusing — never use them: ${refused.join(', ')}.` : '',
     `Pieces already planned to buy — when a look needs one of them, use its exact name in buy: ${db.needs.filter((n) => n.status === 'open').map((n) => n.title).join('; ') || '—'}.`,
@@ -139,7 +152,7 @@ export function applyDiscover(db: DB, job: Job, reply: DiscoverReply) {
   const avoid = refusedPieces(db, hiddenLookIds(db));
   for (const i of owned.values()) if (weakPiece(i)) avoid.add(i.id);
   for (const id of required) avoid.delete(id);
-  const caps = new Map(searchCapsules(db).map((c) => [c.id, c] as const));
+  const caps = new Map(eligibleCapsules(db, job).map((c) => [c.id, c] as const));
   const at = now();
   db.suggestions = (db.suggestions ?? []).filter((s) => !(s.source === 'search' && s.status === 'open'));
   const fresh: Slots[] = [];
@@ -147,7 +160,7 @@ export function applyDiscover(db: DB, job: Job, reply: DiscoverReply) {
   for (const o of (reply.looks ?? []).slice(0, MAX_SEARCH_RESULTS + 2)) {
     if (added >= MAX_SEARCH_RESULTS) break;
     const capsule = caps.get(text(o.capsuleId, 80));
-    if (!capsule || (job.capsuleId && capsule.id !== job.capsuleId)) continue;
+    if (!capsule) continue;
     const slots = emptySlots();
     let bad = false;
     const setKeys = capsule.pieces ? new Set(capsule.pieces.map((r) => pieceKey(normalizePiece(db, r)))) : null;

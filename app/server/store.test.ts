@@ -1716,6 +1716,33 @@ test('the capsule sets report reads every fashion capsule, flags limits and neve
 const owned = (id: string, category: DB['items'][number]['category'], title: string) =>
   ({ id, rev: 1, category, title, status: 'confirmed' as const, photoIds: [], origin: 'manual' as const, history: [], createdAt: at, updatedAt: at, rating: { score: 7, note: 'x', rev: 1, at, scale: SCORE_SCALE } });
 
+test('picked boots restrict discovery to capsules that can use them, even in another period', async () => {
+  const { store, call, drained } = setup();
+  const boots = { kind: 'item' as const, id: 'W-B' };
+  await store.mutate((db) => {
+    db.items.push(owned(boots.id, 'shoes', 'Winter boots'));
+    db.capsules[0].pieces = Object.values(db.looks[0].slots).flat();
+    db.capsules[0].periods = ['late-autumn'];
+  });
+  await assert.rejects(call('POST', '/api/discover', { itemIds: [boots.id] }), /Жодна капсула не містить/);
+  assert.equal(store.read().jobs.length, 0);
+  assert.equal(drained(), 0);
+  await store.mutate((db) => {
+    db.capsules.push({ ...db.capsules[0], id: 'C-WINTER', name: 'Winter outdoor', lookIds: [], periods: ['winter'], pieces: [boots] });
+  });
+  await assert.rejects(call('POST', '/api/discover', { capsuleId: 'C-1', itemIds: [boots.id] }), /У наборі цієї капсули бракує/);
+  await assert.rejects(call('POST', '/api/discover', { itemIds: [boots.id, 'W-1'] }), /Жодна капсула не містить/, 'all picked pieces must fit the same capsule');
+  const job = await call('POST', '/api/discover', { itemIds: [boots.id] });
+  const db = store.read();
+  const prompt = discoverPrompt(db, job);
+  assert.match(prompt, /C-WINTER \| Winter outdoor/);
+  assert.doesNotMatch(prompt, /C-1 \| Urban/);
+  assert.match(prompt, /A capsule for another period is valid/);
+  assert.equal(drained(), 1);
+  db.capsules[1].pieces = [];
+  assert.throws(() => discoverPrompt(db, job), /Жодна капсула не містить/, 'a queued job also checks the current capsule sets');
+});
+
 test('the next purchase is one of a capsule set; on an equal score the one adding more combinations comes first', () => {
   const db = fixture();
   db.items[0].status = 'confirmed';
