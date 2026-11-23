@@ -78,9 +78,11 @@ export function snapshotSlots(db: DB, slots: Slots): SnapshotSlot[] {
     for (const ref of slots[slot]) {
       if (ref.kind === 'item') {
         const item = findOr404(db.items, ref.id, 'Річ');
-        const photos = item.photoIds.map((pid) => findOr404(db.photos, pid, 'Фото'))
-          .filter((p) => p.source !== 'generated' && !p.inspiration && p.kind !== 'label' && p.referenceRole !== 'face')
-          .slice(-4).map((p) => p.path);
+        const usable = item.photoIds.map((pid) => findOr404(db.photos, pid, 'Фото'))
+          .filter((p) => !p.inspiration && p.kind !== 'label' && p.referenceRole !== 'face');
+        const real = usable.filter((p) => p.source !== 'generated');
+        // A bought item keeps its shop photo until the owner photographs it: the photo its product slot used.
+        const photos = (real.length ? real : usable.filter((p) => p.kind === 'product')).slice(-4).map((p) => p.path);
         const details = [item.color, item.brand, item.model, item.fit, item.composition, item.observation].filter(Boolean).join(', ');
         const crop = item.tryonReference;
         // Prefer the verified crop even in profiles created before identity pinning.

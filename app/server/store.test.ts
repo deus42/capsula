@@ -650,6 +650,20 @@ test('pinned original freezes face/body crops and excludes faces from garment ph
   assert.match(validateDb(db)!, /власного оригіналу/);
 });
 
+test('a bought item without its own photo offers its shop photo to the try-on, never a packshot', () => {
+  const db = fixture();
+  db.photos.push(
+    { id: 'P-shop', kind: 'product', path: 'media/products/S-1.png', originalName: 'S-1.png', source: 'generated', createdAt: at },
+    { id: 'P-pack', kind: 'packshot', path: 'media/packshots/J-1.png', originalName: 'J-1.png', source: 'generated', createdAt: at },
+  );
+  db.items[1].photoIds = ['P-shop', 'P-pack'];
+  db.looks[0].slots.bottom = [{ kind: 'item', id: 'W-2' }];
+  const bottom = () => snapshotSlots(db, db.looks[0].slots).find((s) => s.slot === 'bottom')!;
+  assert.deepEqual(bottom().originalPhotoPaths, ['media/products/S-1.png']);
+  db.items[1].photoIds = ['P-shop', 'P-2'];
+  assert.deepEqual(bottom().originalPhotoPaths, ['assets/photos/b.jpeg'], 'the owner’s own photo wins over the shop photo');
+});
+
 test('pinned reference integrity fails before generation when a file changes', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capsula-identity-'));
   try {
