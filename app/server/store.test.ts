@@ -265,12 +265,19 @@ test('purchase moves the product into the wardrobe and updates looks (A08, A09)'
   let db = store.read();
   assert.equal(db.needs.length, 1, 'alternatives do not duplicate the need');
   assert.equal(db.products.filter((p) => p.status === 'purchased').length, 0);
+  await store.mutate((draft) => {
+    draft.photos.push({ id: 'P-shop', kind: 'product', path: 'media/products/tee.png', originalName: 'tee.png', source: 'generated', createdAt: at });
+    draft.products.find((product) => product.id === p1.id)!.photoId = 'P-shop';
+  });
   const item = await call('POST', `/api/products/${p1.id}/purchase`, { size: 'M' });
   db = store.read();
   assert.equal(item.status, 'confirmed');
   assert.equal(item.size, 'M');
   assert.equal(db.needs[0].status, 'covered');
   assert.deepEqual(db.looks[0].slots.top, [{ kind: 'item', id: item.id }]);
+  const packshot = db.jobs.find((job) => job.kind === 'packshot' && job.itemId === item.id);
+  assert.equal(packshot?.state, 'queued');
+  assert.deepEqual(packshot?.snapshot.slots[0].photoPaths, ['media/products/tee.png']);
   assert.equal(db.products.find((p) => p.id !== p1.id)!.status, 'option', 'other alternative stays an option');
   const other = db.products.find((p) => p.id !== p1.id)!;
   await assert.rejects(call('POST', `/api/products/${other.id}/purchase`, {}), /уже закрито/, 'a closed purchase cannot be bought twice');
@@ -279,6 +286,7 @@ test('purchase moves the product into the wardrobe and updates looks (A08, A09)'
   db = store.read();
   assert.equal(db.products.find((p) => p.id === p1.id)!.status, 'option');
   assert.equal(db.items.some((i) => i.id === item.id), false);
+  assert.ok(!db.jobs.some((job) => job.itemId === item.id));
   assert.equal(db.needs[0].status, 'open');
   assert.deepEqual(db.looks[0].slots.top, [{ kind: 'need', id: 'N-1' }]);
   assert.equal(validateDb(db), null);
@@ -668,6 +676,9 @@ test('shoe packshots show the pair from the front, like the rest of the wardrobe
   const job = { id: 'J', kind: 'packshot', itemId: 'W-S', lookVersion: 0, snapshot: { lookName: 'Vans', slots: [{ slot: 'shoes', kind: 'item', id: 'W-S', title: 'Vans', description: '', owned: true, photoPaths: ['assets/photos/a.jpeg'] }], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'queued', origin: 'site', createdAt: at } as Parameters<typeof buildPackshotPrompt>[0];
   const prompt = buildPackshotPrompt(job, '/tmp/result.png');
   assert.match(prompt, /from the front and slightly above, toes pointing at the camera/);
+  assert.match(prompt, /invisible shoe trees/);
+  assert.match(prompt, /Lift the collapsed vamp and toe box/);
+  assert.match(prompt, /Inspect the actual returned image/);
   assert.doesNotMatch(prompt, /three-quarter/);
 });
 

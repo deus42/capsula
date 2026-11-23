@@ -172,10 +172,10 @@ export function buildPrompt(job: Job, resultFile: string, refs?: ImageRefs) {
 }
 
 const PACKSHOT_SHAPE: Record<SnapshotSlot['slot'], string> = {
-  top: 'Dress an invisible torso. Show rounded shoulders, a naturally filled chest, hollow sleeve openings where visible and a shaped neckline or collar with depth. Smooth storage creases while keeping the original cut and ordinary worn drape.',
-  layer: 'Dress an invisible torso. Show the true depth of shoulders and body, natural sleeves and a shaped opening, collar or hood as appropriate. Preserve the real cut, length and closure.',
-  bottom: 'Dress an invisible lower body. Show a shaped waistband and hips, separate legs with round volume, and natural drape. Preserve the real rise, width and length.',
-  shoes: 'Show the original pair side by side from the front and slightly above, toes pointing at the camera, symmetric and centred, so the toe shape, opening and sole edge are clear. Keep the original shape and details.',
+  top: 'Dress an invisible torso. Show rounded shoulders and a naturally filled chest with a gentle convex contour. Let the sleeves hang with rounded cross-sections and visible depth at the cuff openings where the angle allows. Shape the neckline or collar and show its inner depth. Keep the weave or knit texture and natural drape.',
+  layer: 'Dress an invisible torso. Shape the shoulders, chest and sleeves. Show the depth of the front opening, collar or hood as appropriate for the actual closure. Preserve the real cut and length.',
+  bottom: 'Dress an invisible lower body. Show a shaped waistband, seat and hips. Give each leg its own rounded cross-section and gradual fall; preserve the real rise, width and length.',
+  shoes: 'Show the original pair side by side from the front and slightly above, toes pointing at the camera, symmetric and centred. Shape them as if fitted with invisible shoe trees. Lift the collapsed vamp and toe box into a smooth, naturally rounded volume. Remove deep dents and storage folds. Preserve the low or high profile, toe width, opening, sole thickness and construction of the actual shoes.',
   accessories: 'Show the original accessory in a natural display position with enough angle and light to show its shape, thickness and hardware.',
 };
 
@@ -195,8 +195,9 @@ export function buildPackshotPrompt(job: Job, resultFile: string, refs?: ImageRe
     refs?.packshotStyle ? 'The LAST image is a studio style reference only. Follow its three-dimensional presentation, framing and lighting. Do not copy any part of its garment, including colour, collar, closure, logo or cut.' : '',
     job.instructions ? `Owner instructions: ${job.instructions}` : '',
     `Required shape: ${PACKSHOT_SHAPE[s.slot]}`,
-    'Image standard: one complete item (or one pair of shoes), centred in a square frame with generous margin, on pure white (#FFFFFF) with soft studio light and a subtle natural shadow. No people, visible mannequin, hanger, overlay text or watermark. A flattened garment, limp source-photo silhouette or simple background removal is unacceptable.',
-    'Review the returned image for actual volume, item fidelity and clean presentation before saving. If it misses the standard, correct it once. If the result still misses it, report an error. Report done only after saving the final PNG to the exact requested path.',
+    'Use the source for the item’s construction and details. Ignore incidental flattening, hanger impressions, shipping folds and collapsed fabric. Rebuild a plausible shape with gentle fabric tension and rounded surfaces. Keep fine texture and ordinary drape.',
+    'Image standard: one complete item (or one pair of shoes), centred in a square frame with generous margin, on pure white (#FFFFFF). Use soft directional studio light that reveals surface curvature and a subtle natural shadow. No people, visible mannequin, hanger, overlay text or watermark.',
+    'Inspect the actual returned image before saving. At thumbnail size the item must read as a solid shape through its outline and surface shading. Reject flat-lay silhouettes, collapsed uppers, deep storage creases, over-inflated shapes and any drift in the item’s cut or identifiable details. Correct once with targeted feedback if needed. If it still fails, report an error. Report done only after saving the final PNG to the exact requested path.',
     '',
     ...REPLY_RULES,
   ]

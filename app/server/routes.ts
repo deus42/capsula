@@ -127,11 +127,18 @@ export function createJob(db: DB, look: Look, basePhotoIds: string[], instructio
 
 const ITEM_SLOT: Record<Item['category'], SlotKey> = { outerwear: 'layer', knitwear: 'top', shirts: 'top', tees: 'top', dresses: 'top', trousers: 'bottom', shorts: 'bottom', skirts: 'bottom', shoes: 'shoes', accessories: 'accessories' };
 
+function packshotSources(db: DB, item: Item): string[] {
+  const photos = item.photoIds.map((id) => findOr404(db.photos, id, 'Фото'))
+    .filter((photo) => !photo.inspiration && photo.referenceRole !== 'face' && !['label', 'packshot', 'worn'].includes(photo.kind));
+  const own = photos.filter((photo) => photo.kind !== 'product' && photo.source !== 'generated');
+  return (own.length ? own : photos.filter((photo) => photo.kind === 'product')).slice(0, 3).map((photo) => photo.path);
+}
+
 export function packshotJob(db: DB, target: { itemId?: string; needId?: string }, instructions = '', retryOf?: string, frozen?: Job['snapshot']): Job {
   let snapshot = frozen;
   if (!snapshot && target.itemId) {
     const item = findOr404(db.items, target.itemId, 'Річ');
-    const photos = item.photoIds.slice(0, 3).map((pid) => findOr404(db.photos, pid, 'Фото').path);
+    const photos = packshotSources(db, item);
     const description = [item.color, item.brand, item.model, item.fit, item.observation].filter(Boolean).join('; ');
     snapshot = { lookName: item.title, slots: [{ slot: ITEM_SLOT[item.category], kind: 'item', id: item.id, title: item.title, description, owned: true, photoPaths: photos }], basePhotoIds: [], basePhotoPaths: [] };
   } else if (!snapshot && target.needId) {
@@ -150,7 +157,7 @@ export function queueMissingItemPackshots(db: DB, itemIds: string[]): number {
   let queued = 0;
   for (const id of new Set(itemIds)) {
     const item = db.items.find((candidate) => candidate.id === id);
-    if (!item || item.status === 'inactive' || item.mergedInto || item.packshotId || !item.photoIds.length || activeIds.has(id)) continue;
+    if (!item || item.status === 'inactive' || item.mergedInto || item.packshotId || activeIds.has(id) || !packshotSources(db, item).length) continue;
     packshotJob(db, { itemId: id });
     queued += 1;
   }
@@ -1049,6 +1056,7 @@ on('POST', '/api/products/:id/purchase', async (ctx, [id], b) => {
     need.coveredLookIds = looks;
     bump(need, undefined);
     retireReplaced(db, need, b.retire);
+    queueMissingItemPackshots(db, [item.id]);
     queueAdvice(db, `Куплено: ${item.title}`);
     // The look pages offer «Оновити» for the changed pictures.
     return { item, renders: [] as Job[] };

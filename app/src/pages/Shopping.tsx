@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Check, MapPin, Pencil, Plus, RefreshCw, ShoppingBag, Trash2, Undo2, X } from 'lucide-react';
+import { Check, MapPin, Pencil, Plus, RefreshCw, ShoppingBag, Trash2, Undo2, Wand2, X } from 'lucide-react';
 import type { Need, Product } from '../api.ts';
 import { api, thumb } from '../api.ts';
 import { useApp, useDb } from '../store.tsx';
@@ -249,6 +249,8 @@ function NeedCard({ need, top = false, places }: { need: Need; top?: boolean; pl
   const shopPhoto = products.map((p) => db.photos.find((x) => p.photoId && x.id === p.photoId)).find((x) => x !== undefined);
   const searches = db.jobs.filter((j) => j.kind === 'shopsearch' && j.needId === need.id);
   const waitJob = searches.find((j) => j.state === 'running') ?? searches.find((j) => j.state === 'queued');
+  const packshotJob = db.jobs.find((job) => job.kind === 'packshot' && job.needId === need.id && (job.state === 'running' || job.state === 'queued'));
+  const progressJob = waitJob ?? packshotJob;
   const waiting = Boolean(waitJob);
   // The last search that added nothing or failed says so in one grey line.
   const last = [...searches].filter((j) => j.state === 'done' || j.state === 'error').sort((a, b) => (b.finishedAt ?? '').localeCompare(a.finishedAt ?? ''))[0];
@@ -311,7 +313,7 @@ function NeedCard({ need, top = false, places }: { need: Need; top?: boolean; pl
             <button className="icon-btn" aria-label={t('Редагувати покупку')} onClick={() => setEditing(true)}><Pencil size={14} /></button>
           </div>
         </div>
-        {waitJob && <div className="search-run"><JobBar job={waitJob} label /></div>}
+        {progressJob && <div className="search-run"><JobBar job={progressJob} label /></div>}
         {lastNote && <span className="small muted">{lastNote}</span>}
         {products.length > 0 && (
           <div className="product-lines">
@@ -340,6 +342,11 @@ function NeedCard({ need, top = false, places }: { need: Need; top?: boolean; pl
           }
         >
           <p className="muted">{need.description}</p>
+          {need.status === 'open' && (
+            <button className="btn ghost" disabled={Boolean(packshotJob)} onClick={() => void act(() => api('POST', '/api/packshots', { needIds: [need.id], run: true }), t('Нове фото речі в роботі'))}>
+              <Wand2 size={14} /> {t('Нове фото')}
+            </button>
+          )}
         </Modal>
       )}
       {owning && <CoverModal need={need} onClose={() => setOwning(false)} />}
