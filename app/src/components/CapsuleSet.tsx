@@ -1,5 +1,5 @@
-import { Fragment, useMemo, useRef, useState } from 'react';
-import { Pencil, Plus, X } from 'lucide-react';
+import { useMemo, useRef, useState } from 'react';
+import { Check, Pencil, Plus } from 'lucide-react';
 import type { Capsule, Category, SlotRef } from '../api.ts';
 import { api, thumb } from '../api.ts';
 import { useApp, useDb } from '../store.tsx';
@@ -78,7 +78,7 @@ function CapsuleSetDialog({ capsule, onClose }: { capsule: Capsule; onClose: () 
     <button type="button" className="btn" disabled={saving} onClick={onClose}>{t('Скасувати')}</button>
     <button type="button" className="btn primary" disabled={saving || Boolean(draft.pending) || sameSetDraft(draft, initial)} onClick={() => void save()}>{t('Зберегти')}</button>
   </>}>
-    <CapsuleSetEditor capsule={capsule} draft={draft} onChange={setDraft} />
+    <CapsuleSetEditor capsule={capsule} draft={draft} onChange={setDraft} bare />
   </Modal>;
 }
 
@@ -95,12 +95,18 @@ export const initialSetDraft = (db: Parameters<typeof capsuleSet>[0], capsule: C
   pending: null,
 });
 
-/** The set inside the capsule's pencil modal: remove, add, replace at the limit, mark the base. */
-export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsule; draft: SetDraft; onChange: (next: SetDraft) => void }) {
+/**
+ * The set editor (owner, 24.11: «зручніше»): one scroll. The capsule's pieces come first as cards, the rest of the wardrobe
+ * and the purchases follow as the same cards. A click ticks or unticks a card in place, so nothing jumps or disappears.
+ * The counts stay in sight; a full group asks, right there, which piece the new one replaces.
+ */
+export function CapsuleSetEditor({ capsule, draft, onChange, bare }: { capsule: Capsule; draft: SetDraft; onChange: (next: SetDraft) => void; bare?: boolean }) {
   const db = useDb();
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<PieceFilter>(() => sportCapsule(capsule) ? 'sport' : 'all');
-  const [blocked, setBlocked] = useState<string | null>(null);
+  const [blocked, setBlocked] = useState<SlotRef | null>(null);
+  // The pieces the editor opened with keep their place at the top; everything else stays in the catalogue, ticked or not.
+  const [opened] = useState(() => draft.pieces);
   const searchInput = useRef<HTMLInputElement>(null);
   const limits = capsuleLimits(capsule);
   const groupOf = (r: SlotRef): PieceGroup => {
@@ -110,11 +116,13 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
   const counts: Record<PieceGroup, number> = { garments: 0, shoes: 0, accessories: 0 };
   for (const r of draft.pieces) counts[groupOf(r)] += 1;
   const inSet = new Set(draft.pieces.map(pieceKey));
+  const openedKeys = new Set(opened.map(pieceKey));
+  const pendingKey = draft.pending ? pieceKey(draft.pending) : null;
   const pendingGroup = draft.pending ? groupOf(draft.pending) : null;
   const search = query.trim().toLocaleLowerCase();
   const matches = (...values: Array<string | undefined>) => values.join(' ').toLocaleLowerCase().includes(search);
-  const availableItems = db.items.filter((i) => i.status !== 'inactive' && !i.mergedInto && !inSet.has(`item:${i.id}`));
-  const availableNeeds = db.needs.filter((n) => n.status === 'open' && !inSet.has(`need:${n.id}`));
+  const availableItems = db.items.filter((i) => i.status !== 'inactive' && !i.mergedInto && !openedKeys.has(`item:${i.id}`));
+  const availableNeeds = db.needs.filter((n) => n.status === 'open' && !openedKeys.has(`need:${n.id}`));
   const availableCategories = new Set([...availableItems, ...availableNeeds].map((piece) => piece.category));
   const isNew = (item: typeof availableItems[number]) => item.origin === 'intake' && item.status === 'needs_confirmation';
   const filters: { key: PieceFilter; label: string; available?: boolean }[] = [
@@ -137,10 +145,12 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
     const c = pieceCategory(db, r);
     return c === 'outerwear' ? 'layer' : c === 'trousers' || c === 'shorts' || c === 'skirts' ? 'bottom' : c === 'shoes' || c === 'accessories' ? c : 'top';
   };
-  const ordered = [...draft.pieces].sort((a, b) => ROLE_ORDER.indexOf(roleOf(a)) - ROLE_ORDER.indexOf(roleOf(b)));
+  const byWear = (a: SlotRef, b: SlotRef) => ROLE_ORDER.indexOf(roleOf(a)) - ROLE_ORDER.indexOf(roleOf(b));
+  const own = [...opened].sort(byWear);
   const usedIn = (key: string) => visibleCapsuleLooks(db, capsule).filter((look) =>
     Object.values(look.slots).some((refs) => refs.some((ref) => pieceKey(normalizePiece(db, ref)) === key)));
-  const blockedLooks = blocked ? usedIn(blocked) : [];
+  const blockedKey = blocked ? pieceKey(blocked) : null;
+  const blockedLooks = blocked ? usedIn(pieceKey(blocked)) : [];
 
   const add = (ref: SlotRef) => {
     const g = groupOf(ref);
@@ -151,7 +161,7 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
   const changePiece = (r: SlotRef, replacement?: SlotRef) => {
     const key = pieceKey(r);
     if (usedIn(key).length) {
-      setBlocked(key);
+      setBlocked(r);
       return;
     }
     setBlocked(null);
@@ -160,89 +170,93 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
       : draft.pieces.filter((ref) => pieceKey(ref) !== key);
     onChange({ ...draft, pieces, base: draft.base.filter((k) => k !== key), pending: replacement ? null : draft.pending });
   };
+  const toggle = (ref: SlotRef) => {
+    const key = pieceKey(ref);
+    if (inSet.has(key)) return changePiece(ref);
+    setBlocked(null);
+    if (key === pendingKey) return onChange({ ...draft, pending: null });
+    return add(ref);
+  };
   const toggleBase = (r: SlotRef) => {
     const k = pieceKey(r);
     if (draft.base.includes(k)) onChange({ ...draft, base: draft.base.filter((x) => x !== k) });
     else if (draft.base.length < MAX_BASE_PIECES) onChange({ ...draft, base: [...draft.base, k] });
   };
-  const choices = (label: string, refs: SlotRef[]) => refs.length > 0 && (
-    <div className="set-choice-group" role="group" aria-label={label}>
-      <h3>{label}</h3>
-      <div className="own-picks">
-        {refs.map((ref) => {
-          const piece = resolveRef(db, ref);
-          return (
-            <button className="own-pick" key={pieceKey(ref)} type="button" onClick={(event) => {
-              if (add(ref) && event.detail === 0) searchInput.current?.focus();
-            }}>
-              <span className="img">
-                {piece.art ? <img src={thumb(piece.art, 240)} alt="" loading="lazy" /> : <CategoryIcon category={piece.category} size={22} />}
-              </span>
-              <span>{piece.title}</span>
-            </button>
-          );
-        })}
+  const card = (ref: SlotRef) => {
+    const piece = resolveRef(db, ref);
+    const art = piece.art ?? piece.photo;
+    const key = pieceKey(ref);
+    const on = inSet.has(key);
+    const isBase = draft.base.includes(key);
+    const state = [on && 'on', key === pendingKey && 'pending', key === blockedKey && 'blocked'].filter(Boolean).join(' ');
+    return (
+      <div className="set-card" key={key}>
+        <button className={`own-pick${state ? ` ${state}` : ''}`} type="button" aria-pressed={on} onClick={(event) => {
+          if (toggle(ref) === true && event.detail === 0) searchInput.current?.focus();
+        }}>
+          <span className="img">
+            {art ? <img src={thumb(art, 240)} alt="" loading="lazy" /> : <CategoryIcon category={piece.category} size={22} />}
+            {on && <span className="tick" aria-hidden="true"><Check size={12} strokeWidth={2.5} /></span>}
+          </span>
+          <span>{piece.title}{ref.kind === 'need' && <span className="buy"> · {t('докупити')}</span>}</span>
+        </button>
+        {on && groupOf(ref) === 'garments' && (
+          <button type="button" className={`quiet-toggle${isBase ? ' on' : ''}`} aria-pressed={isBase} disabled={!isBase && draft.base.length >= MAX_BASE_PIECES} onClick={() => toggleBase(ref)}>{t('база')}</button>
+        )}
       </div>
+    );
+  };
+  const choices = (label: string, refs: SlotRef[], className = '') => refs.length > 0 && (
+    <div className={`set-choice-group${className}`} role="group" aria-label={label}>
+      <h3>{label}</h3>
+      <div className="own-picks">{refs.map(card)}</div>
     </div>
   );
 
   return (
     <div className="field full set-edit">
-      <span>{t('Речі')}</span>
-      <p className="set-counts">
-        {(Object.keys(limits) as PieceGroup[]).map((g) => (
-          <span key={g} className={counts[g] > limits[g] ? 'over' : ''}>{t(GROUP_TEXT[g])} {counts[g]}/{limits[g]}</span>
-        ))}
-      </p>
-      {draft.pending && pendingGroup && (
-        <p className="set-note" role="status">
-          {t('{group} уже {n}/{max}: що замінить «{title}»?', { group: t(GROUP_TEXT[pendingGroup]), n: counts[pendingGroup], max: limits[pendingGroup], title: resolveRef(db, draft.pending).title })}
-          <button type="button" className="quiet-toggle" onClick={() => { setBlocked(null); onChange({ ...draft, pending: null }); }}>{t('Скасувати')}</button>
-        </p>
-      )}
-      {ordered.length > 0 && <ul className="set-list">
-        {ordered.map((r) => {
-          const res = resolveRef(db, r);
-          const art = res.art ?? res.photo;
-          const g = groupOf(r);
-          const key = pieceKey(r);
-          const isBase = draft.base.includes(key);
-          return (
-            <Fragment key={key}>
-              <li className={pendingGroup === g ? 'replaceable' : ''}>
-                <span className="set-thumb">{art ? <img src={thumb(art, 160)} alt="" /> : <CategoryIcon category={res.category} size={16} />}</span>
-                <a className="set-name" href={pieceHref(r)}>{res.title}{r.kind === 'need' && <span className="buy"> · {t('докупити')}</span>}</a>
-                {g === 'garments' && (
-                  <button type="button" className={`quiet-toggle${isBase ? ' on' : ''}`} aria-pressed={isBase} disabled={!isBase && draft.base.length >= MAX_BASE_PIECES} onClick={() => toggleBase(r)}>{t('база')}</button>
-                )}
-                {pendingGroup === g && draft.pending
-                  ? <button type="button" className="quiet-toggle" onClick={() => changePiece(r, draft.pending!)}>{t('замінити')}</button>
-                  : <button type="button" className="icon-btn sm" aria-label={t('Прибрати «{title}»', { title: res.title })} onClick={() => changePiece(r)}><X size={13} /></button>}
-              </li>
-              {blocked === key && blockedLooks.length > 0 && (
-                <li><p className="set-note" role="status">
-                  {t('Спершу заміни річ в образах')}
-                  {blockedLooks.map((look) => <a key={look.id} className="quiet-toggle on" href={`/looks/${look.id}`}>{look.name}</a>)}
-                </p></li>
-              )}
-            </Fragment>
-          );
-        })}
-      </ul>}
-      {!draft.pending && <>
-        <div className="filters set-filters" role="group" aria-label={t('Категорії')}>
-          {filters.filter(({ key, available }) => available !== false || key === filter).map(({ key, label }) => (
-            <button key={key} type="button" className={key === filter ? 'on' : undefined} aria-pressed={key === filter} onClick={() => setFilter(key)}>{t(label)}</button>
+      {!bare && <span>{t('Речі')}</span>}
+      <div className="set-bar">
+        <p className="set-counts">
+          {(Object.keys(limits) as PieceGroup[]).map((g) => (
+            <span key={g} className={counts[g] > limits[g] ? 'over' : ''}>{t(GROUP_TEXT[g])} {counts[g]}/{limits[g]}</span>
           ))}
-        </div>
-        <input ref={searchInput} type="search" className="input" aria-label={t('Пошук речі')} placeholder={t('Пошук речі')} value={query} onChange={(event) => setQuery(event.target.value)} />
-        {items.length + needs.length > 0 ? (
-          <div className="set-choices">
-            {choices(t('Мої речі'), items.map(({ id }) => ({ kind: 'item', id })))}
-            {choices(t('Докупити'), needs.map(({ id }) => ({ kind: 'need', id })))}
+        </p>
+        {draft.pending && pendingGroup && (
+          <div className="set-note" role="status">
+            <span>{t('{group} уже {n}/{max}: що замінить «{title}»?', { group: t(GROUP_TEXT[pendingGroup]), n: counts[pendingGroup], max: limits[pendingGroup], title: resolveRef(db, draft.pending).title })}</span>
+            <span className="set-replace">
+              {draft.pieces.filter((r) => groupOf(r) === pendingGroup).sort(byWear).map((r) => {
+                const res = resolveRef(db, r);
+                const art = res.art ?? res.photo;
+                return <button key={pieceKey(r)} type="button" className={`set-thumb${usedIn(pieceKey(r)).length ? ' used' : ''}`} title={res.title} aria-label={`${t('замінити')} ${res.title}`} onClick={() => changePiece(r, draft.pending!)}>
+                  {art ? <img src={thumb(art, 160)} alt="" /> : <CategoryIcon category={res.category} size={16} />}
+                </button>;
+              })}
+            </span>
+            <button type="button" className="quiet-toggle" onClick={() => { setBlocked(null); onChange({ ...draft, pending: null }); }}>{t('Скасувати')}</button>
           </div>
-        ) : <p className="muted small" role="status">{t('Нічого відповідного не знайдено')}</p>}
-      </>}
+        )}
+        {blocked && blockedLooks.length > 0 && (
+          <p className="set-note" role="status">
+            <span>«{resolveRef(db, blocked).title}» — {t('Спершу заміни річ в образах')}</span>
+            {blockedLooks.map((look) => <a key={look.id} className="quiet-toggle on" href={`/looks/${look.id}`}>{look.name}</a>)}
+          </p>
+        )}
+      </div>
+      {choices(t('Речі капсули'), own, ' set-own')}
+      <div className="filters set-filters" role="group" aria-label={t('Категорії')}>
+        {filters.filter(({ key, available }) => available !== false || key === filter).map(({ key, label }) => (
+          <button key={key} type="button" className={key === filter ? 'on' : undefined} aria-pressed={key === filter} onClick={() => setFilter(key)}>{t(label)}</button>
+        ))}
+      </div>
+      <input ref={searchInput} type="search" className="input" aria-label={t('Пошук речі')} placeholder={t('Пошук речі')} value={query} onChange={(event) => setQuery(event.target.value)} />
+      {items.length + needs.length > 0 ? (
+        <div className="set-choices">
+          {choices(t('Мої речі'), items.map(({ id }) => ({ kind: 'item', id })))}
+          {choices(t('Докупити'), needs.map(({ id }) => ({ kind: 'need', id })))}
+        </div>
+      ) : <p className="muted small" role="status">{t('Нічого відповідного не знайдено')}</p>}
     </div>
   );
 }
