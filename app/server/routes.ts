@@ -9,11 +9,11 @@ import { folderBytesAsync, prewarm, saveUpload, type StorageLimits } from './med
 import { pickTheme } from './analysis.ts';
 import { acceptSuggestion, dropReplacementsFor, keepItem, queueAdvice, rememberDeclined } from './advisor.ts';
 import { looksNeedingRender } from '../src/render-need.ts';
-import { isBlockedEyewear } from '../src/lib.ts';
+import { hasPieces, isBlockedEyewear, resolveRef } from '../src/lib.ts';
 import { productKey, queueStoreFind } from './shop-search.ts';
 import { quotaKind, type QuotaKind } from './quota.ts';
 import { STYLE_CATALOGUE, styleBrief } from '../src/style-catalogue.ts';
-import { tooClose, withBuys } from '../src/look-memory.ts';
+import { sameComposition, tooClose, withBuys } from '../src/look-memory.ts';
 import { queueDiscover } from './discover.ts';
 import { sameIdentity } from './identity.ts';
 import { assertLookFits, placeLook, replaceInSets, requireParentCapsule, setCapsulePieces, stripFromSets } from './capsule-membership.ts';
@@ -24,6 +24,8 @@ export interface Ctx {
   store: Store;
   projectRoot: string;
   drain: () => void;
+  /** False when this account cannot use AI. */
+  autoTryOn?: boolean;
   /** Accounts mode: refuses AI work beyond this month's allowance or while the budget is spent (429). */
   admit?: (kind: QuotaKind, n?: number) => void;
   /** Accounts mode, the owner excepted: photo size, photo count and folder size (413). */
@@ -196,8 +198,8 @@ function replaceRefs(db: DB, match: (r: SlotRef) => boolean, replacement: SlotRe
  * reason instead of running; once the pause is lifted the look counts as
  * missing again, so "Оновити примірки" picks it up.
  */
-function renderLooks(db: DB, lookIds?: string[]) {
-  if (!db.profile.basePhotoIds.length) return [] as Job[];
+function renderLooks(db: DB, lookIds?: string[], includeWaiting = false) {
+  if (!includeWaiting && !db.profile.basePhotoIds.length) return [] as Job[];
   return looksNeedingRender(db)
     .filter((l) => !lookIds || lookIds.includes(l.id))
     .map((l) => {
@@ -205,6 +207,25 @@ function renderLooks(db: DB, lookIds?: string[]) {
       dropJobs(db, (j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === l.id && j.state === 'queued' && j.lookVersion !== l.version);
       return createJob(db, l, db.profile.basePhotoIds, '');
     });
+}
+
+/** New looks retain a waiting job when their personal or garment references are still missing. */
+export function queueNewLookRenders(db: DB, ids: string[]) {
+  return renderLooks(db, ids, true).map((job) => {
+    const missing = job.snapshot.slots.filter((slot) => !slot.photoPaths.length && !slot.originalPhotoPaths?.length);
+    if (job.state === 'queued' && missing.length) {
+      job.state = 'needs_data';
+      job.stateNote = `Потрібні окремі фото речей: ${[...new Set(missing.map((slot) => slot.title))].join(', ')}.`;
+    }
+    return job;
+  });
+}
+
+/** The capsule's + Look starts empty and its item picker saves a piece at a time. */
+function assembledDraft(db: DB, look: Pick<Look, 'slots'>) {
+  const { top, layer, bottom, shoes } = look.slots;
+  const dress = top.some((ref) => resolveRef(db, ref).category === 'dresses');
+  return shoes.length > 0 && (dress || ((top.length > 0 || layer.length > 0) && bottom.length > 0));
 }
 
 /** A changed composition gets a fresh try-on; returns waiting jobs too. */
@@ -607,7 +628,9 @@ on('POST', '/api/suggestions/:id/accept', async (ctx, [id]) => {
     if (s.status !== 'open') throw new HttpError(409, 'Пропозицію вже розглянуто');
     // A look made meanwhile may already be this one (look memory, owner 19.11).
     if (s.looks.some((l) => db.looks.some((x) => tooClose(db, withBuys(l.slots, l.buy), x.slots)))) throw new HttpError(409, 'Вже є схожий образ');
+    const firstNew = db.looks.length;
     const href = acceptSuggestion(db, s);
+    if (ctx.autoTryOn !== false) queueNewLookRenders(db, db.looks.slice(firstNew).map((look) => look.id));
     queueAdvice(db, `Додано пропозицію: ${s.name}`);
     return { href };
   });
@@ -650,38 +673,52 @@ on('POST', '/api/looks/:id/advice', async (ctx, [id], b) => {
   return out;
 });
 
-on('POST', '/api/looks', (ctx, _p, b) =>
-  ctx.store.mutate((db) => {
+on('POST', '/api/looks', async (ctx, _p, b) => {
+  const out = await ctx.store.mutate((db) => {
     const capsule = requireParentCapsule(db, str(b.capsuleId));
     const slots = cleanSlots(b.slots);
+    const duplicate = hasPieces({ slots }) && db.looks.find((look) => look.capsuleId === capsule.id && sameComposition(db, look.slots, slots));
+    if (duplicate) return { look: duplicate, queued: false };
     const at = now();
     const look: Look = { id: newId('L'), rev: 1, capsuleId: capsule.id, name: str(b.name, 120) || 'Мій образ', note: str(b.note), slots, version: 1, versions: [{ version: 1, slots, at }], favorite: false, origin: 'owner', createdAt: at, updatedAt: at };
     db.looks.push(look);
     placeLook(db, look, capsule);
-    return look;
-  }),
-);
+    const jobs = ctx.autoTryOn !== false ? queueNewLookRenders(db, [look.id]) : [];
+    return { look, queued: jobs.some((job) => job.state === 'queued') };
+  });
+  if (out.queued) ctx.drain();
+  return out.look;
+});
 
 on('PATCH', '/api/looks/:id', async (ctx, [id], b) => {
   const out = await ctx.store.mutate((db) => {
     const look = findOr404(db.looks, id, 'Образ');
     bump(look, b.rev);
     pick(look, b, ['name', 'note']);
-    // A changed composition is rated again (never re-rendered by itself: the look page offers «Оновити», owner 17.11).
+    // The first complete composition finishes an empty draft. Later edits still offer «Оновити».
     const changed = b.slots ? setLookSlots(look, cleanSlots(b.slots), str(b.versionNote)) : false;
     if ('capsuleId' in b) placeLook(db, look, requireParentCapsule(db, str(b.capsuleId)));
     else if (changed) assertLookFits(db, look);
     if (b.keptVersion === look.version) look.keptVersion = look.version;
     if (typeof b.favorite === 'boolean') rate(look, b.favorite ? 'like' : null);
     if (!look.name) throw new HttpError(400, 'Назва не може бути порожньою');
-    if (changed) queueAdvice(db, `Змінено образ: ${look.name}`);
+    if (changed) {
+      const firstDraft = look.versions[0] && !hasPieces(look.versions[0]);
+      const firstAssembly = firstDraft && assembledDraft(db, look) && !look.versions.slice(0, -1).some((v) => assembledDraft(db, v));
+      if (firstAssembly) {
+        const duplicate = db.looks.some((other) => other.id !== id && other.capsuleId === look.capsuleId && sameComposition(db, other.slots, look.slots));
+        if (duplicate) throw new HttpError(409, 'Такий образ уже є в цій капсулі');
+        if (ctx.autoTryOn !== false) queueNewLookRenders(db, [id]);
+      }
+      queueAdvice(db, `Змінено образ: ${look.name}`);
+    }
     return { look, run: changed };
   });
   if (out.run) ctx.drain();
   return out.look;
 });
 
-// ── «Додати мій образ»: real photos of a saved look ─────────────────────────
+// ── «Додати реальне фото»: references for a saved look ───────────────────────
 const sameSet = (a: string[], b: string[]) => a.length === b.length && a.every((x) => b.includes(x));
 
 /** The stylist may read it now: refusals (allowance, budget, AI only for the owner) leave the photos saved without a review. */
@@ -765,9 +802,11 @@ on('DELETE', '/api/wears/:id', (ctx, [id]) =>
 
 // ── Try-on queue ───────────────────────────────────────────────────────────
 on('POST', '/api/jobs', async (ctx, _p, b) => {
-  ctx.admit?.('tryon');
   const job = await ctx.store.mutate((db) => {
     const look = findOr404(db.looks, str(b.lookId) ?? '', 'Образ');
+    const pending = db.jobs.find((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === look.id && j.lookVersion === look.version && (j.state === 'queued' || j.state === 'running'));
+    if (pending) return pending;
+    ctx.admit?.('tryon');
     const base = Array.isArray(b.basePhotoIds) ? (b.basePhotoIds as string[]) : db.profile.basePhotoIds;
     return createJob(db, look, base, str(b.instructions) ?? '');
   });

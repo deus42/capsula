@@ -54,6 +54,10 @@ function resolve(db: DB, r: SlotRef): { key: string; sig: string | null } {
 
 const keysOf = (db: DB, slots: Slots, only: readonly string[]) => new Set(only.flatMap((k) => (slots[k as keyof Slots] ?? []).map((r) => resolve(db, r).key)));
 
+/** Exact duplicates have the same resolved pieces in each slot. */
+export const sameComposition = (db: DB, a: Slots, b: Slots) =>
+  SLOTS.every((slot) => pieceDifference(keysOf(db, a, [slot]), keysOf(db, b, [slot])) === 0);
+
 /** The core outfit by kind and colour (top, layer, bottom, shoes); null when a colour is unknown. */
 function coreSignature(db: DB, slots: Slots) {
   const parts: string[] = [];

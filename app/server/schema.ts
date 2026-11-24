@@ -237,6 +237,8 @@ export interface Look {
   id: string;
   rev: number;
   capsuleId: string | null;
+  /** An explicitly curated variant of another look in the same capsule. */
+  variantOf?: string;
   name: string;
   note?: string;
   slots: Slots;

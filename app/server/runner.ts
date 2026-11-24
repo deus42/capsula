@@ -7,7 +7,7 @@ import type { Store } from './store.ts';
 import { newId, now } from './store.ts';
 import { detectImageType, prewarm, resolveAllowed, thumbnail } from './media.ts';
 import { ANALYZE_SCHEMA, INTAKE_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakePrompt, lookPieces } from './analysis.ts';
-import { coverNeed, queueMissingItemPackshots, queueMissingRenders } from './routes.ts';
+import { coverNeed, queueMissingItemPackshots, queueNewLookRenders } from './routes.ts';
 import { DISCOVER_SCHEMA, applyDiscover, discoverPrompt } from './discover.ts';
 import { SHOP_SEARCH_SCHEMA, STORE_FIND_SCHEMA, applyShopSearch, applyStoreFind, fetchProductImage, queueStoreFind, shopSearchPrompt, storeFindPrompt } from './shop-search.ts';
 import { ADVISE_SCHEMA, adviceDue, advisePrompt, applyAdvice, itemsToRate, queueAdvice, seenRevs } from './advisor.ts';
@@ -241,11 +241,11 @@ export function createLimiter(max: number): Limiter {
 }
 
 /**
- * `autoTryOn: false` (accounts) leaves a new selection's looks without automatic try-ons; `canStart` holds queued
- * jobs back (an account whose month's budget is spent). `codexShell: false` runs Codex without commands
+ * `canStart` holds queued jobs back (an account whose month's budget is spent).
+ * `codexShell: false` runs Codex without commands
  * (see CODEX_SHELL_DEFAULT); `codexHome` is where that Codex keeps its generated images.
  */
-export function createRunner(store: Store, projectRoot: string, codexBin = findCodex(), opts: { limiter?: Limiter; engine?: OpenAIEngine; autoTryOn?: boolean; canStart?: (job: Job) => boolean; codexShell?: boolean; codexHome?: string } = {}) {
+export function createRunner(store: Store, projectRoot: string, codexBin = findCodex(), opts: { limiter?: Limiter; engine?: OpenAIEngine; canStart?: (job: Job) => boolean; codexShell?: boolean; codexHome?: string } = {}) {
   const shell = opts.codexShell ?? CODEX_SHELL_DEFAULT;
   const codexHome = opts.codexHome ?? codexHomeDefault();
   const noCommands = shell ? [] : NO_COMMANDS;
@@ -512,8 +512,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         return;
       }
       j.capsuleId = capsuleId;
-      // Every look of a new selection gets the owner's try-on straight away (accounts start try-ons themselves).
-      const renders = opts.autoTryOn === false ? [] : queueMissingRenders(db, db.capsules.find((c) => c.id === capsuleId)?.lookIds ?? []);
+      const renders = queueNewLookRenders(db, db.capsules.find((c) => c.id === capsuleId)?.lookIds ?? []).filter((j) => j.state === 'queued');
       j.state = 'done';
       j.stateNote = `Підбірка готова: ${db.capsules.find((c) => c.id === capsuleId)?.lookIds.length ?? 0} образів${renders.length ? ` — примірки в черзі: ${renders.length}` : ''}`;
     });

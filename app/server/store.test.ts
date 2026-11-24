@@ -124,10 +124,66 @@ test('outfit groups count core changes, ignore accessories and avoid similarity 
   assert.equal(changedCoreSlots(a, belt).length, 0);
   assert.equal(changedCoreSlots(a, shoe).length, 1);
   assert.equal(changedCoreSlots(a, topAndShoe).length, 2);
-  const groups = groupLookVariations([a, belt, shoe, topAndShoe]);
+  const groups = groupLookVariations(fixture(), [a, belt, shoe, topAndShoe]);
   assert.equal(groups.length, 2);
   assert.equal(groups[0].variants.length, 2);
   assert.equal(groups[1].primary.id, topAndShoe.id);
+});
+
+test('sportswear variants group by visual similarity and a curated family in the same capsule', () => {
+  const db = fixture();
+  const a = db.looks[0];
+  const make = (id: string, colors: string[], categories: DB['items'][number]['category'][]) => {
+    const slots = { ...a.slots, top: [], bottom: [], shoes: [], layer: [], accessories: [] } as DB['looks'][number]['slots'];
+    for (const [index, slot] of (['top', 'bottom', 'shoes', 'layer'] as const).entries()) {
+      if (!colors[index]) continue;
+      const item = { ...db.items[0], id: `W-${id}-${slot}`, color: colors[index], category: categories[index] };
+      db.items.push(item);
+      slots[slot].push({ kind: 'item', id: item.id });
+    }
+    return { ...a, id, slots };
+  };
+  const base = make('gym', ['black', 'black', 'black'], ['tees', 'shorts', 'shoes']);
+  const strength = make('strength', ['black', 'black', 'black'], ['tees', 'shorts', 'shoes']);
+  const warmup = { ...make('warmup', ['blue', 'black', 'black', 'navy'], ['tees', 'shorts', 'shoes', 'knitwear']), variantOf: base.id };
+  const cycle = make('cycle', ['green', 'black', 'black'], ['shirts', 'shorts', 'shoes']);
+  assert.deepEqual(groupLookVariations(db, [base, strength, warmup, cycle]).map((g) => g.variants.map((l) => l.id)), [['strength', 'warmup'], []]);
+  const curatedStrength = { ...strength, variantOf: base.id };
+  assert.equal(groupLookVariations(db, [curatedStrength, base, warmup]).length, 1);
+  assert.equal(groupLookVariations(db, [base, { ...warmup, capsuleId: 'C-other' }]).length, 2);
+});
+
+test('saved looks and completed drafts automatically request one try-on of their first composition', async () => {
+  const { store, call } = setup();
+  const item = (id: string, category: DB['items'][number]['category']) => ({ ...fixture().items[0], id, category });
+  await store.mutate((db) => {
+    db.items.push(item('W-T', 'tees'), item('W-S', 'shoes'), item('W-J', 'outerwear'));
+    db.profile.basePhotoIds = ['P-2'];
+  });
+  const slots = { ...emptySlots(), top: [{ kind: 'item', id: 'W-T' }], bottom: [{ kind: 'item', id: 'W-1' }], shoes: [{ kind: 'item', id: 'W-S' }] };
+  const create = (name: string, slots: unknown) => call('POST', '/api/looks', { capsuleId: 'C-1', name, slots });
+  const jobs = (id: string) => store.read().jobs.filter((job) => job.lookId === id);
+  const look = await create('Saved', slots);
+  assert.equal(jobs(look.id)[0].state, 'queued');
+  assert.equal((await create('Duplicate', slots)).id, look.id);
+  const sameJob = await call('POST', '/api/jobs', { lookId: look.id, run: true });
+  assert.equal(sameJob.id, jobs(look.id)[0].id);
+  assert.equal(jobs(look.id).length, 1);
+
+  const draft = await create('Draft', {});
+  await call('PATCH', `/api/looks/${draft.id}`, { slots: { top: slots.top } });
+  assert.equal(jobs(draft.id).length, 0);
+  await assert.rejects(call('PATCH', `/api/looks/${draft.id}`, { slots }), /уже є в цій капсулі/);
+  const filled = await call('PATCH', `/api/looks/${draft.id}`, { slots: { ...slots, layer: [{ kind: 'item', id: 'W-J' }] } });
+  assert.equal(jobs(draft.id)[0].lookVersion, filled.version);
+  await call('PATCH', `/api/looks/${draft.id}`, { name: 'Renamed' });
+  assert.equal(jobs(draft.id).length, 1);
+
+  const missing = await create('Missing garment', { ...slots, top: [{ kind: 'need', id: 'N-1' }] });
+  assert.equal(jobs(missing.id)[0].state, 'needs_data');
+  await store.mutate((db) => { db.profile.basePhotoIds = []; });
+  const noReference = await create('Missing base', { ...slots, shoes: [] });
+  assert.equal(jobs(noReference.id)[0].state, 'needs_data');
 });
 
 test('fixture is valid and seeds an atomic file with a previous-valid backup', async () => {

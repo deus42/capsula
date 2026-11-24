@@ -10,17 +10,18 @@ import { currentLanguage, t } from '../i18n.ts';
 const MAX_PHOTOS = 6;
 const CAUSE: Record<WearCause, string> = { outfit: 'у житті', render: 'рендер', substitution: 'заміна', unknown: 'неясно' };
 
-/** One key per «Додати мій образ» action: a repeated request returns the same wear. */
+/** One key per upload: a repeated request returns the same wear. */
 const actionKey = () => (globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`);
 
 /** The person's own photos of the look and, beside them, the render they were compared with. */
-export function WearPair({ wear }: { wear: Wear }) {
+export function WearPair({ wear, coverId }: { wear: Wear; coverId?: string }) {
   const db = useDb();
   const [first, ...otherPhotos] = wearPhotoPaths(db, wear);
-  const render = wearRenderOf(db, wear);
+  const compared = wearRenderOf(db, wear);
+  const render = compared?.id === coverId ? undefined : compared;
   const original = (p: string) => (
     <a key={p} className="cover worn" href={media(p)} target="_blank" rel="noreferrer">
-      <img src={thumb(p, 960)} alt={t('Мій образ')} />
+      <img src={thumb(p, 960)} alt={t('Реальне фото')} />
     </a>
   );
   return (
@@ -90,7 +91,7 @@ export function WearReview({ wear }: { wear: Wear }) {
   );
 }
 
-/** «Додати мій образ»: one or more photos of one appearance, saved and read in one action. */
+/** One or more real reference photos of the same composition. */
 export function AddWear({ look }: { look: Look }) {
   const ref = useRef<HTMLInputElement>(null);
   const button = useRef<HTMLButtonElement>(null);
@@ -123,7 +124,7 @@ export function AddWear({ look }: { look: Look }) {
     <>
       <button type="button" ref={button} id="my-look" className="wear-add" onClick={() => ref.current?.click()} disabled={busy}>
         {busy ? <Loader2 size={14} className="spin" /> : <Camera size={14} />}
-        {t('Додати мій образ')}
+        {t('Додати реальне фото')}
       </button>
       <input ref={ref} type="file" accept="image/*,.heic,.heif" multiple hidden onChange={(e) => void run(e.target.files)} />
     </>

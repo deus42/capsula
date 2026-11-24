@@ -126,11 +126,12 @@ export function resultsForLook(db: DB, lookId: string) {
  * pieces instead (owner, 17.11). Rejected attempts stay in the archive.
  */
 export function coverForLook(db: DB, look: Look): Result | undefined {
-  const rs = resultsForLook(db, look.id);
+  const rs = resultsForLook(db, look.id).filter((r) => !r.hiddenAt);
   // A try-on awaiting the owner's check shows only when it was made with the current, active face reference.
   const face = db.profile.identity && !db.profile.identity.disabledReason ? db.profile.identity.face?.sha256 : undefined;
   const current = (r: Result) => Boolean(face) && db.jobs.find((j) => j.id === r.jobId)?.snapshot.identity?.face?.sha256 === face;
-  return rs.find((r) => r.review === 'accepted') ?? rs.find((r) => r.review === 'pending' && current(r));
+  const best = (results: Result[]) => results.find((r) => r.review === 'accepted') ?? results.find((r) => r.review === 'pending' && current(r));
+  return best(rs.filter((r) => r.lookVersion === look.version)) ?? best(rs);
 }
 
 /**
@@ -143,8 +144,7 @@ export function currentCover(db: DB, look: Look): Result | undefined {
 }
 
 /**
- * «Додати мій образ»: the latest real appearance of the look's current composition. Photos of an older version
- * show other pieces, so they never stand for the look once it changes.
+ * The reference photos of the current composition, separate from its render.
  */
 export function currentWear(db: DB, look: Look): Wear | undefined {
   return (db.wears ?? []).filter((w) => w.lookId === look.id && w.lookVersion === look.version).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
@@ -240,7 +240,7 @@ export function distinctLooks(db: DB, looks: Look[]): Look[] {
   const hidden = hiddenLookIds(db);
   const visible = looks.filter((l) => !hidden.has(l.id));
   const best = visible.map((l, i) => ({ l, i, s: lookScore(db, l) })).sort((a, b) => b.s - a.s || a.i - b.i).map((e) => e.l);
-  const reps = new Set(groupLookVariations(best).map((g) => g.primary.id));
+  const reps = new Set(groupLookVariations(db, best).map((g) => g.primary.id));
   return rankLooks(db, visible.filter((l) => reps.has(l.id)));
 }
 
@@ -251,7 +251,7 @@ export function lookVariants(db: DB, look: Look): Look[] {
   const hidden = hiddenLookIds(db);
   const visible = capsuleLooks(db, capsule.lookIds).filter((l) => !hidden.has(l.id));
   const best = visible.map((l, i) => ({ l, i, s: lookScore(db, l) })).sort((a, b) => b.s - a.s || a.i - b.i).map((e) => e.l);
-  const group = groupLookVariations(best).find((g) => g.primary.id === look.id || g.variants.some((v) => v.id === look.id));
+  const group = groupLookVariations(db, best).find((g) => g.primary.id === look.id || g.variants.some((v) => v.id === look.id));
   return group ? [group.primary, ...group.variants].filter((l) => l.id !== look.id) : [];
 }
 

@@ -3,7 +3,7 @@ import { ArrowLeftRight, ImageOff, Pencil, Plus, RefreshCw, Trash2 } from 'lucid
 import type { DB, Job, Look, SlotKey, SlotRef } from '../api.ts';
 import { api, media, quotaNote, thumb } from '../api.ts';
 import { useApp, useDb } from '../store.tsx';
-import { Badge, CategoryIcon, Empty, JobBar, LookArt, Missing, Modal, RateButtons } from '../components/ui.tsx';
+import { Badge, CategoryIcon, Empty, LookArt, Missing, Modal, RateButtons } from '../components/ui.tsx';
 import type { ResolvedRef } from '../lib.ts';
 import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, lookRating, lookVariants, resolveRef, scoreLabel } from '../lib.ts';
 import { hiddenLookIds } from '../rating.ts';
@@ -85,7 +85,6 @@ export function LookPage({ id }: { id: string }) {
   const cover = coverForLook(db, look);
   const stale = cover && cover.lookVersion !== look.version;
   const shown = currentCover(db, look);
-  // The person's own photos of this composition lead; the render they were compared with stays beside them.
   const wear = currentWear(db, look);
   const hidden = hiddenLookIds(db).has(look.id);
   const variants = lookVariants(db, look);
@@ -168,17 +167,16 @@ export function LookPage({ id }: { id: string }) {
       <div className="look-page">
         <div className="look-hero">
           <div className="hero-pic">
-            {wear ? <WearPair wear={wear} /> : <a className="cover" href={shown ? media(shown.imagePath) : undefined} target={shown ? '_blank' : undefined} rel="noreferrer">
+            <a className="cover" href={shown ? media(shown.imagePath) : undefined} target={shown ? '_blank' : undefined} rel="noreferrer">
               <LookArt look={look} w={960} busy={busy} label />
-            </a>}
-            {wear && busy && latest && <JobBar job={latest} label />}
-            {!paused && !wear && (
+            </a>
+            {!paused && (
               <button className="refresh-btn" disabled={busy || Boolean(limit)} onClick={() => void update()} aria-label={t('Оновити картинку')} title={limit ?? t('Оновити картинку')}>
                 <RefreshCw size={15} />
               </button>
             )}
           </div>
-          {!wear && shown && shown.review === 'pending' && !busy && (
+          {shown && shown.review === 'pending' && !busy && (
             <div className="update-ask">
               <span>{t('Це я?')}</span>
               <button className="btn sm" onClick={() => void itsMe(false)}>{t('Ні')}</button>
@@ -201,7 +199,11 @@ export function LookPage({ id }: { id: string }) {
               <button className="btn sm primary" onClick={() => void act(() => api('POST', `/api/looks/${look.id}/advice`, { accept: true }))}>{t('Так')}</button>
             </div>
           )}
-          {wear && <WearReview wear={wear} />}
+          {wear && <>
+            <div className="section-head"><h2 className="h2">{t('Реальне фото')}</h2></div>
+            <WearPair wear={wear} coverId={shown?.id} />
+            <WearReview wear={wear} />
+          </>}
           <AddWear look={look} />
         </div>
         <div className="look-side">
