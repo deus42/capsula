@@ -1125,8 +1125,14 @@ on('PATCH', '/api/profile', (ctx, _p, b) =>
     }
     if (Array.isArray(b.knownSizes)) {
       prof.knownSizes = (b.knownSizes as Record<string, unknown>[])
-        .filter((s) => str(s.brand) && str(s.size) && CATEGORIES.includes(s.category as never))
+        .filter((s) => s && str(s.brand) && str(s.size) && CATEGORIES.includes(s.category as never))
         .map((s) => ({ id: str(s.id) || newId('K'), brand: str(s.brand, 80)!, category: s.category as Item['category'], size: str(s.size, 40)!, note: str(s.note) }));
+    }
+    if ('shoeSizeEu' in b) {
+      const size = str(b.shoeSizeEu, 16);
+      if (size && !/^\d{2}(?:[.,]\d{1,2}| ?[½⅓⅔]| [12]\/3)?$/.test(size)) throw new HttpError(400, 'Вкажи розмір взуття у форматі EU');
+      if (size) prof.shoeSizeEu = size;
+      else delete prof.shoeSizeEu;
     }
     // «Магазини» (Profile): the place to search, my stores and my brands — short, de-duplicated lists.
     const list = (v: unknown[]) => [...new Set(v.map((x) => str(x, 60)).filter((x): x is string => Boolean(x)))].slice(0, 30);

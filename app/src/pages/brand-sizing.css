@@ -1,0 +1,23 @@
+.brand-sizing { margin-top: 18px; min-width: 0; }
+.brand-sizing .section-head { margin-bottom: 12px; }
+.brand-size-picker { max-width: 300px; margin: 16px 0 10px; }
+.brand-size-records { list-style: none; padding: 0; margin: 4px 0 16px; }
+.brand-size-records li { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.brand-size-records strong { white-space: nowrap; }
+.brand-guide { margin-top: 22px; }
+.brand-guide h3 { font-size: 15px; font-weight: 600; }
+.brand-guide .section-head a { color: var(--muted); font-size: 13px; text-decoration: underline; }
+.brand-guide-scroll { overflow-x: auto; }
+.brand-guide table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
+.brand-guide th, .brand-guide td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+.brand-guide thead th { font-size: 12px; color: var(--muted); }
+.brand-guide tbody td { white-space: nowrap; }
+.brand-size-edit { display: grid; gap: 16px; }
+.brand-size-edit > .field { max-width: 220px; }
+.brand-size-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; gap: 10px; align-items: end; }
+.brand-size-fields input, .brand-size-fields select { width: 100%; min-width: 0; }
+@media (max-width: 520px) {
+  .brand-size-fields { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+  .brand-size-fields > .field:first-child { grid-column: 1 / -1; }
+  .brand-guide th, .brand-guide td { padding-inline: 6px; }
+}

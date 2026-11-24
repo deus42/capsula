@@ -10,6 +10,8 @@ import type { DB, Job, Product, StorePlace } from './schema.ts';
 import { newId, now } from './store.ts';
 import { detectImageType } from './media.ts';
 import { siteLooks, wardrobeBrands, missingNeeds, resolveRef, shopLocation, shopStores } from '../src/lib.ts';
+import { brandKey, sizeEvidence, sizingBrands } from '../src/brand-sizes.ts';
+import { sizeGuides } from '../src/size-guides.ts';
 import { placeCountry, replyLanguage, shopSection } from './person.ts';
 
 const str = { type: 'string' } as const;
@@ -26,8 +28,8 @@ export const SHOP_SEARCH_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['store', 'brand', 'model', 'sku', 'url', 'imageUrl', 'price', 'currency', 'inTower', 'size', 'matchScore', 'matchNote'],
-        properties: { store: str, brand: str, model: str, sku: str, url: str, imageUrl: str, price: str, currency: str, inTower: { type: 'boolean' }, size: str, matchScore: { type: 'number' }, matchNote: str },
+        required: ['store', 'brand', 'model', 'sku', 'url', 'imageUrl', 'price', 'currency', 'inTower', 'size', 'sizeBasis', 'matchScore', 'matchNote'],
+        properties: { store: str, brand: str, model: str, sku: str, url: str, imageUrl: str, price: str, currency: str, inTower: { type: 'boolean' }, size: str, sizeBasis: str, matchScore: { type: 'number' }, matchNote: str },
       },
     },
   },
@@ -36,7 +38,7 @@ export const SHOP_SEARCH_SCHEMA = {
 export interface ShopReply {
   status: string;
   reason: string;
-  products: { store: string; brand: string; model: string; sku?: string; url: string; imageUrl: string; price: string; currency: string; inTower: boolean; size: string; matchScore: number; matchNote: string }[];
+  products: { store: string; brand: string; model: string; sku?: string; url: string; imageUrl: string; price: string; currency: string; inTower: boolean; size: string; sizeBasis?: string; matchScore: number; matchNote: string }[];
 }
 
 // ── Stores (owner, 19.11): where the nearest physical store of each shop is ──────────────────────────
@@ -77,17 +79,14 @@ export function ownerWhere(db: DB) {
   return { origin, radius, onlineOnly: radius === 0 || (!c && !place) };
 }
 
-/** The owner's sizes, kept under the hood (owner, 20.11): wardrobe labels, bought products and any saved by hand. */
+/** Known sizes come from recorded item sizes or an explicit entry in the profile. */
 export function ownerSizes(db: DB) {
-  const out = new Set<string>();
-  for (const s of db.profile.knownSizes) out.add(`${s.brand} ${s.category}: ${s.size}`);
-  for (const i of db.items) if (i.size && i.status !== 'inactive' && !i.mergedInto) out.add(`${i.brand || 'unknown brand'} ${i.category}: ${i.size}`);
-  for (const p of db.products) {
-    if (p.status !== 'purchased' || !p.recommendedSize) continue;
-    const need = db.needs.find((n) => n.id === p.needId);
-    out.add(`${p.brand} ${need?.category ?? ''}: ${p.recommendedSize} (bought)`.replace(/ :/, ':'));
+  const out = new Map<string, string>();
+  for (const row of sizeEvidence(db)) {
+    const key = `${brandKey(row.brand)}:${row.category}:${row.size.trim().toUpperCase()}`;
+    if (!out.has(key)) out.set(key, `${row.brand || 'unknown brand'} ${row.category}: ${row.size}`);
   }
-  return [...out];
+  return [...out.values()];
 }
 
 export function storeFindPrompt(db: DB) {
@@ -146,6 +145,15 @@ export function shopSearchPrompt(db: DB, job: Job) {
   // Links the owner dropped with × count as found: a new search never brings them back.
   const known = [...db.products.filter((p) => p.needId === need.id && p.url).map((p) => p.url!), ...(need.droppedUrls ?? [])];
   const sizes = ownerSizes(db).join('; ');
+  const measures = db.profile.measurements;
+  const measureKeys = need.category === 'shoes' ? ['foot'] as const
+    : need.category === 'trousers' || need.category === 'shorts' ? ['waist', 'hips', 'inseam'] as const
+      : ['chest', 'waist', 'hips'] as const;
+  const body = measureKeys.flatMap((key) => measures[key].value == null ? [] : [`${key} ${measures[key].value} cm`]).join(', ');
+  const guides = sizingBrands(db).flatMap((brand) => {
+    const urls = [...new Set(sizeGuides(brand).filter((guide) => guide.categories.includes(need.category)).map((guide) => guide.url))];
+    return urls.length ? [`${brand}: ${urls.join(', ')}`] : [];
+  }).join('; ');
   const looks = siteLooks(db)
     .filter((l) => missingNeeds(db, l).includes(need.id))
     .map((l) => `- ${l.name}: ${Object.values(l.slots).flat().filter((r) => !(r.kind === 'need' && r.id === need.id)).map((r) => resolveRef(db, r).title).join(', ')}`);
@@ -162,9 +170,13 @@ export function shopSearchPrompt(db: DB, job: Job) {
       : `Where: first physical stores ${where.radius ? `within ${where.radius} km of` : 'near'} ${where.origin} — check which stores are there (the owner's stores first) and whether they sell such a piece; then the official online stores of the owner's stores and brands that ship to ${placeCountry(db) || "the owner's country"}. Other shops only if nothing suitable is found there.`,
     `Owner's taste — comfort: ${prefs.comfort || '—'}; materials: ${prefs.materials || '—'}; fit: ${prefs.fit || '—'}; branding: ${prefs.branding || '—'}.`,
     sizes ? `Known sizes: ${sizes}.` : '',
+    body ? `Measured body dimensions: ${body}. Use these only to compare in private, never in web search queries.` : '',
+    need.category === 'shoes' && db.profile.shoeSizeEu ? `Usual shoe size: EU ${db.profile.shoeSizeEu}; this is an EU label, not foot length or a confirmed size for every brand.` : '',
+    guides ? `Official brand guide URLs to verify corresponding sizes: ${guides}.` : '',
     looks.length ? `Looks this piece would complete (with their other pieces):\n${looks.join('\n')}` : '',
     known.length ? `Already found (do not return these again; find different ones): ${known.join(' ')}` : '',
-    `Rules: only real products listed right now, each with its direct product page URL and a direct https image URL of the product taken from that page. Never invent products, prices, URLs or images; leave out anything you could not verify. model: the model name and colour as shown to shoppers, without article numbers or colour codes; sku: the article number if shown, else empty. price: the number with a decimal point as text, empty if unknown; currency: ISO code. inTower: true only when the store is at the owner's shopping place. size: the size to try from the known sizes, else empty. matchScore 0–10: colour, cut, material and style against the recommendation, the looks and the taste; use distinct scores so the best one is clear. matchNote: one short ${replyLanguage(db)} sentence why. Best first.`,
+    `Rules: only real products listed right now, each with its direct product page URL and a direct https image URL of the product taken from that page. Never invent products, prices, URLs or images; leave out anything you could not verify. model: the model name and colour as shown to shoppers, without article numbers or colour codes; sku: the article number if shown, else empty. price: the number with a decimal point as text, empty if unknown; currency: ISO code. inTower: true only when the store is at the owner's shopping place. matchScore 0–10: colour, cut, material and style against the recommendation, the looks and the taste; use distinct scores so the best one is clear. matchNote: one short ${replyLanguage(db)} sentence why. Best first.`,
+    `Sizing: use the recorded size for the same brand and category as the starting point, or compare the relevant body measurements with a verified model or brand guide. Preserve the original label system, including W/L and EU. Distinguish body measurements from garment measurements and foot length from shoe size. Return size and a short ${replyLanguage(db)} sizeBasis explaining the evidence. Leave both empty if evidence is insufficient.`,
     `Return status "error" only if web search is unavailable; if nothing suitable exists, status "done" with an empty list and the reason in ${replyLanguage(db)}.`,
     job.instructions ? `Owner note: ${job.instructions}` : '',
   ]
@@ -212,6 +224,7 @@ export function applyShopSearch(db: DB, job: Job, reply: ShopReply) {
       price: String(r.price || '').trim() && Number.isFinite(price) ? price : null,
       currency: String(r.currency || '').trim().slice(0, 8) || undefined,
       recommendedSize: String(r.size || '').trim().slice(0, 40) || undefined,
+      sizeBasis: String(r.sizeBasis || '').trim().slice(0, 300) || undefined,
       onlineAvailability: 'unknown',
       towerAvailability: r.inTower ? 'confirmed' : 'unknown',
       checkedAt: at.slice(0, 10),

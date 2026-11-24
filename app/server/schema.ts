@@ -438,6 +438,7 @@ export interface Profile {
   identity?: IdentityReference;
   measurements: Record<MeasureKey, Measurement>;
   knownSizes: KnownSize[];
+  shoeSizeEu?: string;
   /** «Мої бренди»: brands the owner wears; shop search looks there first. */
   brands?: string[];
   /** «Де шукати»: the owner's shopping place (city or mall); «Знайти» checks its stores first. Empty = online only. */

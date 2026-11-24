@@ -6,6 +6,7 @@ import { api, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
 import { Badge, ConfirmButton, PageHead, PhotoPicker, SubNav } from '../components/ui.tsx';
 import { useIntake } from './Home.tsx';
+import { BrandSizing } from './BrandSizing.tsx';
 import { InfoMark } from './Glossary.tsx';
 import { MEASURES, fmtDay, plainShopName, shopLocation, wardrobeBrands } from '../lib.ts';
 import { LOOKS, currentLanguage, plural, t } from '../i18n.ts';
@@ -498,7 +499,7 @@ export function ProfilePage({ tab }: { tab?: string }) {
         <SubNav value={current} onChange={(k) => go(`/profile/${k}`)} groups={[{ items: tabs }]} />
         <div>
           {current === 'base' && <BasePhotos />}
-          {current === 'measurements' && <Measurements />}
+          {current === 'measurements' && <><Measurements /><BrandSizing /></>}
           {current === 'shops' && <Shops />}
           {current === 'preferences' && <Preferences />}
           {current === 'account' && <Account />}

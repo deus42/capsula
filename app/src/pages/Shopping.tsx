@@ -176,7 +176,7 @@ function ProductLine({ p, need, best, where }: { p: Product; need: Need; best: b
       <span className="pl-img">{photo ? <Img path={photo.path} w={160} /> : concept ? <Img path={concept.path} w={160} /> : <CategoryIcon category={need.category} size={18} />}</span>
       <span className="pl-main">
         {p.url ? <a className="pl-name" href={p.url} target="_blank" rel="noreferrer">{name}</a> : <b className="pl-name">{name}</b>}
-        <span className="pl-sub">{[shop, p.recommendedSize ? `${t('розмір')} ${p.recommendedSize}` : ''].filter(Boolean).join(' · ')}</span>
+        <span className="pl-sub">{[shop, p.recommendedSize ? `${t('розмір')} ${p.recommendedSize}` : ''].filter(Boolean).join(' · ')}{p.recommendedSize && p.sizeBasis && <TermInfo texts={[]} notes={[{ title: t('Підстава розміру'), text: p.sizeBasis }]} />}</span>
       </span>
       {where?.href
         ? <a className="pl-where" href={where.href} target="_blank" rel="noreferrer"><MapPin size={13} />{where.line}</a>
