@@ -58,6 +58,16 @@ const keysOf = (db: DB, slots: Slots, only: readonly string[]) => new Set(only.f
 export const sameComposition = (db: DB, a: Slots, b: Slots) =>
   SLOTS.every((slot) => pieceDifference(keysOf(db, a, [slot]), keysOf(db, b, [slot])) === 0);
 
+/** An exact change of one piece and at least two unchanged pieces. */
+export function onePieceApart(db: DB, a: Slots, b: Slots) {
+  const placed = (slots: Slots) => new Set(SLOTS.flatMap((slot) =>
+    [...keysOf(db, slots, [slot])].map((key) => `${slot}:${key}`)));
+  const first = placed(a);
+  const second = placed(b);
+  const shared = [...first].filter((key) => second.has(key)).length;
+  return shared >= 2 && pieceDifference(first, second) === 1;
+}
+
 /** The core outfit by kind and colour (top, layer, bottom, shoes); null when a colour is unknown. */
 function coreSignature(db: DB, slots: Slots) {
   const parts: string[] = [];

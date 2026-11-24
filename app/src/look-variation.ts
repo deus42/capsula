@@ -8,15 +8,27 @@ export const changedCoreSlots = (a: Look, b: Look) => CORE.filter((slot) => {
 });
 
 export function sameVariant(db: DB, a: Look, b: Look) {
-  const sameFamily = a.capsuleId && a.capsuleId === b.capsuleId && (a.variantOf ?? a.id) === (b.variantOf ?? b.id);
-  return Boolean(sameFamily) || tooClose(db, a.slots, b.slots);
+  return a.capsuleId === b.capsuleId && tooClose(db, a.slots, b.slots);
 }
 
 /** Compare each look with the representative, so similarity cannot chain across a capsule. */
 export function groupLookVariations(db: DB, looks: Look[]) {
-  const groups: { primary: Look; variants: Look[] }[] = [];
+  type Group = { primary: Look; variants: Look[] };
+  const byId = new Map(looks.map((look) => [look.id, look]));
+  const explicit = new Map<string, Group>();
+  const parents = new Map<string, Group>();
   for (const look of looks) {
-    const group = groups.find((g) => sameVariant(db, g.primary, look));
+    const parent = look.variantOf && byId.get(look.variantOf);
+    if (parent && parent.capsuleId === look.capsuleId) {
+      const group = explicit.get(parent.id) ?? { primary: parent, variants: [] };
+      explicit.set(parent.id, group);
+      parents.set(look.id, group);
+    }
+  }
+  const groups = [...explicit.values()];
+  for (const look of looks) {
+    if (explicit.has(look.id)) continue;
+    const group = parents.get(look.id) ?? groups.find((g) => sameVariant(db, g.primary, look));
     if (group) group.variants.push(look);
     else groups.push({ primary: look, variants: [] });
   }

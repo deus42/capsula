@@ -2,6 +2,7 @@ import type { Capsule, DB, Look, SlotRef, Slots } from './schema.ts';
 import { SLOT_KEYS } from './schema.ts';
 import { bump, findOr404, HttpError, now } from './store.ts';
 import { freePlaces, inSavedSet, normalizePiece, pieceCategory, pieceGroup, pieceKey, pieceSetError, piecesOutsideSet, visibleCapsuleLooks } from '../src/capsule-pieces.ts';
+import { onePieceApart } from '../src/look-memory.ts';
 
 export function requireParentCapsule(db: DB, id: string | undefined): Capsule {
   if (!id) throw new HttpError(400, 'Вибери капсулу для образу');
@@ -42,15 +43,38 @@ export function addLookPieceToSet(db: DB, look: Look, revision: number, replaceK
   setCapsulePieces(db, capsule, [...capsule.pieces.filter((ref) => ref !== replacement), piece], undefined);
 }
 
+export function linkNewLookVariant(db: DB, capsule: Capsule, look: Look) {
+  if (look.variantOf) return;
+  const visible = visibleCapsuleLooks(db, capsule);
+  const main = visible.find((other) => other.id !== look.id
+    && !visible.some((candidate) => candidate.id === other.variantOf)
+    && onePieceApart(db, other.slots, look.slots));
+  if (main) look.variantOf = main.id;
+}
+
+/** Moving or deleting a family member keeps the remaining family together. */
+export function detachLookVariant(db: DB, look: Look) {
+  const children = db.looks.filter((other) => other.variantOf === look.id);
+  const next = children.find((other) => other.capsuleId === look.capsuleId && !other.disliked);
+  for (const child of children) {
+    if (next && child !== next && child.capsuleId === next.capsuleId) child.variantOf = next.id;
+    else delete child.variantOf;
+    bump(child, undefined);
+  }
+  delete look.variantOf;
+}
+
 /** Update membership in both directions without changing the look's composition. */
 export function placeLook(db: DB, look: Look, capsule: Capsule) {
   assertFitsCapsule(db, look.slots, capsule);
+  if (look.capsuleId !== capsule.id) detachLookVariant(db, look);
   for (const other of db.capsules) {
     if (other.id === capsule.id || !other.lookIds.includes(look.id)) continue;
     other.lookIds = other.lookIds.filter((id) => id !== look.id);
     bump(other, undefined);
   }
   if (!capsule.lookIds.includes(look.id)) {
+    linkNewLookVariant(db, capsule, look);
     capsule.lookIds.push(look.id);
     bump(capsule, undefined);
   }

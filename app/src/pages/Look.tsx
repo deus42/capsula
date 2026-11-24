@@ -2,7 +2,7 @@ import { Fragment, useEffect, useState } from 'react';
 import { ArrowLeftRight, ImageOff, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import type { DB, Job, Look, SlotKey, SlotRef } from '../api.ts';
 import { api, media, quotaNote, thumb } from '../api.ts';
-import { useApp, useDb } from '../store.tsx';
+import { go, useApp, useDb } from '../store.tsx';
 import { Badge, CategoryIcon, Empty, LookArt, Missing, Modal, RateButtons } from '../components/ui.tsx';
 import type { ResolvedRef } from '../lib.ts';
 import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, itemArt, lookRating, lookVariants, resolveRef, scoreLabel } from '../lib.ts';
@@ -71,7 +71,7 @@ export function LookPage({ id }: { id: string }) {
   const db = useDb();
   const { act, toast, session } = useApp();
   const [editing, setEditing] = useState(false);
-  const [swap, setSwap] = useState<{ slot?: SlotKey; current?: SlotRef } | null>(null);
+  const [swap, setSwap] = useState<{ slot?: SlotKey; current?: SlotRef; variant?: boolean } | null>(null);
   const [keptNow, setKeptNow] = useState('');
   const [asked, setAsked] = useState<string | null>(null);
   // The picture the owner asked for: one quiet word if it could not be made (the slider simply stops otherwise).
@@ -91,7 +91,9 @@ export function LookPage({ id }: { id: string }) {
   const wear = currentWear(db, look);
   const hidden = hiddenLookIds(db).has(look.id);
   const variants = lookVariants(db, look);
-  const siblings = capsule ? distinctLooks(db, capsuleLooks(db, capsule.lookIds)).filter((l) => l.id !== look.id && !variants.some((v) => v.id === l.id)) : [];
+  const capsuleMains = capsule ? distinctLooks(db, capsuleLooks(db, capsule.lookIds)) : [];
+  const siblings = capsuleMains.filter((l) => l.id !== look.id && !variants.some((v) => v.id === l.id));
+  const canMakePrimary = variants.length > 0 && !capsuleMains.some((l) => l.id === look.id);
   // The owner asked for a new picture: the slider runs until it arrives (queued or being made).
   const lookJobs = db.jobs.filter((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === look.id);
   const busy = lookJobs.some((j) => j.state === 'queued' || j.state === 'running');
@@ -101,7 +103,7 @@ export function LookPage({ id }: { id: string }) {
   // Accounts: the month's try-ons are used up (or the budget paused generation).
   const limit = quotaNote(session, 'tryon');
   const kept = look.keptVersion === look.version;
-  // After pieces change, ask once whether to update the picture (owner, 17.11): never automatic.
+  // Manual fallback when an automatic update is unavailable.
   const askUpdate = Boolean(stale) && !busy && !paused && !limit && !kept && keptNow !== `${look.id}:${look.version}`;
   const options = accessoryOptions(db, look);
   // The advisor's one better owned piece for this version of the look.
@@ -258,14 +260,30 @@ export function LookPage({ id }: { id: string }) {
           </div>
         </>
       )}
-      {editing && <EditLook look={look} onClose={() => setEditing(false)} />}
-      {swap && <SwapModal look={look} slot={swap.slot} current={swap.current} onClose={() => setSwap(null)} />}
+      {editing && <EditLook
+        look={look}
+        onClose={() => setEditing(false)}
+        onCreateVariant={capsule && !hidden && pieces.length ? () => { setEditing(false); setSwap({ variant: true }); } : undefined}
+        onMakePrimary={canMakePrimary ? () => void act(() => api('POST', `/api/looks/${look.id}/primary`, { rev: look.rev })).then((saved) => { if (saved) setEditing(false); }) : undefined}
+      />}
+      {swap?.variant && !swap.current ? (
+        <Modal title={t('Яку річ замінити?')} onClose={() => setSwap(null)} wide>
+          <div className="own-picks">
+            {pieces.map(({ slot, r }) => (
+              <button key={`${slot}-${r.ref.kind}-${r.ref.id}`} type="button" className="own-pick" onClick={() => setSwap({ slot, current: r.ref, variant: true })}>
+                <span className="img">{r.art || r.photo ? <img src={thumb((r.art ?? r.photo)!, 320)} alt="" /> : <CategoryIcon category={r.category} size={20} />}</span>
+                <span>{r.title}</span>
+              </button>
+            ))}
+          </div>
+        </Modal>
+      ) : swap && <SwapModal look={look} slot={swap.slot} current={swap.current} variant={swap.variant} onClose={() => setSwap(null)} />}
     </div>
   );
 }
 
 /** Swap, remove or add a piece, with an explicit set change for a piece outside the capsule. */
-function SwapModal({ look, slot, current, onClose }: { look: Look; slot?: SlotKey; current?: SlotRef; onClose: () => void }) {
+function SwapModal({ look, slot, current, variant, onClose }: { look: Look; slot?: SlotKey; current?: SlotRef; variant?: boolean; onClose: () => void }) {
   const db = useDb();
   const { act } = useApp();
   const capsule = db.capsules.find((c) => c.id === look.capsuleId && c.pieces);
@@ -274,6 +292,7 @@ function SwapModal({ look, slot, current, onClose }: { look: Look; slot?: SlotKe
   const [replacement, setReplacement] = useState<string>();
   const [saving, setSaving] = useState(false);
   const inCapsule = (ref: SlotRef) => !capsule || inSavedSet(db, capsule, ref);
+  const inLook = (ref: SlotRef) => Object.values(look.slots).some((refs) => refs.some((r) => same(normalizePiece(db, r), normalizePiece(db, ref))));
   const art = (id?: string) => (id ? db.photos.find((p) => p.id === id)?.path : undefined);
   // Adding: each piece once, under its natural place (a jumper under «Верх», a jacket under «Шар»).
   const NATURAL: Record<string, SlotKey> = { outerwear: 'layer', knitwear: 'top', shirts: 'top', tees: 'top', dresses: 'top', trousers: 'bottom', shorts: 'bottom', skirts: 'bottom', shoes: 'shoes', accessories: 'accessories' };
@@ -286,25 +305,28 @@ function SwapModal({ look, slot, current, onClose }: { look: Look; slot?: SlotKe
         return { ref: { kind: 'item' as const, id: i.id }, title: i.title, photo: art ?? photo };
       }),
       ...db.needs.filter((n) => n.status === 'open' && cats.includes(n.category)).map((n) => ({ ref: { kind: 'need' as const, id: n.id }, title: `${n.title} · ${t('докупити')}`, photo: art(n.conceptPhotoId) })),
-    ].filter(({ ref }) => allPieces || inCapsule(ref));
+    ].filter(({ ref }) => (allPieces || inCapsule(ref)) && (!variant || !inLook(ref)));
   };
-  const save = async (slots: Look['slots'], include?: NonNullable<typeof pending>) => {
+  const save = async (slots: Look['slots'], include?: NonNullable<typeof pending>, selected = include?.ref) => {
     if (saving) return;
     setSaving(true);
-    const ok = await act(() => api('PATCH', `/api/looks/${look.id}`, {
-      rev: include?.lookRev ?? look.rev,
-      slots,
-      ...(include ? { capsuleRev: include.capsuleRev, replaceCapsulePiece: replacement } : {}),
-    }));
+    const rev = include?.lookRev ?? look.rev;
+    const setChange = include ? { capsuleRev: include.capsuleRev, replaceCapsulePiece: replacement } : {};
+    const saved = await act(() => variant
+      ? api<Look>('POST', '/api/looks', { variant: { lookId: look.id, rev, slot, from: current, to: selected }, ...setChange })
+      : api<Look>('PATCH', `/api/looks/${look.id}`, { rev, slots, ...setChange }));
     setSaving(false);
-    if (ok) onClose();
+    if (saved) {
+      onClose();
+      if (variant) go(`/looks/${saved.id}`);
+    }
   };
   const choose = (s: SlotKey, ref: SlotRef) => {
     const list = look.slots[s];
     if (!current && list.some((r) => same(r, ref))) return onClose();
     const next = current ? list.map((r) => same(r, current) ? ref : r).filter((r, i, a) => a.findIndex((x) => same(x, r)) === i) : [...list, ref];
     const slots = { ...look.slots, [s]: next };
-    if (!capsule || inCapsule(ref)) return save(slots);
+    if (!capsule || inCapsule(ref)) return save(slots, undefined, ref);
     setReplacement(undefined);
     setPending({ ref, slots, lookRev: look.rev, capsuleRev: capsule.rev });
   };
@@ -315,17 +337,17 @@ function SwapModal({ look, slot, current, onClose }: { look: Look; slot?: SlotKe
     const category = pieceCategory(db, ref);
     if (!category || pieceGroup(category) !== group) return false;
     const used = (slots: Look['slots']) => Object.values(slots).some((refs) => refs.some((r) => same(normalizePiece(db, r), normalizePiece(db, ref))));
-    return !used(pending.slots) && !visibleCapsuleLooks(db, capsule).some((other) => other.id !== look.id && used(other.slots));
+    return !used(pending.slots) && !visibleCapsuleLooks(db, capsule).some((other) => (variant || other.id !== look.id) && used(other.slots));
   }) : [];
   const slots = slot ? [slot] : SLOTS;
   return (
     <Modal
-      title={current ? <a href={current.kind === 'item' ? `/wardrobe/${current.id}` : `/shopping?need=${current.kind === 'need' ? current.id : (db.products.find((p) => p.id === current.id)?.needId ?? '')}`} onClick={onClose}>{resolveRef(db, current).title}</a> : t('Додати річ')}
+      title={variant ? t('Створити варіант') : current ? <a href={current.kind === 'item' ? `/wardrobe/${current.id}` : `/shopping?need=${current.kind === 'need' ? current.id : (db.products.find((p) => p.id === current.id)?.needId ?? '')}`} onClick={onClose}>{resolveRef(db, current).title}</a> : t('Додати річ')}
       onClose={() => { if (!saving) onClose(); }}
       wide
       footer={pending && <>
         <button type="button" className="btn" disabled={saving} onClick={() => setPending(null)}>{t('Назад')}</button>
-        <button type="button" className="btn primary" disabled={saving || !capsule || (atLimit && !replacement)} onClick={() => void save(pending.slots, pending)}>{t('Додати в капсулу й образ')}</button>
+        <button type="button" className="btn primary" disabled={saving || !capsule || (atLimit && !replacement)} onClick={() => void save(pending.slots, pending)}>{variant ? t('Додати в капсулу й створити варіант') : t('Додати в капсулу й образ')}</button>
       </>}
     >
       {pending && capsule ? (
@@ -352,7 +374,7 @@ function SwapModal({ look, slot, current, onClose }: { look: Look; slot?: SlotKe
           <button type="button" className={!allPieces ? 'on' : undefined} aria-pressed={!allPieces} onClick={() => setAllPieces(false)}>{t('Речі капсули')}</button>
           <button type="button" className={allPieces ? 'on' : undefined} aria-pressed={allPieces} onClick={() => setAllPieces(true)}>{t('Усі речі')}</button>
         </div>}
-        {current && slot && (
+        {current && slot && !variant && (
           <button className="btn sm ghost danger" disabled={saving} style={{ marginBottom: 14 }} onClick={() => void save({ ...look.slots, [slot]: look.slots[slot].filter((r) => !same(r, current)) })}>
             <Trash2 size={13} /> {t('Прибрати з образу')}
           </button>

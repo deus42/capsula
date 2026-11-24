@@ -14,7 +14,7 @@ import { MAX_IMAGE_REFS, buildPackshotPrompt, buildPrompt, createRunner, pickRef
 import { ANALYZE_SCHEMA, INTAKE_SCHEMA, VISUAL_DEDUP_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakeComparisonCandidates, intakePrompt, type IntakeReply } from './analysis.ts';
 import { hiddenLookIds, isCapsuleHidden, sameLook } from '../src/rating.ts';
 import { createHash } from 'node:crypto';
-import { itemArt } from '../src/lib.ts';
+import { distinctLooks, itemArt, lookVariants } from '../src/lib.ts';
 import { changedCoreSlots, groupLookVariations } from '../src/look-variation.ts';
 import { looksNeedingRender } from '../src/render-need.ts';
 import { coverForLook, currentCover, currentPeriod, indoorOnly, purchasePlan, todayLooks, openSuggestions, storeKey, capsuleCount, capsuleRating, isComplete, itemPlacements, itemRating, itemVerdict, lookRating, missingInfo, purchaseRanking, scoreLabel, usageLabel, wardrobeCapsule } from '../src/lib.ts';
@@ -186,6 +186,54 @@ test('saved looks and completed drafts automatically request one try-on of their
   await store.mutate((db) => { db.profile.basePhotoIds = []; });
   const noReference = await create('Missing base', { ...slots, shoes: [] });
   assert.equal(jobs(noReference.id)[0].state, 'needs_data');
+});
+
+test('one-piece variants are unique, auto-linked and can represent their family', async () => {
+  const { store, call } = setup();
+  const ref = (id: string) => ({ kind: 'item' as const, id });
+  const baseSlots = { ...emptySlots(), top: [ref('W-T1')], bottom: [ref('W-1')], shoes: [ref('W-S')] };
+  await store.mutate((db) => {
+    const item = (id: string, category: DB['items'][number]['category']) =>
+      ({ ...db.items[0], id, title: id, category });
+    db.items.push(item('W-T1', 'tees'), item('W-T2', 'tees'), item('W-S', 'shoes'), item('W-S2', 'shoes'));
+    Object.assign(db.looks[0], { slots: baseSlots, versions: [{ version: 1, slots: baseSlots, at }], favorite: true });
+    db.profile.basePhotoIds = ['P-1'];
+    db.items[1].photoIds = ['P-2'];
+    db.capsules[0].pieces = [ref('W-T1'), ref('W-T2'), ref('W-1'), ref('W-S'), ref('W-S2')];
+  });
+  const base = store.read().looks[0];
+  const capsule = store.read().capsules[0];
+  const request = { variant: { lookId: base.id, rev: base.rev, slot: 'bottom', from: ref('W-1'), to: ref('W-2') }, capsuleRev: capsule.rev };
+  await assert.rejects(call('POST', '/api/looks', { ...request, capsuleRev: capsule.rev - 1 }), { status: 409 });
+  await assert.rejects(call('POST', '/api/looks', { ...request, replaceCapsulePiece: 'item:W-1' }), { status: 409 });
+  await assert.rejects(call('POST', '/api/looks', { ...request, variant: { ...request.variant, to: ref('W-S') } }), { status: 400 });
+  const manual = await call('POST', '/api/looks', request);
+  assert.equal(manual.variantOf, base.id);
+  assert.equal(manual.version, 1);
+  assert.equal((await call('POST', '/api/looks', request)).id, manual.id);
+  const direct = await call('POST', '/api/looks', { capsuleId: 'C-1', name: 'Another tee', slots: { ...baseSlots, top: [ref('W-T2')] } });
+  assert.equal(direct.variantOf, base.id);
+  const draft = await call('POST', '/api/looks', { capsuleId: 'C-1', name: 'Other shoes' });
+  await call('PATCH', `/api/looks/${draft.id}`, { slots: { top: baseSlots.top } });
+  assert.equal(store.read().looks.find((look) => look.id === draft.id)?.variantOf, undefined);
+  const assembled = await call('PATCH', `/api/looks/${draft.id}`, { slots: { ...baseSlots, shoes: [ref('W-S2')] } });
+  assert.equal(assembled.variantOf, base.id);
+  const other = await call('POST', '/api/capsules', { name: 'Other capsule' });
+  const outside = await call('POST', '/api/looks', { capsuleId: other.id, name: 'Outside', slots: direct.slots });
+  assert.equal(outside.variantOf, undefined);
+
+  const before = store.read();
+  assert.deepEqual(before.looks[0], base);
+  assert.ok(before.jobs.some((job) => job.lookId === manual.id && job.lookVersion === 1 && job.state === 'queued'));
+  await assert.rejects(call('POST', `/api/looks/${manual.id}/primary`, { rev: manual.rev - 1 }), { status: 409 });
+  const primary = await call('POST', `/api/looks/${manual.id}/primary`, { rev: manual.rev });
+  const after = store.read();
+  assert.equal(primary.variantOf, undefined);
+  assert.equal(primary.version, manual.version);
+  assert.deepEqual(after.jobs, before.jobs);
+  assert.deepEqual(after.looks.filter((look) => look.variantOf === primary.id).map((look) => look.id), [base.id, direct.id, draft.id]);
+  assert.deepEqual(distinctLooks(after, after.looks).map((look) => look.id), [primary.id, outside.id]);
+  assert.deepEqual(new Set(lookVariants(after, primary).map((look) => look.id)), new Set([base.id, direct.id, draft.id]));
 });
 
 test('sports tagging preserves item categories and a multisport capsule can store four accessories', async () => {

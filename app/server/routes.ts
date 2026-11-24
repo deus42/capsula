@@ -9,16 +9,16 @@ import { folderBytesAsync, prewarm, saveUpload, type StorageLimits } from './med
 import { pickTheme } from './analysis.ts';
 import { acceptSuggestion, dropReplacementsFor, keepItem, queueAdvice, rememberDeclined } from './advisor.ts';
 import { looksNeedingRender } from '../src/render-need.ts';
-import { pieceSetError } from '../src/capsule-pieces.ts';
+import { normalizePiece, pieceKey, pieceSetError } from '../src/capsule-pieces.ts';
 import { itemCoverOptions, primaryPhotoFirst } from '../src/item-images.ts';
-import { hasPieces, isBlockedEyewear, resolveRef } from '../src/lib.ts';
+import { SLOT_CATEGORIES, hasPieces, isBlockedEyewear, lookGroup, lookVariants, resolveRef } from '../src/lib.ts';
 import { productKey, queueStoreFind } from './shop-search.ts';
 import { quotaKind, type QuotaKind } from './quota.ts';
 import { STYLE_CATALOGUE, styleBrief } from '../src/style-catalogue.ts';
 import { sameComposition, tooClose, withBuys } from '../src/look-memory.ts';
 import { queueDiscover } from './discover.ts';
 import { sameIdentity } from './identity.ts';
-import { addLookPieceToSet, assertLookFits, placeLook, replaceInSets, requireParentCapsule, setCapsulePieces, stripFromSets } from './capsule-membership.ts';
+import { addLookPieceToSet, assertLookFits, detachLookVariant, linkNewLookVariant, placeLook, replaceInSets, requireParentCapsule, setCapsulePieces, stripFromSets } from './capsule-membership.ts';
 import { MAX_WEAR_PHOTOS, newWearId, queueWearReview, reviewPending, wearRender } from './wear-review.ts';
 import { approveIdentityDraft, queueIdentityPrep } from './identity-prep.ts';
 import { approveCapsules, approveSets, queueCapsuleMatch, queueCapsulePlan, type ApprovedSetInput } from './onboarding.ts';
@@ -462,8 +462,7 @@ export function deleteLook(db: DB, id: string) {
   db.comparisons = db.comparisons.filter((c) => db.results.some((r) => r.id === c.resultA) && db.results.some((r) => r.id === c.resultB));
   for (const c of db.capsules) c.lookIds = c.lookIds.filter((l) => l !== id);
   for (const n of db.needs) if (n.coveredLookIds?.includes(id)) n.coveredLookIds = n.coveredLookIds.filter((l) => l !== id);
-  // Its variants stand on their own once it is gone.
-  for (const other of db.looks) if (other.variantOf === id) delete other.variantOf;
+  detachLookVariant(db, look);
   db.looks = db.looks.filter((l) => l.id !== id);
 }
 
@@ -934,12 +933,35 @@ on('POST', '/api/looks/:id/advice', async (ctx, [id], b) => {
 
 on('POST', '/api/looks', async (ctx, _p, b) => {
   const out = await ctx.store.mutate((db) => {
-    const capsule = requireParentCapsule(db, str(b.capsuleId));
-    const slots = cleanSlots(b.slots);
+    const variant = b.variant as Body | undefined;
+    const source = variant ? findOr404(db.looks, str(variant.lookId) ?? '', 'Образ') : undefined;
+    const capsule = requireParentCapsule(db, source ? source.capsuleId ?? undefined : str(b.capsuleId));
+    let variantOf: string | undefined;
+    let name = str(b.name, 120) || 'Мій образ';
+    let slots = cleanSlots(b.slots);
+    if (source && variant) {
+      if (typeof variant.rev !== 'number') throw new HttpError(400, 'Онови сторінку образу');
+      if (variant.rev !== source.rev) throw new HttpError(409, 'Запис уже змінено в іншому місці — оновіть сторінку', source);
+      const slot = SLOT_KEYS.find((key) => key === variant.slot);
+      const refs = slot ? cleanSlots({ [slot]: [variant.from, variant.to] })[slot] : [];
+      if (!slot || refs.length !== 2) throw new HttpError(400, 'Вибери одну річ для заміни');
+      const [from, to] = refs;
+      const key = (ref: SlotRef) => pieceKey(normalizePiece(db, ref));
+      const replacement = resolveRef(db, to);
+      const oldIndex = source.slots[slot].findIndex((ref) => ref.kind === from.kind && ref.id === from.id);
+      if (oldIndex < 0 || !replacement.category || !SLOT_CATEGORIES[slot].includes(replacement.category) || replacement.inactive
+        || Object.values(source.slots).flat().some((ref) => key(ref) === key(to))) {
+        throw new HttpError(400, 'Вибери одну річ для заміни');
+      }
+      variantOf = lookGroup(db, source)?.primary.id ?? source.id;
+      slots = { ...source.slots, [slot]: source.slots[slot].map((ref, index) => index === oldIndex ? to : ref) };
+      name = replacement.title.slice(0, 120);
+    }
     const duplicate = hasPieces({ slots }) && db.looks.find((look) => look.capsuleId === capsule.id && sameComposition(db, look.slots, slots));
     if (duplicate) return { look: duplicate, queuedIds: [] };
     const at = now();
-    const look: Look = { id: newId('L'), rev: 1, capsuleId: capsule.id, name: str(b.name, 120) || 'Мій образ', note: str(b.note), slots, version: 1, versions: [{ version: 1, slots, at }], favorite: false, origin: 'owner', createdAt: at, updatedAt: at };
+    const look: Look = { id: newId('L'), rev: 1, capsuleId: capsule.id, variantOf, name, note: str(b.note), slots, version: 1, versions: [{ version: 1, slots, at }], favorite: false, origin: 'owner', createdAt: at, updatedAt: at };
+    if (variantOf && typeof b.capsuleRev === 'number') addLookPieceToSet(db, look, b.capsuleRev, str(b.replaceCapsulePiece));
     db.looks.push(look);
     placeLook(db, look, capsule);
     const jobs = ctx.autoTryOn !== false ? queueNewLookRenders(db, [look.id]) : [];
@@ -948,6 +970,24 @@ on('POST', '/api/looks', async (ctx, _p, b) => {
   if (out.queuedIds.length && (!ctx.admit || kept(ctx, out.queuedIds).length)) ctx.drain();
   return out.look;
 });
+
+on('POST', '/api/looks/:id/primary', (ctx, [id], b) => ctx.store.mutate((db) => {
+  const look = findOr404(db.looks, id, 'Образ');
+  const variants = lookVariants(db, look);
+  if (!variants.length) throw new HttpError(409, 'У цього образу немає варіантів');
+  bump(look, b.rev);
+  const family = new Set([id, ...variants.map((other) => other.id)]);
+  for (const other of db.looks) {
+    if (other.id === id || other.capsuleId !== look.capsuleId) continue;
+    if (!family.has(other.id) && !(other.variantOf && family.has(other.variantOf))) continue;
+    if (other.variantOf !== id) {
+      other.variantOf = id;
+      bump(other, undefined);
+    }
+  }
+  delete look.variantOf;
+  return look;
+}));
 
 on('PATCH', '/api/looks/:id', async (ctx, [id], b) => {
   const out = await ctx.store.mutate((db) => {
@@ -969,6 +1009,8 @@ on('PATCH', '/api/looks/:id', async (ctx, [id], b) => {
       if (draft && ready) {
         const duplicate = db.looks.some((other) => other.id !== id && other.capsuleId === look.capsuleId && sameComposition(db, other.slots, look.slots));
         if (duplicate) throw new HttpError(409, 'Такий образ уже є в цій капсулі');
+        const capsule = db.capsules.find((other) => other.id === look.capsuleId);
+        if (capsule) linkNewLookVariant(db, capsule, look);
       }
       if (ready && ctx.autoTryOn !== false) queueNewLookRenders(db, [id]);
       queueAdvice(db, `Змінено образ: ${look.name}`);

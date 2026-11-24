@@ -235,8 +235,7 @@ const lookScore = (db: DB, l: Look) => (l.favorite ? 8 : 0) + (isComplete(db, l)
 /**
  * One card per look: hidden looks are dropped and near-copies (owner's rule:
  * identical or one piece different) fold into the best representative —
- * liked, then with an accepted try-on, then with any try-on. Copies stay in
- * the data. Liked looks come first; otherwise the given order is kept.
+ * the chosen main look, or liked and complete looks first for an unlinked group.
  */
 export function distinctLooks(db: DB, looks: Look[]): Look[] {
   const hidden = hiddenLookIds(db);
@@ -246,14 +245,18 @@ export function distinctLooks(db: DB, looks: Look[]): Look[] {
   return rankLooks(db, visible.filter((l) => reps.has(l.id)));
 }
 
-/** The other looks shown as variants of this one in its capsule (owner, 19.11): its primary and the primary's other variants. */
-export function lookVariants(db: DB, look: Look): Look[] {
+export function lookGroup(db: DB, look: Look) {
   const capsule = look.capsuleId ? db.capsules.find((c) => c.id === look.capsuleId) : undefined;
-  if (!capsule) return [];
+  if (!capsule) return;
   const hidden = hiddenLookIds(db);
   const visible = capsuleLooks(db, capsule.lookIds).filter((l) => !hidden.has(l.id));
   const best = visible.map((l, i) => ({ l, i, s: lookScore(db, l) })).sort((a, b) => b.s - a.s || a.i - b.i).map((e) => e.l);
-  const group = groupLookVariations(db, best).find((g) => g.primary.id === look.id || g.variants.some((v) => v.id === look.id));
+  return groupLookVariations(db, best).find((g) => g.primary.id === look.id || g.variants.some((v) => v.id === look.id));
+}
+
+/** The other looks displayed in this look's group. */
+export function lookVariants(db: DB, look: Look): Look[] {
+  const group = lookGroup(db, look);
   return group ? [group.primary, ...group.variants].filter((l) => l.id !== look.id) : [];
 }
 
