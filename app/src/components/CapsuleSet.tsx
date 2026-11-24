@@ -1,11 +1,11 @@
-import { useMemo } from 'react';
-import { X } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Plus, X } from 'lucide-react';
 import type { Capsule, SlotRef } from '../api.ts';
-import { thumb } from '../api.ts';
-import { useDb } from '../store.tsx';
+import { api, thumb } from '../api.ts';
+import { useApp, useDb } from '../store.tsx';
 import { CATEGORY_LABEL, resolveRef } from '../lib.ts';
 import { CAPSULE_LIMITS, MAX_BASE_PIECES, capsuleLimits, capsuleSet, pieceCategory, pieceGroup, pieceKey, type CapsulePiece, type PieceGroup } from '../capsule-pieces.ts';
-import { Badge, CategoryIcon } from './ui.tsx';
+import { Badge, CategoryIcon, Modal } from './ui.tsx';
 import { LOOKS, t, plural as pluralize } from '../i18n.ts';
 
 const looksText = (n: number) => (n ? pluralize(n, LOOKS) : t('без образів'));
@@ -21,8 +21,8 @@ const pieceHref = (r: SlotRef) => (r.kind === 'item' ? `/wardrobe/${r.id}` : `/s
  */
 export function CapsuleSetSection({ capsule }: { capsule: Capsule }) {
   const db = useDb();
+  const [adding, setAdding] = useState(false);
   const set = useMemo(() => capsuleSet(db, capsule), [db, capsule]);
-  if (!set.pieces.length) return null;
   const garments = set.pieces.filter((p) => p.group === 'garments').sort(byRole);
   const extras = set.pieces.filter((p) => p.group !== 'garments').sort(byRole);
   const over = set.counts.garments > CAPSULE_LIMITS.garments;
@@ -44,12 +44,36 @@ export function CapsuleSetSection({ capsule }: { capsule: Capsule }) {
     <section className="capsule-set" aria-label={t('Речі капсули')}>
       <div className="section-head">
         <h2 className="h2">{t('Речі')} <span className={`count${over ? ' over' : ''}`}>{over ? `${set.counts.garments}/${CAPSULE_LIMITS.garments}` : set.counts.garments}</span></h2>
-        {set.combinations > 0 && <span className="set-combos">{combosText(set.combinations)}</span>}
+        <div className="row">
+          {set.combinations > 0 && <span className="set-combos">{combosText(set.combinations)}</span>}
+          <button type="button" className="btn sm ghost" onClick={() => setAdding(true)}><Plus size={14} /> {t('Додати річ')}</button>
+        </div>
       </div>
       {garments.length > 0 && <div className="ward-grid">{garments.map(tile)}</div>}
       {extras.length > 0 && <div className="ward-grid small set-extras">{extras.map(tile)}</div>}
+      {adding && <CapsuleSetDialog capsule={capsule} onClose={() => setAdding(false)} />}
     </section>
   );
+}
+
+function CapsuleSetDialog({ capsule, onClose }: { capsule: Capsule; onClose: () => void }) {
+  const db = useDb();
+  const { act } = useApp();
+  const [{ initial, rev }] = useState(() => ({ initial: initialSetDraft(db, capsule), rev: capsule.rev }));
+  const [draft, setDraft] = useState(initial);
+  const [saving, setSaving] = useState(false);
+  const save = async () => {
+    setSaving(true);
+    const result = await act(() => api('PATCH', `/api/capsules/${capsule.id}`, { rev, ...setDraftPayload(draft) }), t('Збережено'));
+    setSaving(false);
+    if (result) onClose();
+  };
+  return <Modal title={t('Речі капсули')} onClose={() => { if (!saving) onClose(); }} footer={<>
+    <button type="button" className="btn" disabled={saving} onClick={onClose}>{t('Скасувати')}</button>
+    <button type="button" className="btn primary" disabled={saving || Boolean(draft.pending) || sameSetDraft(draft, initial)} onClick={() => void save()}>{t('Зберегти')}</button>
+  </>}>
+    <CapsuleSetEditor capsule={capsule} draft={draft} onChange={setDraft} />
+  </Modal>;
 }
 
 export interface SetDraft {
@@ -113,6 +137,11 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
           <span key={g} className={counts[g] > limits[g] ? 'over' : ''}>{t(GROUP_TEXT[g])} {counts[g]}/{limits[g]}</span>
         ))}
       </p>
+      <select className="select" value="" aria-label={t('Додати річ у капсулу')} onChange={(e) => add(e.target.value)}>
+        <option value="">{t('Додати річ…')}</option>
+        {items.length > 0 && <optgroup label={t('Мої речі')}>{items.map((i) => <option key={i.id} value={`item:${i.id}`}>{i.title} — {t(CATEGORY_LABEL[i.category])}</option>)}</optgroup>}
+        {needs.length > 0 && <optgroup label={t('Докупити')}>{needs.map((n) => <option key={n.id} value={`need:${n.id}`}>{n.title} — {t(CATEGORY_LABEL[n.category])}</option>)}</optgroup>}
+      </select>
       <ul className="set-list">
         {ordered.map((r) => {
           const res = resolveRef(db, r);
@@ -140,11 +169,6 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
           <button type="button" className="quiet-toggle" onClick={() => onChange({ ...draft, pending: null })}>{t('Скасувати')}</button>
         </p>
       )}
-      <select className="select" value="" aria-label={t('Додати річ у капсулу')} onChange={(e) => add(e.target.value)}>
-        <option value="">{t('Додати річ…')}</option>
-        {items.length > 0 && <optgroup label={t('Мої речі')}>{items.map((i) => <option key={i.id} value={`item:${i.id}`}>{i.title} — {t(CATEGORY_LABEL[i.category])}</option>)}</optgroup>}
-        {needs.length > 0 && <optgroup label={t('Докупити')}>{needs.map((n) => <option key={n.id} value={`need:${n.id}`}>{n.title} — {t(CATEGORY_LABEL[n.category])}</option>)}</optgroup>}
-      </select>
     </div>
   );
 }

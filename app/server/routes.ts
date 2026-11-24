@@ -9,6 +9,7 @@ import { folderBytesAsync, prewarm, saveUpload, type StorageLimits } from './med
 import { pickTheme } from './analysis.ts';
 import { acceptSuggestion, dropReplacementsFor, keepItem, queueAdvice, rememberDeclined } from './advisor.ts';
 import { looksNeedingRender } from '../src/render-need.ts';
+import { itemCoverOptions, primaryPhotoFirst } from '../src/item-images.ts';
 import { hasPieces, isBlockedEyewear, resolveRef } from '../src/lib.ts';
 import { productKey, queueStoreFind } from './shop-search.ts';
 import { quotaKind, type QuotaKind } from './quota.ts';
@@ -448,7 +449,12 @@ export function deleteItem(db: DB, id: string) {
   for (const n of db.needs) if (n.coveredByItem === id && n.status === 'covered') uncoverNeed(db, n.id);
   stripRefs(db, 'item', id);
   dropJobs(db, (j) => j.kind === 'packshot' && j.itemId === id);
-  if (item.packshotId) db.photos = db.photos.filter((p) => p.id !== item.packshotId);
+  if (item.packshotId && !db.items.some((other) => other.id !== id && (other.packshotId === item.packshotId || other.photoIds.includes(item.packshotId!)))
+    && !db.products.some((product) => product.photoId === item.packshotId)
+    && !db.needs.some((need) => need.conceptPhotoId === item.packshotId)
+    && !db.jobs.some((job) => job.photoId === item.packshotId)) {
+    db.photos = db.photos.filter((p) => p.id !== item.packshotId);
+  }
   for (const j of db.jobs) {
     if (j.createdItemIds?.includes(id)) j.createdItemIds = j.createdItemIds.filter((x) => x !== id);
     if (j.attachedItemIds?.includes(id)) j.attachedItemIds = j.attachedItemIds.filter((x) => x !== id);
@@ -505,6 +511,11 @@ on('PATCH', '/api/items/:id', async (ctx, [id], b) => {
     // «Це моя річ? — Ні»: a rejected item no longer covers a recommendation; its looks get the stand-in back.
     if (item.status === 'inactive' && before !== 'inactive') for (const n of db.needs) if (n.coveredByItem === item.id && n.status === 'covered' && !db.products.some((p) => p.needId === n.id && p.status === 'purchased')) uncoverNeed(db, n.id);
     if (Array.isArray(b.photoIds)) item.photoIds = (b.photoIds as string[]).filter((pid) => db.photos.some((p) => p.id === pid && p.kind !== 'worn'));
+    if (b.packshotId !== undefined) {
+      const cover = itemCoverOptions(db, [item]).find((photo) => photo.id === b.packshotId);
+      if (!cover) throw new HttpError(400, 'Вибери каталожне зображення цієї речі');
+      item.packshotId = cover.id;
+    }
     clearDetachedCrop(db, item);
     if (!item.title) throw new HttpError(400, 'Назва не може бути порожньою');
     history(item, before !== item.status ? `status:${item.status}` : 'edited');
@@ -518,9 +529,16 @@ on('PATCH', '/api/items/:id', async (ctx, [id], b) => {
 
 on('POST', '/api/items/merge', async (ctx, _p, b) => {
   const out = await ctx.store.mutate((db) => {
-    const ids = Array.isArray(b.ids) ? (b.ids as string[]) : [];
+    const ids = Array.isArray(b.ids) ? [...new Set(b.ids.filter((id): id is string => typeof id === 'string'))] : [];
     if (ids.length < 2) throw new HttpError(400, 'Для обʼєднання потрібно щонайменше дві речі');
     const sources = ids.map((id) => findOr404(db.items, id, 'Річ'));
+    if (sources.some((item) => item.mergedInto)) throw new HttpError(409, 'Ці речі вже обʼєднано');
+    const photoIds = [...new Set(sources.flatMap((item) => item.photoIds))];
+    const primary = str(b.primaryPhotoId);
+    if (primary && !photoIds.includes(primary)) throw new HttpError(400, 'Вибери основне фото з цих речей');
+    const covers = itemCoverOptions(db, sources);
+    const cover = b.packshotId === undefined ? covers[0] : covers.find((photo) => photo.id === b.packshotId);
+    if (b.packshotId !== undefined && !cover) throw new HttpError(400, 'Вибери каталожне зображення цієї речі');
     const at = now();
     const merged: Item = {
       id: newId('W'),
@@ -530,7 +548,8 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
       title: str(b.title, 200) || sources[0].title,
       // Merging items the owner already confirmed does not ask «Це моя річ?» again.
       status: sources.every((s) => s.status === 'confirmed') ? 'confirmed' : 'needs_confirmation',
-      photoIds: [...new Set(sources.flatMap((s) => s.photoIds))],
+      photoIds: primaryPhotoFirst(photoIds, primary),
+      ...(cover ? { packshotId: cover.id } : {}),
       observation: sources.map((s) => `${s.id}: ${s.observation ?? ''}`).join(' · '),
       confirmedFact: sources.map((s) => s.confirmedFact).filter(Boolean).join(' ') || undefined,
       origin: 'merge',
@@ -552,6 +571,7 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
     replaceRefs(db, (r) => r.kind === 'item' && ids.includes(r.id), { kind: 'item', id: merged.id }, `Обʼєднання речей → ${merged.id}`);
     for (const n of db.needs) if (n.coveredByItem && ids.includes(n.coveredByItem)) n.coveredByItem = merged.id;
     for (const id of ids) dropReplacementsFor(db, id);
+    queueMissingItemPackshots(db, [merged.id]);
     queueAdvice(db, `Обʼєднано речі: ${merged.title}`);
     return merged;
   });

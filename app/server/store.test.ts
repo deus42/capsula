@@ -13,6 +13,7 @@ import { MAX_IMAGE_REFS, buildPackshotPrompt, buildPrompt, createRunner, pickRef
 import { analyzePrompt, applyAnalyze, applyIntake, intakePrompt } from './analysis.ts';
 import { hiddenLookIds, isCapsuleHidden, sameLook } from '../src/rating.ts';
 import { createHash } from 'node:crypto';
+import { itemArt } from '../src/lib.ts';
 import { changedCoreSlots, groupLookVariations } from '../src/look-variation.ts';
 import { looksNeedingRender } from '../src/render-need.ts';
 import { coverForLook, currentCover, currentPeriod, indoorOnly, purchasePlan, todayLooks, openSuggestions, storeKey, capsuleCount, capsuleRating, isComplete, itemPlacements, itemRating, itemVerdict, lookRating, missingInfo, purchaseRanking, scoreLabel, usageLabel, wardrobeCapsule } from '../src/lib.ts';
@@ -256,6 +257,41 @@ test('merge keeps sources and repoints looks; split moves photos (A02)', async (
   db = store.read();
   assert.deepEqual(db.items.find((i) => i.id === merged.id)!.photoIds, ['P-1']);
   assert.equal(part.splitFrom, merged.id);
+});
+
+test('merged items keep an existing catalogue cover and allow safe changes to source and cover', async () => {
+  const { store, call } = setup();
+  await store.mutate((db) => {
+    db.photos.push(
+      { ...db.photos[0], id: 'P-cover1', kind: 'packshot', path: 'media/packshots/one.png', source: 'generated' },
+      { ...db.photos[1], id: 'P-cover2', kind: 'packshot', path: 'media/packshots/two.png', source: 'generated' },
+    );
+    db.items[0].packshotId = 'P-cover1';
+    db.items[1].packshotId = 'P-cover2';
+  });
+  const merge = (options: Record<string, unknown> = {}) => call('POST', '/api/items/merge', { ids: ['W-1', 'W-2'], ...options });
+  await assert.rejects(merge({ packshotId: 'P-1' }), /Вибери каталожне зображення/);
+  await assert.rejects(merge({ primaryPhotoId: 'P-cover1' }), /Вибери основне фото/);
+  const result = await merge({ primaryPhotoId: 'P-2' });
+  assert.deepEqual(result.photoIds, ['P-2', 'P-1']);
+  assert.equal(result.packshotId, 'P-cover1');
+  assert.deepEqual(itemArt(store.read(), result.id), { art: 'media/packshots/one.png', photo: undefined });
+  assert.ok(!store.read().jobs.some((job) => job.kind === 'packshot' && job.itemId === result.id));
+  await assert.rejects(merge(), /вже обʼєднано/);
+  await call('PATCH', `/api/items/${result.id}`, { packshotId: 'P-cover2' });
+  await call('DELETE', '/api/items/W-2');
+  assert.deepEqual(itemArt(store.read(), result.id), { art: 'media/packshots/two.png', photo: undefined });
+  assert.equal(validateDb(store.read()), null);
+});
+
+test('a merge without catalogue art queues a packshot from the selected primary source', async () => {
+  const { store, call } = setup();
+  const result = await call('POST', '/api/items/merge', { ids: ['W-1', 'W-2'], primaryPhotoId: 'P-2' });
+  const db = store.read();
+  assert.deepEqual(itemArt(db, result.id), { art: undefined, photo: undefined });
+  const job = db.jobs.find((job) => job.kind === 'packshot' && job.itemId === result.id)!;
+  assert.equal(job.state, 'queued');
+  assert.equal(job.snapshot.slots[0].photoPaths[0], 'assets/photos/b.jpeg');
 });
 
 test('a look requires one capsule and moving it preserves its identity and versions (A04)', async () => {

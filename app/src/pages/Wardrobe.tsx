@@ -1,11 +1,12 @@
 import { useState } from 'react';
 import type { ReactNode } from 'react';
 import { Archive, Camera, Check, CircleCheck, CircleDashed, Dumbbell, Grid2x2, Merge, Pencil, Plus, Search, Sparkles, Trash2, Wand2 } from 'lucide-react';
-import type { Category, Item, ItemStatus, Job } from '../api.ts';
+import type { Category, Item, ItemStatus, Job, Photo } from '../api.ts';
 import { api, media, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
 import { Badge, CategoryIcon, ConfirmButton, Empty, JobBar, LookArt, Missing, Modal, PageHead, SubNav, UploadButton } from '../components/ui.tsx';
-import { CATEGORY_LABEL, capsuleCount, isBlockedEyewear, itemPlacements, itemRating, itemVerdict, scoreLabel, usageLabel, wardrobeCapsule } from '../lib.ts';
+import { CATEGORY_LABEL, capsuleCount, isBlockedEyewear, itemArt, itemPlacements, itemRating, itemVerdict, scoreLabel, usageLabel, wardrobeCapsule } from '../lib.ts';
+import { itemCoverOptions, primaryPhotoFirst } from '../item-images.ts';
 
 import { InfoMark, TermInfo } from './Glossary.tsx';
 import { t } from '../i18n.ts';
@@ -35,8 +36,8 @@ function ItemPage({ item }: { item: Item }) {
   const busy = usePackshotState();
   const [editing, setEditing] = useState(false);
   const photos = item.photoIds.map((id) => db.photos.find((p) => p.id === id)).filter(Boolean) as typeof db.photos;
-  const packshot = item.packshotId ? db.photos.find((p) => p.id === item.packshotId) : undefined;
-  const main = packshot ?? photos[0];
+  const { art, photo } = itemArt(db, item.id);
+  const main = art ?? photo;
   const { looks, capsules } = itemPlacements(db, item.id);
   const covers = db.needs.filter((n) => n.coveredByItem === item.id);
   const verdict = itemVerdict(db, item);
@@ -71,8 +72,8 @@ function ItemPage({ item }: { item: Item }) {
       </div>
 
       <div className="item-hero">
-        <a className="item-main" href={main ? media(main.path) : undefined} target={main ? '_blank' : undefined} rel="noreferrer">
-          {main ? <img src={thumb(main.path, 960)} alt={item.title} /> : <CategoryIcon category={item.category} size={34} />}
+        <a className="item-main" href={main ? media(main) : undefined} target={main ? '_blank' : undefined} rel="noreferrer">
+          {main ? <img src={thumb(main, 960)} alt={item.title} /> : <CategoryIcon category={item.category} size={34} />}
           {busy.get(item.id) && <JobBar job={busy.get(item.id)!} label />}
         </a>
         <div className="item-thumbs">
@@ -152,15 +153,24 @@ function DeleteItem({ item, className, children }: { item: Item; className: stri
 
 /** Everything editable about an item, in one modal behind the pencil. */
 function ItemEdit({ item, onClose }: { item: Item; onClose: () => void }) {
+  const db = useDb();
   const { act } = useApp();
   const [sport, setSport] = useState(Boolean(item.sport));
+  const originals = item.origin === 'merge' ? item.photoIds.flatMap((id) => db.photos.filter((photo) => photo.id === id)) : [];
+  const covers = item.origin === 'merge' ? itemCoverOptions(db, [item]) : [];
+  const [primary, setPrimary] = useState(originals[0]?.id);
+  const [cover, setCover] = useState(covers[0]?.id);
   const [form, setForm] = useState({ title: item.title, category: item.category, color: item.color ?? '', brand: item.brand ?? '', model: item.model ?? '', composition: item.composition ?? '', fit: item.fit ?? '', size: item.size ?? '' });
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) => setForm((f) => ({ ...f, [k]: e.target.value }));
   const field = (k: keyof typeof form, label: string) => (
     <label className="field"><span>{t(label)}</span><input className="input" value={form[k]} onChange={set(k)} /></label>
   );
   const save = async () => {
-    const ok = await act(() => api('PATCH', `/api/items/${item.id}`, { rev: item.rev, ...form, sport }), t('Збережено'));
+    const pictures = {
+      ...(primary && primary !== item.photoIds[0] ? { photoIds: primaryPhotoFirst(item.photoIds, primary) } : {}),
+      ...(cover && cover !== item.packshotId ? { packshotId: cover } : {}),
+    };
+    const ok = await act(() => api('PATCH', `/api/items/${item.id}`, { rev: item.rev, ...form, sport, ...pictures }), t('Збережено'));
     if (ok) onClose();
   };
   return (
@@ -191,9 +201,54 @@ function ItemEdit({ item, onClose }: { item: Item; onClose: () => void }) {
         {field('composition', 'Склад')}
         {field('fit', 'Крій')}
         <label className="row"><input type="checkbox" checked={sport} onChange={(event) => setSport(event.target.checked)} /> {t('Спорт')}</label>
+        {covers.length > 1 && <PhotoChoices title={t('Каталожна обкладинка')} photos={covers} selected={cover} onSelect={setCover} />}
+        {originals.length > 1 && <PhotoChoices title={t('Основне фото')} photos={originals} selected={primary} onSelect={setPrimary} />}
       </div>
     </Modal>
   );
+}
+
+function PhotoChoices({ title, photos, selected, onSelect }: { title: string; photos: Photo[]; selected?: string; onSelect: (id: string) => void }) {
+  return (
+    <div className="field full">
+      <span>{title}</span>
+      <div className="item-thumbs" role="group" aria-label={title}>
+        {photos.map((photo) => (
+          <button key={photo.id} type="button" className="item-thumb" aria-label={photo.originalName} aria-pressed={selected === photo.id} onClick={() => onSelect(photo.id)}>
+            <img src={thumb(photo.path, 240)} alt="" />
+            {selected === photo.id && <span className="tr sel-box"><Check size={14} /></span>}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MergeItems({ ids, onClose, onMerged }: { ids: string[]; onClose: () => void; onMerged: (id: string) => void }) {
+  const db = useDb();
+  const { act } = useApp();
+  const sources = ids.flatMap((id) => db.items.filter((item) => item.id === id && !item.mergedInto));
+  const originals = [...new Set(sources.flatMap((item) => item.photoIds))].flatMap((id) => db.photos.filter((photo) => photo.id === id));
+  const covers = itemCoverOptions(db, sources);
+  const [primary, setPrimary] = useState(originals[0]?.id);
+  const [cover, setCover] = useState(covers[0]?.id);
+  const [saving, setSaving] = useState(false);
+  const merge = async () => {
+    setSaving(true);
+    const item = await act(() => api<Item>('POST', '/api/items/merge', { ids, primaryPhotoId: primary, packshotId: cover }), t('Дублікати обʼєднано, джерела збережено'));
+    setSaving(false);
+    if (item) onMerged(item.id);
+  };
+  return <Modal title={t('Обʼєднати дублікати')} onClose={() => { if (!saving) onClose(); }} footer={<>
+    <button type="button" className="btn" disabled={saving} onClick={onClose}>{t('Скасувати')}</button>
+    <button type="button" className="btn primary" disabled={saving || sources.length < 2} onClick={() => void merge()}>{t('Обʼєднати')}</button>
+  </>}>
+    <div className="stack" style={{ gap: 14 }}>
+      {covers.length > 0 && <PhotoChoices title={t('Каталожна обкладинка')} photos={covers} selected={cover} onSelect={setCover} />}
+      {originals.length > 0 && <PhotoChoices title={t('Основне фото')} photos={originals} selected={primary} onSelect={setPrimary} />}
+      {covers.length === 0 && originals.length === 0 && <p>{sources.map((item) => item.title).join(' · ')}</p>}
+    </div>
+  </Modal>;
 }
 
 function NewItem({ onClose }: { onClose: () => void }) {
@@ -258,6 +313,7 @@ export function WardrobePage({ openId }: { openId?: string }) {
   // Same count as the item page: distinct looks (near-copies fold into one).
   const ready = wardrobeCapsule(db);
   const [creating, setCreating] = useState(false);
+  const [confirmMerge, setConfirmMerge] = useState(false);
   const status = (['needs_confirmation', 'confirmed', 'inactive'] as ItemStatus[]).includes(view as ItemStatus) ? (view as ItemStatus) : null;
   const isNew = (i: Item) => i.origin === 'intake' && i.status === 'needs_confirmation';
   const cat = CATS.includes(view as Category) ? (view as Category) : null;
@@ -333,8 +389,7 @@ export function WardrobePage({ openId }: { openId?: string }) {
           ) : (
             <div className="ward-grid">
               {list.map((i) => {
-                const packshot = i.packshotId ? db.photos.find((p) => p.id === i.packshotId) : undefined;
-                const photo = db.photos.find((p) => p.id === i.photoIds[0]);
+                const { art, photo } = itemArt(db, i.id);
                 const selected = mergeSel?.includes(i.id);
                 const st = busy.get(i.id);
                 const usage = mergeSel ? null : itemPlacements(db, i.id, ready);
@@ -345,7 +400,7 @@ export function WardrobePage({ openId }: { openId?: string }) {
                     onClick={() => (mode ? toggle(i.id) : go(`/wardrobe/${i.id}`))}
                   >
                     <div className="img">
-                      {packshot ? <img src={thumb(packshot.path, 480)} alt={i.title} loading="lazy" /> : photo ? <img className="photo" src={thumb(photo.path, 480)} alt={i.title} loading="lazy" /> : null}
+                      {art ? <img src={thumb(art, 480)} alt={i.title} loading="lazy" /> : photo ? <img className="photo" src={thumb(photo, 480)} alt={i.title} loading="lazy" /> : <CategoryIcon category={i.category} size={22} />}
                       {i.status !== 'needs_confirmation' && <span className="tl"><Badge tone={`${STATUS_TONE[i.status]} glass`}>{t(STATUS_SHORT[i.status])}</Badge></span>}
                       {i.origin === 'intake' && i.status === 'needs_confirmation' && <span className="tl"><Badge tone="info glass">{t('нова')}</Badge></span>}
                       {mergeSel && <span className="tr sel-box">{selected && <Check size={14} />}</span>}
@@ -368,13 +423,7 @@ export function WardrobePage({ openId }: { openId?: string }) {
                 <button
                   className="btn primary"
                   disabled={sel.length < 2}
-                  onClick={async () => {
-                    const ok = await act(() => api<Item>('POST', '/api/items/merge', { ids: sel }), t('Дублікати обʼєднано, джерела збережено'));
-                    if (ok) {
-                      stopMode();
-                      go(`/wardrobe/${ok.id}`);
-                    }
-                  }}
+                  onClick={() => setConfirmMerge(true)}
                 >
                   <Merge size={15} /> {t('Обʼєднати')} {sel.length}
                 </button>
@@ -396,6 +445,11 @@ export function WardrobePage({ openId }: { openId?: string }) {
                     </div>
       )}
       {creating && <NewItem onClose={() => setCreating(false)} />}
+      {confirmMerge && <MergeItems ids={sel} onClose={() => setConfirmMerge(false)} onMerged={(id) => {
+        setConfirmMerge(false);
+        stopMode();
+        go(`/wardrobe/${id}`);
+      }} />}
     </div>
   );
 }

@@ -5,7 +5,7 @@ import { api, media, quotaNote, thumb } from '../api.ts';
 import { useApp, useDb } from '../store.tsx';
 import { Badge, CategoryIcon, Empty, LookArt, Missing, Modal, RateButtons } from '../components/ui.tsx';
 import type { ResolvedRef } from '../lib.ts';
-import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, lookRating, lookVariants, resolveRef, scoreLabel } from '../lib.ts';
+import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, itemArt, lookRating, lookVariants, resolveRef, scoreLabel } from '../lib.ts';
 import { hiddenLookIds } from '../rating.ts';
 import { rendersPaused } from '../render-need.ts';
 import { EditLook } from './Capsules.tsx';
@@ -271,7 +271,10 @@ function SwapModal({ look, slot, current, onClose }: { look: Look; slot?: SlotKe
     const cats = slot ? SLOT_CATEGORIES[s] : SLOT_CATEGORIES[s].filter((c) => NATURAL[c] === s);
     const own = current?.kind === 'item' ? db.items.find((i) => i.id === current.id)?.category : current?.kind === 'need' ? db.needs.find((n) => n.id === current.id)?.category : undefined;
     return [
-      ...db.items.filter((i) => cats.includes(i.category) && i.status !== 'inactive' && !i.mergedInto && !(eyewearBlocked(db) && accessoryKind(i.title) === 'glasses')).sort((a, b) => Number(b.category === own) - Number(a.category === own)).map((i) => ({ ref: { kind: 'item' as const, id: i.id }, title: i.title, photo: art(i.packshotId) ?? art(i.photoIds[0]) })),
+      ...db.items.filter((i) => cats.includes(i.category) && i.status !== 'inactive' && !i.mergedInto && !(eyewearBlocked(db) && accessoryKind(i.title) === 'glasses')).sort((a, b) => Number(b.category === own) - Number(a.category === own)).map((i) => {
+        const { art, photo } = itemArt(db, i.id);
+        return { ref: { kind: 'item' as const, id: i.id }, title: i.title, photo: art ?? photo };
+      }),
       ...db.needs.filter((n) => n.status === 'open' && cats.includes(n.category)).map((n) => ({ ref: { kind: 'need' as const, id: n.id }, title: `${n.title} · ${t('докупити')}`, photo: art(n.conceptPhotoId) })),
     ];
   };

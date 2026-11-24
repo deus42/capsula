@@ -1,6 +1,7 @@
 import type { Capsule, Category, DB, Item, Job, Look, MeasureKey, Need, Period, Result, Season, SlotKey, SlotRef, Wear } from './api.ts';
 import { hiddenLookIds, isCapsuleHidden } from './rating.ts';
 import { groupLookVariations } from './look-variation.ts';
+import { itemCoverOptions } from './item-images.ts';
 import { tooClose, withBuys } from './look-memory.ts';
 import { buysFitSet, capsulePieceRefs, combinationGains, fashionCapsules, inSavedSet } from './capsule-pieces.ts';
 import { LOOKS, currentLanguage, plural, t } from './i18n.ts';
@@ -101,8 +102,7 @@ export function resolveRef(db: DB, ref: SlotRef): ResolvedRef {
   if (ref.kind === 'item') {
     const it = db.items.find((i) => i.id === ref.id);
     if (!it) return { ref, title: ref.id, kind: 'candidate', missing: true };
-    const photo = it.photoIds.map((id) => db.photos.find((p) => p.id === id)?.path).find(Boolean);
-    const art = it.packshotId ? db.photos.find((p) => p.id === it.packshotId)?.path : undefined;
+    const { art, photo } = itemArt(db, it.id);
     return { ref, title: it.title, kind: it.status === 'confirmed' ? 'owned' : 'candidate', category: it.category, art, photo, inactive: it.status === 'inactive' };
   }
   if (ref.kind === 'need') {
@@ -209,8 +209,10 @@ export function piecesOf(db: DB, slots: Look['slots']): ResolvedRef[] {
 export function itemArt(db: DB, itemId: string) {
   const it = db.items.find((i) => i.id === itemId);
   if (!it) return {};
-  const art = it.packshotId ? db.photos.find((p) => p.id === it.packshotId)?.path : undefined;
-  const photo = it.photoIds.map((id) => db.photos.find((p) => p.id === id)?.path).find(Boolean);
+  const art = it.origin === 'merge'
+    ? itemCoverOptions(db, [it])[0]?.path
+    : db.photos.find((p) => p.id === it.packshotId)?.path;
+  const photo = it.origin === 'merge' ? undefined : it.photoIds.map((id) => db.photos.find((p) => p.id === id)?.path).find(Boolean);
   return { art, photo };
 }
 
