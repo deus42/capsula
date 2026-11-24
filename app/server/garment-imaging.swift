@@ -128,6 +128,34 @@ func makeSheet(_ entry: Sheet) throws {
     try data.write(to: URL(fileURLWithPath: entry.destination), options: .atomic)
 }
 
+struct BodyCrop: Decodable {
+    let source: String
+    let destination: String
+}
+
+func bodyCrop(_ entry: BodyCrop) throws -> Bool {
+    guard let image = uprightImage(entry.source), image.width >= 48, image.height >= 64 else { return false }
+    let detected = try faces(in: image)
+    let startY: Double
+    if detected.isEmpty {
+        startY = 0
+    } else {
+        let maxBottom = detected.map { Double($0.maxY) }.max() ?? 0.22
+        let maxH = detected.map { Double($0.height) }.max() ?? 0.12
+        startY = min(0.62, max(0.12, maxBottom + maxH * 0.28))
+    }
+    let w = image.width, h = image.height
+    for shift in [0.0, 0.06, 0.12] {
+        let top = max(0, min(h - 64, Int((min(0.68, startY + shift) * Double(h)).rounded())))
+        let cropH = h - top
+        guard cropH >= 64 else { continue }
+        let rect = CGRect(x: 0, y: top, width: w, height: cropH)
+        guard let piece = image.cropping(to: rect), try faces(in: piece).isEmpty else { continue }
+        return saveImage(downscale(piece, maxEdge: 1536), to: entry.destination)
+    }
+    return false
+}
+
 let command = CommandLine.arguments[1]
 let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
 if command == "crop" {
@@ -154,6 +182,9 @@ if command == "crop" {
     print(String(decoding: try JSONEncoder().encode(accepted), as: UTF8.self))
 } else if command == "sheet" {
     try makeSheet(JSONDecoder().decode(Sheet.self, from: data))
+} else if command == "bodycrop" {
+    let ok = try bodyCrop(JSONDecoder().decode(BodyCrop.self, from: data))
+    print(ok ? "{\"ok\":true}" : "{\"ok\":false}")
 } else {
     throw CocoaError(.featureUnsupported)
 }

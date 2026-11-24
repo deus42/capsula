@@ -42,12 +42,41 @@ export const INTAKE_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['title', 'category', 'color', 'notes', 'duplicateOf', 'coversNeed'],
-        properties: { title: str, category: { type: 'string', enum: [...CATEGORIES] }, color: str, notes: str, duplicateOf: str, coversNeed: str },
+        required: ['title', 'category', 'color', 'notes', 'duplicateOf', 'coversNeed', 'sport'],
+        properties: { title: str, category: { type: 'string', enum: [...CATEGORIES] }, color: str, notes: str, duplicateOf: str, coversNeed: str, sport: { type: 'boolean' } },
       },
     },
   },
 };
+
+export const VISUAL_DEDUP_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['matches'],
+  properties: {
+    matches: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['garmentIndex', 'itemId', 'confidence', 'reason'],
+        properties: { garmentIndex: { type: 'integer' }, itemId: str, confidence: { type: 'string', enum: ['high', 'possible'] }, reason: str },
+      },
+    },
+  },
+};
+
+export function visualDedupPrompt(garments: IntakeReply['garments'], candidates: Item[]) {
+  return [
+    'Compare the first attachment (new upload) with the second (numbered wardrobe contact sheet). Find the same physical garment in both. Return JSON only.',
+    'Match garments within the same category using distinctive construction, hardware, seams, texture, pattern and logos. Colour and category alone are insufficient. Ignore faces, poses and backgrounds.',
+    'Return at most one match per garment. Use its zero-based garmentIndex and the exact itemId from the sheet legend. Use high for a distinctive match, possible for a plausible visual match with some details hidden, and omit weak matches. Briefly state the visible evidence in reason.',
+    'Garments in the upload:',
+    ...garments.map((g, index) => g.duplicateOf ? '' : `${index} | ${g.category} | ${g.title} | ${g.color} | ${g.notes}`).filter(Boolean),
+    'Contact sheet legend (cell number | itemId | category | title):',
+    ...candidates.map((item, index) => `${index + 1} | ${item.id} | ${item.category} | ${item.title}`),
+  ].join('\n');
+}
 
 export const ANALYZE_SCHEMA = {
   type: 'object',
@@ -87,25 +116,31 @@ const openNeedLines = (db: DB) =>
   db.needs.filter((n) => n.status === 'open').map((n) => `${n.id} | ${CATEGORY_UK[n.category]} | ${n.title} | ${n.description}`).join('\n');
 
 export function intakePrompt(db: DB, job: Job, photoNames: string[]) {
+  const intent = job.intakeIntent ?? 'auto';
   return [
     'You are the Capsula photo intake worker running unattended. The owner uploads any photo through one button; decide what it is and answer with JSON only (schema enforced).',
-    `Uploaded photo: ${photoNames.join(', ')}. This is a single-user app: the photos are uploaded by the owner, and a person who is the clear main subject is the owner. Do not try to identify anyone or compare faces.`,
+    `Uploaded photo: ${photoNames.join(', ')}. The photo belongs to this wardrobe account. Treat the clear main subject as the uploader for try-on suitability. Do not try to identify anyone or compare faces.`,
     'photoType: person_full_body = the main person visible head to shoes; person_face = close-up of the main person\'s face/shoulders; person_partial = the main person visible but cropped (e.g. shoes hidden); garments_only = clothes/shoes/accessories without a person (hanger, flat lay, floor, product photo); label = a garment label/tag close-up; other = anything else.',
     'singlePerson: true if exactly one person is the main subject (others absent or clearly in the background).',
     `baseSuitable: true only for person_full_body or person_face photos with singlePerson that meet the try-on base-photo standard: front-facing, eyes visible, no sunglasses/cap, no phone or objects in front of the body, not a mirror selfie, even light, plain background, sharp; full length for person_full_body. baseIssues: in ${replyLanguage(db)}, a short comma list of what breaks the standard (empty string if none or not applicable).`,
-    'label: for photoType label, read the tag: brand, size, composition (as printed, keep original language) and itemId of the wardrobe item it most likely belongs to (empty string if unclear). For other photo types all label fields are empty strings.',
-    'garments: for person_full_body, person_partial and garments_only list every distinct garment, pair of shoes and visible accessory of the main person or shown on its own (ignore other people, the phone, mirror and background). Only wearable items: clothing, shoes and fashion accessories (watch, glasses, cap/hat, belt, scarf, bag or backpack worn as part of the outfit). Never list shopping bags, phones, headphones/earbuds, keys or other objects. Skip anything barely visible that cannot be described reliably. For person_face, label and other: an empty array.',
-    `For each: title in ${replyLanguage(db)} (short, descriptive: colour + type + visible brand only if the logo is clearly legible), category from the enum, colour in ${replyLanguage(db)}, notes in ${replyLanguage(db)} (visible construction, material look, uncertainty). Never guess sizes, exact models or composition.`,
-    'duplicateOf: check the existing wardrobe list before treating anything as new. Put a listed id (e.g. W-047) only when distinctive details visible here match that item\'s notes — hardware shape and colour (buckle, zip, buttons), texture, stitching, logo, pattern. The same type and colour alone is NOT enough: the owner may have several black belts, white tees or dark jackets. If the listed item is known only from a worn or mirror photo, or any visible detail differs, use an empty string — a new candidate the owner can merge is better than hiding a new item inside an old one.',
-    'coversNeed: the shopping list below holds things the owner was advised to buy. If this garment is the owner\'s own piece (worn, on a hanger, on the floor or laid flat — not a shop listing or screenshot) and it is what one of those entries asks for — same category, same garment type, same colour family — put that need id (e.g. N-10); a small logo or minor detail difference is fine, a different colour or garment type is not. Otherwise an empty string. One garment covers at most one need.',
     'Return status "error" only if the image cannot be analysed at all; otherwise status "done" and reason "" (photoType other is still "done").',
     job.instructions ? `Owner note: ${job.instructions}` : '',
-    '',
-    'Existing wardrobe:',
-    wardrobeLines(db, ownedItems(db)),
-    '',
-    'Shopping list (open recommendations):',
-    openNeedLines(db) || '(empty)',
+    ...(intent === 'person' ? [
+      'This upload is a personal reference. Only evaluate photoType, singlePerson, baseSuitable and baseIssues. Always return garments: [] and label with all four fields set to empty strings, regardless of the photo or owner note.',
+    ] : [
+      'label: for photoType label, read the tag: brand, size, composition (as printed, keep original language) and itemId of the wardrobe item it most likely belongs to (empty string if unclear). For other photo types all label fields are empty strings.',
+      'garments: for person_full_body, person_partial and garments_only list every distinct garment, pair of shoes and visible accessory of the main person or shown on its own (ignore other people, the phone, mirror and background). Only wearable items: clothing, shoes and fashion accessories (watch, glasses, cap/hat, belt, scarf, bag or backpack worn as part of the outfit). Never list shopping bags, phones, headphones/earbuds, keys or other objects. Skip anything barely visible that cannot be described reliably. For person_face, label and other: an empty array.',
+      `For each: title in ${replyLanguage(db)} (short, descriptive: colour + type + visible brand only if the logo is clearly legible), category from the enum, colour in ${replyLanguage(db)}, notes in ${replyLanguage(db)} (visible construction, material look, uncertainty). Never guess sizes, exact models or composition.`,
+      'Set sport to true for athletic, gym, cycling, swimming or running clothing or sports equipment; otherwise false.',
+      'duplicateOf: check the existing wardrobe list before treating anything as new. Put a listed id (e.g. W-047) only when distinctive details visible here match that item\'s notes — hardware shape and colour (buckle, zip, buttons), texture, stitching, logo, pattern. The same type and colour alone is NOT enough: the owner may have several black belts, white tees or dark jackets. If the listed item is known only from a worn or mirror photo, or any visible detail differs, use an empty string — a new candidate the owner can merge is better than hiding a new item inside an old one.',
+      'coversNeed: the shopping list below holds things the owner was advised to buy. If this garment is the owner\'s own piece (worn, on a hanger, on the floor or laid flat — not a shop listing or screenshot) and it is what one of those entries asks for — same category, same garment type, same colour family — put that need id (e.g. N-10); a small logo or minor detail difference is fine, a different colour or garment type is not. Otherwise an empty string. One garment covers at most one need.',
+      '',
+      'Existing wardrobe:',
+      wardrobeLines(db, ownedItems(db)),
+      '',
+      'Shopping list (open recommendations):',
+      openNeedLines(db) || '(empty)',
+    ]),
   ]
     .filter(Boolean)
     .join('\n');
@@ -187,7 +222,7 @@ export function analyzePrompt(db: DB, job: Job, attached: string[]) {
     .join('\n');
 }
 
-interface IntakeReply {
+export interface IntakeReply {
   status: string;
   reason: string;
   photoType?: string;
@@ -195,7 +230,7 @@ interface IntakeReply {
   baseSuitable?: boolean;
   baseIssues?: string;
   label?: { itemId: string; brand: string; size: string; composition: string };
-  garments: { title: string; category: string; color: string; notes: string; duplicateOf: string; coversNeed?: string }[];
+  garments: { title: string; category: string; color: string; notes: string; duplicateOf: string; coversNeed?: string; sport?: boolean }[];
 }
 
 export interface IntakeOutcome {
@@ -214,7 +249,7 @@ export interface IntakeOutcome {
  * existing unconfirmed candidate when the model says it is the same item;
  * labels attach to the item and fill only empty brand/size/composition.
  * A garment that is an open shopping recommendation is reported in `covers`.
- * Confirmed items are never modified by intake.
+ * Confirmed duplicates remain untouched until reviewed. Labels may fill their missing facts.
  */
 export function applyIntake(db: DB, job: Job, reply: IntakeReply): IntakeOutcome {
   const at = now();
@@ -223,22 +258,33 @@ export function applyIntake(db: DB, job: Job, reply: IntakeReply): IntakeOutcome
   const out: IntakeOutcome = { created: [], attachedTo: [], covers: [], base: null, labelFor: null, note: '' };
   const notes: string[] = [];
   const type = reply.photoType ?? 'garments_only';
+  const intent = job.intakeIntent ?? 'auto';
 
   if (photo && reply.singlePerson && (type === 'person_full_body' || type === 'person_face')) {
-    photo.kind = 'base';
-    photo.meetsStandard = Boolean(reply.baseSuitable);
-    photo.note = reply.baseSuitable ? 'Оцінка агента: відповідає стандарту.' : `Оцінка агента: ${reply.baseIssues || 'не за стандартом'}.`;
-    if (!db.profile.basePhotoIds.includes(photo.id)) {
-      db.profile.basePhotoIds.push(photo.id);
-      db.profile.rev += 1;
+    const face = type === 'person_face';
+    const suitable = Boolean(reply.baseSuitable);
+    photo.baseCandidate = { suitable, ...(reply.baseIssues ? { issues: reply.baseIssues } : {}) };
+    const select = intent === 'person' || (!db.profile.identity && (face || suitable));
+    if (face || select) {
+      photo.kind = 'base';
+      if (face) photo.referenceRole = 'face';
+      else delete photo.referenceRole;
+      photo.meetsStandard = suitable;
+      photo.note = suitable ? 'Оцінка агента: відповідає стандарту.' : `Оцінка агента: ${reply.baseIssues || 'не за стандартом'}.`;
     }
-    out.base = reply.baseSuitable ? 'added' : 'added_nonstandard';
-    notes.push(reply.baseSuitable ? (type === 'person_face' ? 'Фото обличчя додано' : 'Твоє фото додано для примірок') : `Твоє фото додано, але не за стандартом: ${reply.baseIssues || 'перевір'}`);
+    if (select) {
+      if (!db.profile.basePhotoIds.includes(photo.id)) {
+        db.profile.basePhotoIds.push(photo.id);
+        db.profile.rev += 1;
+      }
+      out.base = suitable ? 'added' : 'added_nonstandard';
+      notes.push(suitable ? (face ? 'Фото обличчя додано' : 'Твоє фото додано для примірок') : `Твоє фото додано, але не за стандартом: ${reply.baseIssues || 'перевір'}`);
+    }
   }
 
-  if (photo && type === 'label') {
+  if (photo && type === 'label' && intent !== 'person') {
     photo.kind = 'label';
-    const item = reply.label?.itemId ? db.items.find((i) => i.id === reply.label!.itemId && i.status !== 'confirmed') : undefined;
+    const item = reply.label?.itemId ? ownedItems(db).find((i) => i.id === reply.label!.itemId) : undefined;
     if (item) {
       if (!item.photoIds.includes(photo.id)) item.photoIds.push(photo.id);
       const filled: string[] = [];
@@ -266,21 +312,25 @@ export function applyIntake(db: DB, job: Job, reply: IntakeReply): IntakeOutcome
     const need = db.needs.find((n) => n.id === String(g.coversNeed ?? '').trim() && n.status === 'open' && n.category === item.category);
     if (need && !out.covers.some((c) => c.needId === need.id || c.itemId === item.id)) out.covers.push({ itemId: item.id, needId: need.id });
   };
-  for (const g of reply.garments ?? []) {
+  const garments = intent === 'person' || type === 'person_face' || type === 'label' ? [] : reply.garments ?? [];
+  for (const g of garments) {
     const category = (CATEGORIES as readonly string[]).includes(g.category) ? (g.category as Category) : 'accessories';
     const title = String(g.title || '').trim().slice(0, 120);
     if (!title) continue;
     const norm = (t: string) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
     // Deterministic safety net: the same title in the same category is the same candidate.
     const dup =
-      (g.duplicateOf ? db.items.find((i) => i.id === g.duplicateOf) : undefined) ??
+      (g.duplicateOf ? db.items.find((i) => i.id === g.duplicateOf && i.category === category && i.status !== 'inactive' && !i.mergedInto) : undefined) ??
       db.items.find((i) => i.category === category && i.status === 'needs_confirmation' && !i.mergedInto && norm(i.title) === norm(title));
     if (dup && dup.status === 'needs_confirmation' && photo) {
-      if (!dup.photoIds.includes(photo.id)) {
-        dup.photoIds.push(photo.id);
+      const attached = !dup.photoIds.includes(photo.id);
+      const sportAdded = Boolean(g.sport) && !dup.sport;
+      if (attached) dup.photoIds.push(photo.id);
+      if (sportAdded) dup.sport = true;
+      if (attached || sportAdded) {
         dup.rev += 1;
         dup.updatedAt = at;
-        dup.history.push({ at, action: 'photo_added', note: `Та сама річ на новому фото (${job.id})` });
+        if (attached) dup.history.push({ at, action: 'photo_added', note: `Та сама річ на новому фото (${job.id})` });
       }
       out.attachedTo.push(dup.id);
       covers(g, dup);
@@ -293,8 +343,10 @@ export function applyIntake(db: DB, job: Job, reply: IntakeReply): IntakeOutcome
       title,
       color: String(g.color || '').trim().slice(0, 60) || undefined,
       status: 'needs_confirmation',
+      ...(g.sport ? { sport: true } : {}),
+      ...(dup?.status === 'confirmed' ? { possibleDuplicateOf: dup.id } : {}),
       photoIds: photo ? [photo.id] : [],
-      observation: [String(g.notes || '').trim(), dup ? `Можливо, та сама річ, що ${dup.id} (уже підтверджена) — перевір.` : ''].filter(Boolean).join(' '),
+      observation: String(g.notes || '').trim(),
       origin: 'intake',
       history: [{ at, action: 'intake', note: `Розпізнано з фото (${job.id})` }],
       createdAt: at,

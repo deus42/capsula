@@ -18,9 +18,8 @@
 .brand-guide thead th { font-size: 12px; color: var(--muted); }
 .brand-guide tbody td { white-space: nowrap; }
 .brand-guide tbody th { font-weight: 500; }
-/* My row in the original chart: a soft band, a fine ink edge, the numbers in ink. */
-.brand-guide tbody tr.mine > * { background: var(--active); color: var(--ink); font-weight: 600; }
-.brand-guide tbody tr.mine > th { box-shadow: inset 2px 0 0 var(--ink); }
+.brand-guide .my-row > * { background: var(--active); }
+.brand-guide .my-row > th { box-shadow: inset 1px 0 0 var(--muted); }
 .brand-size-edit { display: grid; gap: 16px; }
 .brand-size-edit > .field { max-width: 220px; }
 .brand-size-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; gap: 10px; align-items: end; }

@@ -10,10 +10,11 @@ import { HttpError, type Store } from './store.ts';
 export type QuotaKind = 'tryon' | 'packshot' | 'intake' | 'styling' | 'advice';
 export const QUOTA_KINDS: QuotaKind[] = ['tryon', 'packshot', 'intake', 'styling', 'advice'];
 
-/** Which allowance a job uses: «Підібрати», «Нові», shop and store searches share one; the background advisor has its own. */
+/** Which allowance a job uses: «Підібрати», «Нові», onboarding plans/matches and shop searches share styling; identity setup counts as a try-on. */
 export function quotaKind(job: Pick<Job, 'kind'>): QuotaKind {
   switch (job.kind ?? 'tryon') {
-    case 'tryon': return 'tryon';
+    case 'tryon':
+    case 'identity_prep': return 'tryon';
     case 'packshot': return 'packshot';
     case 'intake': return 'intake';
     case 'advise': return 'advice';

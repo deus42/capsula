@@ -73,14 +73,14 @@ export function createTenants(opts: { projectRoot: string; dataDir: string; seed
     const store = quota ? meteredStore(raw, quota) : raw;
     const engine = quota && opts.engine ? meteredEngine(opts.engine, quota.cost) : opts.engine;
     const noAI = Boolean(opts.aiOwnerOnly && account && !account.owner && !account.test);
-    const runner = createRunner(store, root, opts.codexBin, { limiter: opts.limiter, engine, canStart: noAI ? () => false : quota?.canStart });
+    // Invited and test accounts start try-ons explicitly, preserving their monthly allowance.
+    const autoTryOn = !account || account.owner;
+    const runner = createRunner(store, root, opts.codexBin, { limiter: opts.limiter, engine, canStart: noAI ? () => false : quota?.canStart, autoTryOn });
     const admit = noAI
       ? () => { throw new HttpError(403, AI_OWNER_ONLY); }
       : quota ? (kind: QuotaKind, n?: number) => quota.admit(store.read(), kind, n) : undefined;
     const limits = account && !account.owner ? ACCOUNT_LIMITS : undefined;
-    // New looks get a try-on by themselves only in the owner's own wardrobe (owner, 24.11); invited and test accounts
-    // start each try-on themselves, so their monthly allowance is never spent unnoticed.
-    const tenant: Tenant = { id, root, store, runner, quota, ctx: { store, projectRoot: root, drain: () => void runner.drain(), admit, limits, autoTryOn: !noAI && (!account || account.owner) } };
+    const tenant: Tenant = { id, root, store, runner, quota, ctx: { store, projectRoot: root, drain: () => void runner.drain(), admit, limits, autoTryOn } };
     // A run stopped by a restart continues when its account is opened again; an account's queue resumes too
     // (it may have waited for the budget). The owner's local site keeps its queue as it was left.
     void runner.recover().then((n) => (n > 0 || account ? runner.drain() : undefined)).catch(() => undefined);

@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { lazy, Suspense, useEffect } from 'react';
 import type { ReactNode } from 'react';
 import {
   House, Images, LayoutGrid, Loader2, Plus, Shirt, ShoppingBag, TriangleAlert, User,
@@ -16,6 +16,8 @@ import { Landing } from './pages/Landing.tsx';
 import { LegalPage } from './pages/Legal.tsx';
 import { Welcome } from './pages/Welcome.tsx';
 import { pickLanguage, setLanguage, t } from './i18n.ts';
+
+const SetupPage = lazy(() => import('./pages/Setup.tsx').then((m) => ({ default: m.SetupPage })));
 
 function RailItem({ to, icon, label, active, dot, desk }: { to: string; icon: ReactNode; label: string; active: boolean; dot?: number; desk?: boolean }) {
   return (
@@ -80,7 +82,10 @@ export default function App() {
 
   let page: ReactNode;
   // «Найкращі» and «З моїх речей» became filters of «Усі образи» (owner, 20.11); old links land there.
-  if (section === 'capsules' && parts[1] === 'best') page = <Redirect to="/capsules?tab=looks&best=1" />;
+  const freshAccount = session?.mode === 'accounts' && !db.onboarding?.completedAt && !db.profile.identity && db.capsules.length === 0;
+  if (section === 'setup') page = <Suspense fallback={null}><SetupPage /></Suspense>;
+  else if (freshAccount && section === 'home') page = <Redirect to="/setup" />;
+  else if (section === 'capsules' && parts[1] === 'best') page = <Redirect to="/capsules?tab=looks&best=1" />;
   else if (section === 'capsules' && parts[1] === 'my-wardrobe') page = <Redirect to="/capsules?tab=looks&owned=1" />;
   else if (section === 'capsules' && parts[1]) page = <CapsuleDetail id={parts[1]} />;
   else if (section === 'capsules') page = <CapsulesPage />;

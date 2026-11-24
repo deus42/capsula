@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { brandKey, sizeEvidence, sizingBrands } from '../src/brand-sizes.ts';
 import { myRows, sizeGuides } from '../src/size-guides.ts';
 import { dispatch } from './routes.ts';
+import type { Category } from './schema.ts';
 import { ownerSizes, shopSearchPrompt } from './shop-search.ts';
 import { createStore } from './store.ts';
 import { emptyDb } from './tenants.ts';
@@ -60,6 +61,43 @@ test('published sizing charts contain aligned rows and official source URLs', ()
   assert.deepEqual(sizeGuides('Levi’s')[0].rows.find(([waist]) => waist === '33'), ['33', '83.8', '100.3']);
 });
 
+test('size guides follow wardrobe focus and include unisex guides', () => {
+  assert.deepEqual(sizeGuides('Nike', 'women'), []);
+  const nike = sizeGuides('Nike', 'men');
+  assert.ok(nike.length && nike.every((guide) => guide.focus === 'men'));
+  assert.deepEqual(sizeGuides('Nike', 'any'), nike);
+
+  const helmets = sizeGuides('ABUS', 'women');
+  assert.deepEqual(helmets.map((guide) => [guide.focus, guide.categories]), [['unisex', ['accessories']]]);
+  assert.deepEqual(sizeGuides('ABUS', 'men'), helmets);
+  assert.deepEqual(sizeGuides('ABUS', 'any'), helmets);
+});
+
+test('shop-search prompts use only unisex guide URLs for mixed focus and omit men’s URLs for women', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capsula-brand-focus-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore(dir, emptyDb);
+  const ctx = { store, projectRoot: dir, drain: () => undefined };
+  await dispatch(ctx, 'PATCH', '/api/profile', { brands: ['Nike', 'Under Armour', 'ABUS'] });
+  const search = async (title: string, category: Category) => {
+    const need = await dispatch(ctx, 'POST', '/api/needs', { title, category }) as { id: string };
+    return await dispatch(ctx, 'POST', `/api/needs/${need.id}/search`, {}) as Parameters<typeof shopSearchPrompt>[1];
+  };
+  const shoes = await search('Test sneakers', 'shoes');
+  const tops = await search('Test shirt', 'shirts');
+  const helmet = await search('Test cycling helmet', 'accessories');
+
+  assert.match(shopSearchPrompt(store.read(), shoes), /mens-footwear/);
+  assert.match(shopSearchPrompt(store.read(), tops), /mens-tops/);
+  for (const wardrobeFocus of ['women', 'any'] as const) {
+    await dispatch(ctx, 'PATCH', '/api/profile', { wardrobeFocus });
+    const db = store.read();
+    assert.doesNotMatch(shopSearchPrompt(db, shoes), /mens-footwear/, wardrobeFocus);
+    assert.doesNotMatch(shopSearchPrompt(db, tops), /mens-tops/, wardrobeFocus);
+    assert.match(shopSearchPrompt(db, helmet), /abus\.com\/int\/Guide\/Bicycle-safety\//, wardrobeFocus);
+  }
+});
+
 test('my sizes mark their rows in the original charts', () => {
   const [waist, length, top] = sizeGuides("Levi's");
   assert.deepEqual([...myRows(waist, ['W31 L30'])], ['31']);
@@ -68,7 +106,8 @@ test('my sizes mark their rows in the original charts', () => {
   assert.deepEqual([...myRows(top, ['m'])], ['M']);
   assert.deepEqual([...myRows(sizeGuides('Under Armour')[0], ['L'])], ['LG']);
   assert.deepEqual([...myRows(sizeGuides('Speedo')[0], ['DE 5 / UK 34'])], ['34']);
-  assert.deepEqual([...myRows(sizeGuides('Nike')[0], ['42,5'])], ['42.5']);
+  assert.deepEqual([...myRows(sizeGuides('Nike')[0], ['EU 42,5', 'EU 43', '42½'])], ['42.5', '43']);
+  assert.deepEqual([...myRows(sizeGuides('Adidas')[1], ['42 2/3'])], ['42⅔']);
   assert.deepEqual([...myRows(sizeGuides('Vans')[0], ['One Size'])], []);
   const shoesUA = sizeGuides('Under Armour').find((guide) => guide.categories.includes('shoes'));
   assert.deepEqual(shoesUA && [...myRows(shoesUA, ['42'])], ['42']);

@@ -166,7 +166,7 @@ export const lookBusy = (db: DB, lookId: string) => db.jobs.some((j) => (j.kind 
 export const lookJob = (db: DB, lookId: string, includeQueued = false) =>
   db.jobs.filter((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === lookId && (j.state === 'running' || (includeQueued && j.state === 'queued'))).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
 
-const FALLBACK_SECONDS: Record<string, number> = { tryon: 140, packshot: 80, intake: 25, analyze: 60, shopsearch: 320, advise: 240, storefind: 240, discover: 120, wearreview: 60 };
+const FALLBACK_SECONDS: Record<string, number> = { tryon: 140, packshot: 80, intake: 25, analyze: 60, shopsearch: 320, advise: 240, storefind: 240, discover: 120, wearreview: 60, identity_prep: 90, capsule_plan: 35, capsule_match: 45 };
 
 /** How long a job of this kind usually takes here: the median of the last 20 finished ones (owner, 18.11). */
 export function expectedSeconds(db: DB, kind: Job['kind']) {

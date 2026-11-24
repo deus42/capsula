@@ -3,14 +3,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { DB } from './schema.ts';
+import sharp from 'sharp';
+import type { DB, Job } from './schema.ts';
 import { SCHEMA_VERSION, emptySlots, validateDb } from './schema.ts';
 import { createStore, HttpError } from './store.ts';
 import { stateView } from './state-view.ts';
 import { createJob, dispatch, queueMissingRenders, snapshotSlots, upload } from './routes.ts';
 import { sameIdentity, verifyReferenceFiles } from './identity.ts';
 import { MAX_IMAGE_REFS, buildPackshotPrompt, buildPrompt, createRunner, pickRefs } from './runner.ts';
-import { analyzePrompt, applyAnalyze, applyIntake, intakePrompt } from './analysis.ts';
+import { ANALYZE_SCHEMA, INTAKE_SCHEMA, VISUAL_DEDUP_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakePrompt, type IntakeReply } from './analysis.ts';
 import { hiddenLookIds, isCapsuleHidden, sameLook } from '../src/rating.ts';
 import { createHash } from 'node:crypto';
 import { itemArt } from '../src/lib.ts';
@@ -198,14 +199,22 @@ test('sports tagging preserves item categories and a multisport capsule can stor
   }
   await call('PATCH', `/api/items/${refs[0].id}`, { sport: false });
   assert.equal(store.read().items.find((item) => item.id === refs[0].id)?.sport, false);
-  const capsuleId = 'C-sports';
-  await store.mutate((db) => { db.capsules.push({ ...db.capsules[0], id: capsuleId, name: 'Pool and road', lookIds: [] }); });
-  await assert.rejects(call('PATCH', `/api/capsules/${capsuleId}`, { pieces: refs }), /до 3 аксесуарів/);
-  await store.mutate((db) => { db.capsules.find((capsule) => capsule.id === capsuleId)!.accessoryLimit = 4; });
-  await call('PATCH', `/api/capsules/${capsuleId}`, { pieces: refs });
+  const capsule = await call('POST', '/api/capsules', { name: 'Pool and road' });
+  const url = `/api/capsules/${capsule.id}`;
+  await assert.rejects(call('PATCH', url, { pieces: refs }), /до 3 аксесуарів/);
+  assert.equal((await call('PATCH', url, { accessoryLimit: 4 })).accessoryLimit, 4);
+  const saved = await call('PATCH', url, { pieces: refs });
+  await assert.rejects(call('PATCH', url, { accessoryLimit: null }), { status: 422, message: /до 3 аксесуарів/ });
   const db = store.read();
-  assert.equal(capsuleSet(db, db.capsules.find((capsule) => capsule.id === capsuleId)!).counts.accessories, 4);
+  assert.deepEqual(db.capsules.find((c) => c.id === capsule.id), saved, 'the rejected shortcut changes neither the set nor its limit');
+  assert.equal(capsuleSet(db, saved).counts.accessories, 4);
   assert.equal(validateDb(db), null);
+  for (const accessoryLimit of [null, 3]) {
+    const cleared = await call('PATCH', url, { accessoryLimit, pieces: refs.slice(0, 3) });
+    assert.equal(cleared.accessoryLimit, undefined);
+    await call('PATCH', url, { accessoryLimit: 4, pieces: refs });
+  }
+  assert.equal((await call('POST', '/api/capsules', { name: 'Triathlon', accessoryLimit: 4 })).accessoryLimit, 4);
 });
 
 test('fixture is valid and seeds an atomic file with a previous-valid backup', async () => {
@@ -561,22 +570,46 @@ test('one upload control: owner photo becomes a base photo, label fills only emp
   const { store } = setup();
   await store.mutate((db) => {
     db.photos.push({ id: 'P-up', kind: 'item', path: 'assets/photos/up.jpeg', originalName: 'up.jpeg', source: 'upload', createdAt: at });
+    db.photos.push({ ...db.photos.at(-1)!, id: 'P-outfit', path: 'assets/photos/outfit.jpeg' });
+    db.photos.push({ ...db.photos.at(-1)!, id: 'P-face', path: 'assets/photos/face.jpeg' });
     db.photos.push({ id: 'P-tag', kind: 'item', path: 'assets/photos/tag.jpeg', originalName: 'tag.jpeg', source: 'upload', createdAt: at });
-    db.items.find((i) => i.id === 'W-2')!.brand = 'Known';
+    Object.assign(db.items.find((i) => i.id === 'W-2')!, { status: 'confirmed', brand: 'Known', composition: 'Owner composition' });
     db.items.push({ id: 'W-C', rev: 1, category: 'shoes', title: 'Stan Smith', status: 'confirmed', photoIds: [], origin: 'candidate', history: [], createdAt: at, updatedAt: at });
     const base = { id: 'J-b', kind: 'intake' as const, inputPhotoIds: ['P-up'], lookVersion: 0, snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'running' as const, origin: 'site' as const, createdAt: at };
-    const o1 = applyIntake(db, base, {
+    const reply: IntakeReply = {
       status: 'done', reason: '', photoType: 'person_full_body', singlePerson: true, baseSuitable: false, baseIssues: 'окуляри',
       label: { itemId: '', brand: '', size: '', composition: '' },
-      garments: [{ title: 'Білі кеди', category: 'shoes', color: 'білий', notes: '', duplicateOf: 'W-C' }],
-    });
+      garments: [{ title: 'Білі кеди', category: 'shoes', color: 'білий', notes: '', duplicateOf: 'W-C', sport: true }],
+    };
+    const personal = { ...base, intakeIntent: 'person' as const };
+    assert.match(intakePrompt(db, personal, ['up.jpeg']), /Always return garments: \[\]/);
+    assert.doesNotMatch(intakePrompt(db, personal, ['up.jpeg']), /Existing wardrobe/);
+    const o1 = applyIntake(db, personal, reply);
     assert.equal(o1.base, 'added_nonstandard');
     assert.deepEqual(db.profile.basePhotoIds, ['P-up']);
     const up = db.photos.find((p) => p.id === 'P-up')!;
     assert.equal(up.kind, 'base');
     assert.equal(up.meetsStandard, false);
-    assert.equal(o1.created.length, 1, 'a duplicate of a confirmed item becomes a new candidate, confirmed item untouched');
+    assert.deepEqual(up.baseCandidate, { suitable: false, issues: 'окуляри' });
+    assert.deepEqual(o1.created, []);
+
+    const outfit = { ...base, inputPhotoIds: ['P-outfit'], intakeIntent: 'garments' as const };
+    const oGarment = applyIntake(db, outfit, reply);
+    assert.equal(oGarment.base, null);
+    assert.deepEqual(db.profile.basePhotoIds, ['P-up']);
+    assert.equal(db.photos.find((p) => p.id === 'P-outfit')!.kind, 'item');
+    const candidate = db.items.find((i) => i.id === oGarment.created[0])!;
+    assert.equal(candidate.possibleDuplicateOf, 'W-C');
+    assert.equal(candidate.sport, true);
     assert.deepEqual(db.items.find((i) => i.id === 'W-C')!.photoIds, []);
+    applyIntake(db, outfit, { ...reply, garments: [{ ...reply.garments[0], duplicateOf: candidate.id }] });
+    assert.deepEqual(candidate.photoIds, ['P-outfit']);
+
+    const autoFace = applyIntake(db, { ...base, inputPhotoIds: ['P-face'] }, { ...reply, photoType: 'person_face', baseSuitable: true, baseIssues: '' });
+    assert.equal(autoFace.base, 'added');
+    assert.deepEqual(autoFace.created, []);
+    assert.equal(db.photos.find((p) => p.id === 'P-face')!.referenceRole, 'face');
+    assert.deepEqual(db.profile.basePhotoIds, ['P-up', 'P-face']);
     const tag = { ...base, id: 'J-t', inputPhotoIds: ['P-tag'] };
     const o2 = applyIntake(db, tag, {
       status: 'done', reason: '', photoType: 'label', singlePerson: false, baseSuitable: false, baseIssues: '',
@@ -586,10 +619,438 @@ test('one upload control: owner photo becomes a base photo, label fills only emp
     const w2 = db.items.find((i) => i.id === 'W-2')!;
     assert.equal(w2.brand, 'Known', 'existing values are not overwritten');
     assert.equal(w2.size, 'W32 L32');
-    assert.equal(w2.composition, '98% cotton');
+    assert.equal(w2.composition, 'Owner composition');
     assert.ok(w2.photoIds.includes('P-tag'));
     assert.equal(db.photos.find((p) => p.id === 'P-tag')!.kind, 'label');
   });
+});
+
+function pinFixtureIdentity(db: DB) {
+  const file = (path: string) => ({ path, sha256: 'a'.repeat(64) });
+  db.profile.identity = {
+    sourcePhotoId: 'P-1', original: file(db.photos[0].path), bodyOriginal: file(db.photos[1].path),
+    face: file('media/face.png'), body: file('media/body.png'), preserveHeadAngle: true, confirmedAt: at,
+  };
+}
+
+test('auto intake selects suitable body photos only when identity is unpinned, and updates a pending candidate sport flag', () => {
+  const db = fixture();
+  const photo = { ...db.photos[0], id: 'P-upload', source: 'upload' as const, kind: 'item' as const };
+  db.photos.push(photo);
+  const job: Job = {
+    id: 'J-intake', kind: 'intake', inputPhotoIds: [photo.id], lookVersion: 0,
+    snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'running', origin: 'site', createdAt: at,
+  };
+  const reply: IntakeReply = {
+    status: 'done', reason: '', photoType: 'person_full_body', singlePerson: true, baseSuitable: true,
+    garments: [{ title: 'Training pants', sport: true, category: 'trousers', color: 'navy', notes: '', duplicateOf: 'W-1' }],
+  };
+  pinFixtureIdentity(db);
+  const outcome = applyIntake(db, job, reply);
+  assert.deepEqual(outcome.attachedTo, ['W-1']);
+  assert.equal(db.items[0].sport, true);
+  assert.deepEqual(db.items[0].photoIds, ['P-1', 'P-2', photo.id]);
+  assert.deepEqual(photo.baseCandidate, { suitable: true });
+  assert.deepEqual(db.profile.basePhotoIds, []);
+  assert.equal(photo.kind, 'item');
+  delete db.profile.identity;
+  assert.equal(applyIntake(db, job, reply).base, 'added');
+  assert.deepEqual(db.profile.basePhotoIds, [photo.id]);
+  assert.equal(photo.kind, 'base');
+});
+
+test('photo and intake schema validate archive dates, duplicate links and intents', () => {
+  const db = fixture();
+  db.jobs.push({ id: 'J-intake', kind: 'intake', inputPhotoIds: ['P-1'], intakeIntent: 'auto', lookVersion: 0,
+    snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'queued', origin: 'site', createdAt: at });
+  db.items[0].possibleDuplicateOf = 'W-2';
+  db.photos[0].archivedAt = at;
+  assert.equal(validateDb(db), null);
+  for (const invalid of ['W-1', 'missing', 123]) {
+    db.items[0].possibleDuplicateOf = invalid as string;
+    assert.match(validateDb(db)!, /дублікат/);
+  }
+  delete db.items[0].possibleDuplicateOf;
+  db.photos[0].archivedAt = 1 as unknown as string;
+  assert.match(validateDb(db)!, /архівування/);
+  delete db.photos[0].archivedAt;
+  db.jobs[0].intakeIntent = 'unknown' as Job['intakeIntent'];
+  assert.match(validateDb(db)!, /намір/);
+});
+
+test('identical uploads reuse one non-generated original and one intake job across roles', async () => {
+  const { dir, store, call, drained } = setup();
+  const product = await call('POST', '/api/products', { needId: 'N-1', store: 'Shop', model: 'Tee' });
+  let admissions = 0;
+  const ctx = { store, projectRoot: dir, drain: () => {}, admit: () => void admissions++ };
+  const sha256 = createHash('sha256').update(SAMPLE_PNG).digest('hex');
+  await store.mutate((db) => db.photos.push({ ...db.photos[0], id: 'P-generated', kind: 'packshot', source: 'generated', sha256 }));
+  const send = (query: Record<string, string>) => upload(ctx, new URLSearchParams(query), SAMPLE_PNG, 'original.png');
+  const [first, second] = await Promise.all([
+    send({ kind: 'intake', intent: 'person' }), send({ kind: 'intake', intent: 'garments' }),
+  ]);
+  assert.equal(first.id, second.id);
+  assert.notEqual(first.id, 'P-generated');
+  assert.equal(first.sha256, sha256);
+  assert.equal(admissions, 1);
+  assert.deepEqual(fs.readdirSync(path.join(dir, 'media/uploads')), [`${first.id}.png`]);
+  await call('PATCH', `/api/photos/${first.id}`, { archived: true });
+  const attached = await send({ kind: 'item', item: 'W-2', product: product.id });
+  assert.equal(attached.id, first.id);
+  assert.equal(attached.archivedAt, undefined);
+  assert.equal(store.read().products[0].photoId, first.id);
+  assert.deepEqual(store.read().items[1].photoIds, [first.id]);
+  assert.ok(store.read().jobs.some((j) => j.kind === 'packshot' && j.itemId === 'W-2'));
+  await send({ kind: 'base', role: 'face' });
+  await send({ kind: 'base', role: 'face', item: 'W-2' });
+  let db = store.read();
+  assert.deepEqual(db.items[1].photoIds, [first.id]);
+  assert.deepEqual(db.profile.basePhotoIds, [first.id]);
+  assert.equal(db.photos.find((p) => p.id === first.id)!.referenceRole, 'face');
+  assert.equal(db.jobs.find((j) => j.kind === 'intake')!.intakeIntent, 'person');
+  await store.mutate((draft) => { draft.jobs.find((j) => j.kind === 'intake')!.state = 'done'; });
+  await send({ kind: 'intake' });
+  assert.equal(admissions, 1, 'a completed intake also suppresses an automatic repeat');
+  await send({ kind: 'intake', intent: 'garments', reanalyze: '1' });
+  db = store.read();
+  assert.deepEqual(db.jobs.filter((j) => j.kind === 'intake').map((j) => j.intakeIntent), ['person', 'garments']);
+  assert.equal(admissions, 2);
+  const worn = await send({ kind: 'worn' });
+  assert.notEqual(worn.id, first.id);
+  assert.equal(worn.sha256, sha256);
+  assert.equal((await send({ kind: 'worn', item: 'W-2' })).id, worn.id);
+  assert.equal(fs.readdirSync(path.join(dir, 'media/uploads')).length, 2);
+  assert.equal(drained(), 0);
+});
+
+function testPackshot(db: DB, id: string) {
+  const photo = { id, kind: 'packshot' as const, path: `media/${id}.png`, originalName: `${id}.png`, source: 'generated' as const, createdAt: at };
+  db.photos.push(photo);
+  return photo;
+}
+
+test('visual intake checks matching wardrobe images, defers packshots and supports lossless absorb', async () => {
+  const { dir, store, call } = setup();
+  const crop = sourceCropFixture(dir);
+  const validPng = await sharp({ create: { width: 24, height: 24, channels: 3, background: '#22334a' } }).png().toBuffer();
+  const product = await call('POST', '/api/products', { needId: 'N-1', store: 'Shop', model: 'Chinos' });
+  await store.mutate((db) => {
+    const target = db.items[0];
+    Object.assign(target, { status: 'confirmed', brand: 'Owner brand', color: 'Navy', packshotId: testPackshot(db, 'P-cover').id, tryonReference: crop });
+    // The packshot wins over the photo on the same item.
+    fs.writeFileSync(path.join(dir, 'media/P-cover.png'), validPng);
+    db.items[1].status = 'inactive';
+  });
+  const before = store.read().items[0];
+  const uploaded = await upload({ store, projectRoot: dir, drain: () => {} }, new URLSearchParams({ kind: 'intake', intent: 'garments', batch: '1' }), validPng, 'new-angle.png');
+  const observed: string[] = [];
+  const garment = { title: 'Pleated chinos', category: 'trousers', color: 'navy', notes: 'Distinct pocket seam', duplicateOf: '', sport: true };
+  let checks = 0;
+  const engine = {
+    label: 'test', imageLabel: 'test',
+    json: async ({ schema, prompt, images }: { schema: object; prompt: string; images: string[] }) => {
+      if (schema === INTAKE_SCHEMA) {
+        observed.push('primary');
+        return { reply: { status: 'done', photoType: 'garments_only', garments: [{ ...garment, title: checks ? 'Second garment' : garment.title }] } };
+      }
+      assert.equal(schema, VISUAL_DEDUP_SCHEMA);
+      observed.push('visual');
+      assert.equal(images[0], path.join(dir, uploaded.path));
+      assert.ok((await sharp(images[1]).metadata()).width);
+      assert.match(prompt, /1 \| W-1 \| trousers/);
+      assert.doesNotMatch(prompt, /W-2/);
+      if (checks++ > 0) return { reply: { status: 'done', matches: null } };
+      return { reply: { matches: [
+        { garmentIndex: 0, itemId: 'W-2', confidence: 'high', reason: 'Unavailable candidate' },
+        { garmentIndex: 2, itemId: 'W-1', confidence: 'high', reason: 'Invalid index' },
+        { garmentIndex: 0, itemId: 'W-1', confidence: 'possible', reason: 'Same seam' },
+      ] } };
+    },
+    image: async () => { throw new Error('No image generation expected'); },
+  };
+  const runner = createRunner(store, dir, '/usr/bin/false', { engine: engine as never, canStart: (j) => j.kind === 'intake' });
+  await runner.drain();
+  assert.deepEqual(observed, ['primary', 'visual']);
+  let db = store.read();
+  const candidate = db.items.find((i) => i.title === garment.title)!;
+  assert.equal(candidate.possibleDuplicateOf, 'W-1');
+  assert.deepEqual(db.items[0], before);
+  assert.ok(!db.jobs.some((j) => j.kind === 'packshot' && j.itemId === candidate.id));
+
+  const repeat = await call('POST', `/api/photos/${uploaded.id}/reanalyze`, { intent: 'garments' });
+  await runner.drain();
+  db = store.read();
+  const noVisualMatch = db.items.find((i) => i.id === db.jobs.find((j) => j.id === repeat.id)!.createdItemIds![0])!;
+  assert.equal(noVisualMatch.possibleDuplicateOf, undefined);
+  assert.ok(db.jobs.some((j) => j.kind === 'packshot' && j.itemId === noVisualMatch.id));
+
+  await call('POST', '/api/packshots', { itemIds: [candidate.id] });
+  const worn = await upload({ store, projectRoot: dir, drain: () => {} }, new URLSearchParams({ kind: 'worn' }), validPng, 'worn.png');
+  await store.mutate((draft) => {
+    const source = draft.items.find((i) => i.id === candidate.id)!;
+    Object.assign(source, { brand: 'Candidate brand', model: 'Model', size: 'M', fit: 'Straight', composition: 'Cotton', confirmedFact: 'Receipt', packshotId: testPackshot(draft, 'P-source-cover').id });
+    source.photoIds.push(worn.id);
+    draft.items[0].possibleDuplicateOf = source.id;
+    const other = draft.items.find((i) => i.id === noVisualMatch.id)!;
+    other.possibleDuplicateOf = source.id;
+    const ref = { kind: 'item' as const, id: source.id };
+    const look = draft.looks[0];
+    look.slots.bottom = [ref];
+    draft.capsules[0].pieces = [...look.slots.top, ref];
+    draft.capsules[0].base = [ref];
+    Object.assign(draft.needs[0], { coveredByItem: source.id, status: 'covered' });
+    Object.assign(draft.products.find((p) => p.id === product.id)!, { purchasedItemId: source.id, status: 'purchased' });
+    const job = draft.jobs.find((j) => j.itemId === source.id)!;
+    draft.jobs.push({ ...job, id: 'J-finished-cover', state: 'done', photoId: source.packshotId });
+    job.state = 'running';
+  });
+  const absorb = (sourceId: string) => call('POST', '/api/items/W-1/absorb', { sourceId });
+  await assert.rejects(absorb('W-1'), { status: 400 });
+  await assert.rejects(absorb(candidate.id), { status: 409 });
+  await store.mutate((draft) => { draft.jobs.find((j) => j.itemId === candidate.id && j.state === 'running')!.state = 'queued'; });
+  const target = await absorb(candidate.id);
+  assert.equal(target.id, 'W-1');
+  assert.equal(target.status, 'confirmed');
+  assert.deepEqual(target.photoIds, ['P-1', 'P-2', uploaded.id]);
+  assert.equal(target.brand, 'Owner brand');
+  assert.equal(target.color, 'Navy');
+  assert.equal(target.model, 'Model');
+  assert.equal(target.size, 'M');
+  assert.equal(target.fit, 'Straight');
+  assert.equal(target.composition, 'Cotton');
+  assert.equal(target.confirmedFact, 'Receipt');
+  assert.equal(target.sport, true);
+  assert.equal(target.packshotId, 'P-cover');
+  assert.deepEqual(target.tryonReference, crop);
+  assert.equal(target.possibleDuplicateOf, undefined);
+  assert.equal(target.history.at(-1).action, 'merged');
+  db = store.read();
+  const source = db.items.find((i) => i.id === candidate.id)!;
+  assert.equal(source.status, 'inactive');
+  assert.equal(source.mergedInto, target.id);
+  assert.equal(source.possibleDuplicateOf, undefined);
+  assert.equal(source.history.at(-1)?.action, 'merged_into');
+  assert.equal(db.items.find((i) => i.id === noVisualMatch.id)!.possibleDuplicateOf, target.id);
+  assert.deepEqual(db.looks[0].slots.bottom, [{ kind: 'item', id: target.id }]);
+  assert.deepEqual(db.capsules[0].base, [{ kind: 'item', id: target.id }]);
+  assert.equal(db.needs[0].coveredByItem, target.id);
+  assert.equal(db.products[0].purchasedItemId, target.id);
+  assert.ok(!db.jobs.some((j) => j.itemId === source.id && j.state === 'queued'));
+  assert.ok(!db.photos.some((p) => p.id === 'P-source-cover'));
+  assert.equal(db.jobs.find((j) => j.id === 'J-finished-cover')!.photoId, undefined);
+  await assert.rejects(absorb(candidate.id), { status: 409 });
+  assert.equal(validateDb(db), null);
+  await call('POST', `/api/products/${product.id}/unpurchase`);
+  db = store.read();
+  assert.equal(db.needs[0].status, 'open');
+  assert.equal(db.items[0].status, 'confirmed');
+  assert.deepEqual(db.items[0].photoIds, target.photoIds);
+});
+
+test('clearing a probable duplicate queues a missing cover and deleting its match clears the link', async () => {
+  const { store, call } = setup();
+  await store.mutate((db) => {
+    db.items[1].photoIds = ['P-1'];
+    db.items[1].possibleDuplicateOf = 'W-1';
+  });
+  const confirmed = await call('PATCH', '/api/items/W-2', { status: 'confirmed', clearDuplicate: true });
+  assert.equal(confirmed.possibleDuplicateOf, undefined);
+  assert.equal(store.read().jobs.filter((j) => j.kind === 'packshot' && j.itemId === 'W-2').length, 1);
+  await store.mutate((db) => { db.items[1].possibleDuplicateOf = 'W-1'; });
+  await call('DELETE', '/api/items/W-1');
+  assert.equal(store.read().items[0].possibleDuplicateOf, undefined);
+});
+
+test('merge preserves owner metadata, selected covers, garment crops and purchased product links', async () => {
+  for (const explicit of [false, true]) {
+    const { dir, store, call } = setup();
+    const crop = sourceCropFixture(dir);
+    const product = await call('POST', '/api/products', { needId: 'N-1', store: 'Shop', model: 'Chinos' });
+    await store.mutate((db) => {
+      const [confirmed, pending] = db.items;
+      Object.assign(confirmed, { status: 'confirmed', brand: 'Owner', model: 'Classic', color: 'Navy', size: '32', tryonReference: crop, packshotId: testPackshot(db, 'P-primary-cover').id });
+      Object.assign(pending, { brand: 'Candidate', fit: 'Straight', composition: 'Cotton', purchasedFromProduct: product.id, possibleDuplicateOf: confirmed.id, packshotId: testPackshot(db, 'P-alt-cover').id });
+      db.items.push({ ...pending, id: 'W-external', possibleDuplicateOf: pending.id });
+      Object.assign(db.products[0], { purchasedItemId: pending.id, status: 'purchased' });
+    });
+    const data = explicit ? { targetId: 'W-2', coverPhotoId: 'P-alt-cover' } : {};
+    const item = await call('POST', '/api/items/merge', { ids: ['W-2', 'W-1'], primaryPhotoId: 'P-2', ...data });
+    assert.ok(!['W-1', 'W-2'].includes(item.id));
+    assert.equal(item.status, 'confirmed');
+    assert.equal(item.brand, explicit ? 'Candidate' : 'Owner');
+    assert.equal(item.model, 'Classic');
+    assert.equal(item.color, 'Navy');
+    assert.equal(item.size, '32');
+    assert.equal(item.fit, 'Straight');
+    assert.equal(item.composition, 'Cotton');
+    assert.equal(item.packshotId, explicit ? 'P-alt-cover' : 'P-primary-cover');
+    assert.deepEqual(item.tryonReference, crop);
+    assert.deepEqual(item.photoIds, ['P-2', 'P-1']);
+    assert.equal(item.purchasedFromProduct, product.id);
+    assert.equal(item.possibleDuplicateOf, undefined);
+    const db = store.read();
+    assert.equal(db.items.find((i) => i.id === 'W-external')!.possibleDuplicateOf, item.id);
+    assert.equal(db.items.find((i) => i.id === 'W-2')!.possibleDuplicateOf, undefined);
+    assert.equal(db.products[0].purchasedItemId, item.id);
+    assert.ok(db.photos.some((p) => p.id === 'P-alt-cover'));
+    assert.equal(validateDb(db), null);
+  }
+});
+
+test('photo management protects identity and wear originals and updates item evidence', async () => {
+  const { dir, store, call } = setup();
+  const crop = sourceCropFixture(dir);
+  await store.mutate((db) => {
+    pinFixtureIdentity(db);
+    db.items[0].tryonReference = crop;
+    db.photos.push({ ...db.photos[1], id: 'P-inspiration', inspiration: { title: 'Reference', sourceUrl: 'https://example.test', sourceNote: '', tags: [], sha256: 'a'.repeat(64) } });
+    testPackshot(db, 'P-generated');
+  });
+  const ctx = { store, projectRoot: dir, drain: () => {} };
+  const photo = await upload(ctx, new URLSearchParams({ kind: 'item' }), SAMPLE_PNG, 'original.png');
+  const worn = await upload(ctx, new URLSearchParams({ kind: 'worn' }), SAMPLE_PNG, 'worn.png');
+  await store.mutate((db) => {
+    db.wears = [{ id: 'wear-test', key: 'test', lookId: 'L-1', lookVersion: 1, photoIds: [worn.id], createdAt: at }];
+  });
+  const patch = (id: string, body: Record<string, unknown>) => call('PATCH', `/api/photos/${id}`, body);
+  for (const id of ['P-1', 'P-2']) {
+    for (const role of ['item', 'label']) await assert.rejects(patch(id, { role }), { status: 409 });
+    await assert.rejects(patch(id, { archived: true }), { status: 409 });
+  }
+  for (const id of [worn.id, 'P-generated', 'P-inspiration']) {
+    await assert.rejects(patch(id, { role: 'face' }), { status: 409 });
+    await assert.rejects(patch(id, { attachItemId: 'W-2' }), { status: 409 });
+    await assert.rejects(call('POST', `/api/photos/${id}/reanalyze`), { status: 409 });
+  }
+  await assert.rejects(patch(worn.id, { archived: true }), { status: 409 });
+
+  const face = await patch(photo.id, { role: 'face', meetsStandard: true, note: 'Owner check' });
+  assert.equal(face.kind, 'base');
+  assert.equal(face.referenceRole, 'face');
+  assert.equal(face.meetsStandard, true);
+  assert.equal(face.note, 'Owner check');
+  assert.deepEqual(store.read().profile.basePhotoIds, [photo.id]);
+  assert.equal((await patch(photo.id, { role: 'base' })).referenceRole, undefined);
+  assert.equal((await patch(photo.id, { role: 'label' })).kind, 'label');
+  assert.deepEqual(store.read().profile.basePhotoIds, []);
+  assert.equal((await patch(photo.id, { role: 'item' })).kind, 'item');
+  assert.equal((await patch(photo.id, { role: 'base' })).kind, 'base');
+  const archived = await patch(photo.id, { archived: true });
+  assert.ok(archived.archivedAt);
+  assert.deepEqual(store.read().profile.basePhotoIds, []);
+  assert.equal(archived.preserveAsReference, true);
+  assert.deepEqual(fs.readFileSync(path.join(dir, photo.path)), SAMPLE_PNG);
+  assert.deepEqual((await call('PATCH', '/api/profile', { basePhotoIds: [photo.id] })).basePhotoIds, []);
+  await assert.rejects(call('DELETE', `/api/photos/${photo.id}`), { status: 409 });
+  assert.equal((await patch(photo.id, { archived: false })).archivedAt, undefined);
+  await patch(photo.id, { archived: true });
+  assert.equal((await patch(photo.id, { attachItemId: 'W-1' })).archivedAt, undefined);
+  assert.equal(store.read().items[0].tryonReference, undefined);
+  assert.ok(store.read().jobs.some((j) => j.kind === 'packshot' && j.itemId === 'W-1'));
+  await assert.rejects(patch(photo.id, { archived: true }), { status: 409 });
+  await store.mutate((db) => { db.items[0].tryonReference = { ...crop, source: { ...crop.source, path: photo.path } }; });
+  assert.ok((await patch(photo.id, { detachItemId: 'W-1', archived: true })).archivedAt);
+  assert.ok(!store.read().items[0].photoIds.includes(photo.id));
+  assert.equal(store.read().items[0].tryonReference, undefined);
+});
+
+test('direct own item upload replaces a stale shop crop and retains the catalogue cover', async () => {
+  const { dir, store } = setup();
+  const crop = sourceCropFixture(dir);
+  await store.mutate((db) => {
+    db.photos.push({ ...db.photos[0], id: 'P-shop-crop', kind: 'product', path: 'media/shop.png' });
+    const item = db.items[1];
+    item.photoIds = ['P-shop-crop'];
+    item.tryonReference = { ...crop, source: { ...crop.source, path: 'media/shop.png' } };
+    item.packshotId = testPackshot(db, 'P-current-cover').id;
+  });
+  const photo = await upload({ store, projectRoot: dir, drain: () => {} }, new URLSearchParams({ kind: 'item', item: 'W-2' }), SAMPLE_PNG, 'own.png');
+  const db = store.read();
+  assert.deepEqual(db.items[1].photoIds, ['P-shop-crop', photo.id]);
+  assert.equal(db.items[1].tryonReference, undefined);
+  assert.equal(db.items[1].packshotId, 'P-current-cover');
+  assert.deepEqual(db.jobs, []);
+});
+
+test('reanalyze applies admission, unarchives and starts only one active intake for the photo', async () => {
+  const { dir, store, call } = setup();
+  const photo = await upload({ store, projectRoot: dir, drain: () => {} }, new URLSearchParams({ kind: 'item' }), SAMPLE_PNG, 'own.png');
+  const endpoint = `/api/photos/${photo.id}/reanalyze`;
+  await call('PATCH', `/api/photos/${photo.id}`, { archived: true });
+  let drains = 0;
+  let allowed = false;
+  const admissions: string[] = [];
+  const ctx = { store, projectRoot: dir, drain: () => void drains++, admit: (kind: string) => {
+    admissions.push(kind);
+    if (!allowed) throw new HttpError(429, 'Test quota');
+  } };
+  const run = (body: Record<string, unknown> = {}) => dispatch(ctx, 'POST', endpoint, body) as Promise<Job>;
+  await assert.rejects(run({ intent: 'wrong' }), { status: 400 });
+  await assert.rejects(run(), { status: 429 });
+  assert.ok(store.read().photos.find((p) => p.id === photo.id)!.archivedAt);
+  allowed = true;
+  const job = await run({ intent: 'person', note: '  New reference  ' });
+  assert.equal(job.intakeIntent, 'person');
+  assert.equal(job.instructions, 'New reference');
+  assert.deepEqual(job.inputPhotoIds, [photo.id]);
+  assert.equal(job.state, 'queued');
+  assert.equal(store.read().photos.find((p) => p.id === photo.id)!.archivedAt, undefined);
+  await assert.rejects(run(), { status: 409 });
+  await store.mutate((db) => { db.jobs[0].state = 'running'; });
+  await assert.rejects(run(), { status: 409 });
+  await store.mutate((db) => { db.jobs[0].state = 'done'; });
+  const fresh = await run();
+  assert.notEqual(fresh.id, job.id);
+  assert.equal(fresh.intakeIntent, 'auto');
+  assert.deepEqual(admissions, ['intake', 'intake', 'intake']);
+  assert.equal(drains, 2);
+});
+
+test('intake leaves a photo archived if the owner archives it during analysis', async () => {
+  const { dir, store, call } = setup();
+  const photo = await upload({ store, projectRoot: dir, drain: () => {} }, new URLSearchParams({ kind: 'intake', intent: 'person' }), SAMPLE_PNG, 'reference.png');
+  const engine = {
+    label: 'test', imageLabel: 'test',
+    json: async ({ schema }: { schema: object }) => {
+      assert.equal(schema, INTAKE_SCHEMA);
+      await call('PATCH', `/api/photos/${photo.id}`, { archived: true });
+      return { reply: { status: 'done', photoType: 'person_full_body', singlePerson: true, baseSuitable: true, garments: [] } };
+    },
+  };
+  await createRunner(store, dir, '/usr/bin/false', { engine: engine as never }).drain();
+  const db = store.read();
+  assert.equal(db.jobs[0].state, 'needs_data');
+  assert.ok(db.photos.find((p) => p.id === photo.id)!.archivedAt);
+  assert.deepEqual(db.profile.basePhotoIds, []);
+});
+
+test('photo management, reanalysis, absorb and upload dedup are tenant isolated', async () => {
+  const { createTenants, emptyDb } = await import('./tenants.ts');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capsula-photo-tenants-'));
+  const tenants = createTenants({ projectRoot: dir, dataDir: dir, seed: emptyDb, codexBin: '/usr/bin/false' });
+  const a = tenants.forUser('photo-tenant-a');
+  const b = tenants.forUser('photo-tenant-b');
+  a.runner.stop();
+  b.runner.stop();
+  const params = new URLSearchParams({ kind: 'item' });
+  const aPhoto = await upload(a.ctx, params, SAMPLE_PNG, 'same.png');
+  const bPhoto = await upload(b.ctx, params, SAMPLE_PNG, 'same.png');
+  assert.notEqual(aPhoto.id, bPhoto.id);
+  assert.deepEqual(a.store.read().photos.map((p) => p.id), [aPhoto.id]);
+  assert.deepEqual(b.store.read().photos.map((p) => p.id), [bPhoto.id]);
+  const make = (ctx: typeof a.ctx, title: string) => dispatch(ctx, 'POST', '/api/items', { category: 'shirts', title }) as Promise<DB['items'][number]>;
+  const [aItem, aCandidate, bItem] = await Promise.all([make(a.ctx, 'A'), make(a.ctx, 'Candidate A'), make(b.ctx, 'B')]);
+  const beforeA = a.store.read();
+  const beforeB = b.store.read();
+  await assert.rejects(dispatch(b.ctx, 'POST', `/api/photos/${aPhoto.id}/reanalyze`, {}), { status: 404 });
+  await assert.rejects(dispatch(b.ctx, 'PATCH', `/api/photos/${aPhoto.id}`, { archived: true }), { status: 404 });
+  await assert.rejects(dispatch(b.ctx, 'PATCH', `/api/photos/${bPhoto.id}`, { attachItemId: aItem.id }), { status: 404 });
+  await assert.rejects(dispatch(b.ctx, 'PATCH', `/api/photos/${bPhoto.id}`, { detachItemId: aItem.id }), { status: 404 });
+  await assert.rejects(dispatch(b.ctx, 'POST', `/api/items/${aItem.id}/absorb`, { sourceId: bItem.id }), { status: 404 });
+  await assert.rejects(dispatch(b.ctx, 'POST', `/api/items/${bItem.id}/absorb`, { sourceId: aCandidate.id }), { status: 404 });
+  await assert.rejects(dispatch(b.ctx, 'POST', '/api/items/merge', { ids: [bItem.id, aItem.id] }), { status: 404 });
+  assert.deepEqual(a.store.read(), beforeA);
+  assert.deepEqual(b.store.read(), beforeB);
 });
 
 test('deleting capsule, look, item and photo cascades without dangling references', async () => {
@@ -2001,6 +2462,95 @@ test('a proposal is shown only while its purchases fit the closed set: planned, 
 
 // ── Production stage 1: accounts and per-account wardrobes ──
 
+test('automatic try-ons are queued only for the local and owner tenants', async (t) => {
+  const { createTenants, emptyDb } = await import('./tenants.ts');
+  const { createUsage, quotaConfigFromEnv, quotaKind } = await import('./quota.ts');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capsula-auto-tryon-'));
+  const usage = createUsage(path.join(dir, 'usage.sqlite'));
+  const engine = {
+    label: 'test', imageLabel: 'test',
+    json: async ({ schema }: { schema: object }) => ({ reply: schema === ANALYZE_SCHEMA ? {
+      name: 'Selection', looks: [{ name: 'Analyzed look', top: ['W-T'], bottom: ['W-1'], shoes: ['W-S'] }],
+    } : {} }),
+    image: async () => ({ ok: false, err: 'Test engine does not render' }),
+  };
+  const tenants = createTenants({ projectRoot: dir, dataDir: dir, seed: emptyDb, engine, quota: { cfg: quotaConfigFromEnv({}), usage } });
+  t.after(() => {
+    tenants.stopAll();
+    usage.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const cases = [
+    { name: 'local', tenant: tenants.local(), auto: true },
+    { name: 'owner', tenant: tenants.forUser('owner-account', true), auto: true },
+    { name: 'invited', tenant: tenants.forUser('invited-account'), auto: false },
+    { name: 'test', tenant: tenants.forUser('test-account', false, true), auto: false },
+  ];
+  for (const { name, tenant, auto } of cases) {
+    await t.test(name, async () => {
+      const { store, ctx, runner } = tenant;
+      assert.equal(ctx.autoTryOn, auto);
+      const call = (url: string, body: Record<string, unknown> = {}) => dispatch({ ...ctx, drain: () => {} }, 'POST', url, body);
+      const tryons = () => store.read().jobs.filter((job) => quotaKind(job) === 'tryon');
+      const manualSlots = { ...emptySlots(), top: [{ kind: 'item' as const, id: 'W-T' }] };
+      const suggestedSlots = { ...emptySlots(), layer: [{ kind: 'item' as const, id: 'W-J' }], bottom: [{ kind: 'item' as const, id: 'W-1' }] };
+      await store.mutate((db) => {
+        db.photos = fixture().photos;
+        db.profile.basePhotoIds = ['P-2'];
+        db.items.push(owned('W-T', 'tees', 'Tee'), owned('W-1', 'trousers', 'Chinos'), owned('W-S', 'shoes', 'Sneakers'), owned('W-J', 'outerwear', 'Jacket'));
+        for (const item of db.items) item.photoIds = ['P-1'];
+        db.capsules.push({ ...fixture().capsules[0], lookIds: [] });
+        db.suggestions = [{ id: 'S-1', kind: 'look', status: 'open', name: 'Proposed', why: '', capsuleId: 'C-1', looks: [{ name: 'Proposed', why: '', slots: suggestedSlots }], jobId: 'J-proposal', createdAt: at }];
+      });
+      const manual = await call('/api/looks', { capsuleId: 'C-1', name: 'Manual', slots: manualSlots }) as DB['looks'][number];
+      assert.deepEqual(tryons().map((job) => job.lookId), auto ? [manual.id] : []);
+      const accepted = await call('/api/suggestions/S-1/accept') as { href: string };
+      const proposedId = accepted.href.split('/').at(-1);
+      assert.deepEqual(tryons().map((job) => job.lookId), auto ? [manual.id, proposedId] : []);
+      assert.ok(tryons().every((job) => job.state === 'queued'));
+
+      await call('/api/analyze');
+      await runner.drain();
+      const selection = store.read().capsules.find((c) => c.kind === 'selection');
+      assert.ok(selection);
+      assert.equal(selection.lookIds.length, 1);
+      assert.deepEqual(tryons().map((job) => job.lookId), auto ? [manual.id, proposedId, selection.lookIds[0]] : []);
+      if (!auto) {
+        assert.deepEqual(tenant.quota!.status(store.read()).kinds.tryon, { used: 0, limit: 10 });
+        await call('/api/jobs', { lookId: manual.id });
+        assert.deepEqual(tryons().map((job) => job.state), ['queued']);
+      }
+    });
+  }
+});
+
+test('creating a look wakes the queue only when its try-on survives quota trimming', async () => {
+  const { accountQuota, createUsage, meteredStore, quotaConfigFromEnv } = await import('./quota.ts');
+  const { dir, store } = setup();
+  const usage = createUsage(path.join(dir, 'usage.sqlite'));
+  try {
+    const quota = accountQuota(quotaConfigFromEnv({ QUOTA_TRYON_QUEUE: '1' }), usage, 'test-account', false);
+    let drains = 0;
+    const ctx = { store: meteredStore(store, quota), projectRoot: dir, admit: () => {}, drain: () => void drains++ };
+    await store.mutate((db) => {
+      db.items[1].photoIds = ['P-1'];
+      db.profile.basePhotoIds = ['P-2'];
+    });
+    const create = (id: string) => dispatch(ctx, 'POST', '/api/looks', { capsuleId: 'C-1', slots: { bottom: [{ kind: 'item', id }] } }) as Promise<DB['looks'][number]>;
+    const first = await create('W-1');
+    assert.equal(drains, 1);
+    assert.equal((await create('W-1')).id, first.id);
+    const second = await create('W-2');
+    const db = store.read();
+    assert.ok(db.looks.some((look) => look.id === second.id));
+    assert.deepEqual(db.jobs.map((job) => [job.lookId, job.state]), [[first.id, 'queued']]);
+    assert.equal(drains, 1, 'neither the duplicate nor the trimmed try-on wakes the runner');
+  } finally {
+    usage.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('every account gets its own empty, valid wardrobe folder; deleting the account removes it and stops its queue', async () => {
   const { createTenants, emptyDb } = await import('./tenants.ts');
   assert.equal(validateDb(emptyDb()), null);
@@ -2500,6 +3050,11 @@ test('deleting a look frees its variants: no variantOf points at a look that is 
   const base = db.looks[0];
   const other = { ...structuredClone(base), id: 'L-2', variantOf: base.id };
   db.looks.push(other);
+  assert.equal(validateDb(db), null);
+  for (const variantOf of ['L-missing', other.id, 42]) {
+    const invalid = { ...db, looks: [base, { ...other, variantOf }] };
+    assert.match(validateDb(invalid) ?? '', /основний образ/);
+  }
   deleteLook(db, base.id);
   assert.equal(db.looks.find((l) => l.id === 'L-2')?.variantOf, undefined);
   assert.equal(validateDb(db), null);

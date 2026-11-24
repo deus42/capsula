@@ -18,9 +18,13 @@ function EditSizes({ brands, defaultBrand, onClose }: { brands: string[]; defaul
   const [saving, setSaving] = useState(false);
   const patch = (id: string, changes: Partial<KnownSize>) =>
     setSizes((rows) => rows.map((row) => row.id === id ? { ...row, ...changes } : row));
+  const addSize = () => {
+    const id = globalThis.crypto?.randomUUID?.() ?? `K-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    setSizes((rows) => [...rows, { id, brand: defaultBrand ?? '', size: '', category: 'trousers' }]);
+  };
   const save = async () => {
     setSaving(true);
-    const result = await act(() => api('PATCH', '/api/profile', { rev: profile.rev, knownSizes: sizes, shoeSizeEu }), t('Збережено'));
+    const result = await act(() => api('PATCH', '/api/profile', { knownSizes: sizes, shoeSizeEu }), t('Збережено'));
     setSaving(false);
     if (result) onClose();
   };
@@ -44,7 +48,7 @@ function EditSizes({ brands, defaultBrand, onClose }: { brands: string[]; defaul
             <button type="button" className="icon-btn sm" aria-label={t('Прибрати розмір')} onClick={() => setSizes((rows) => rows.filter((size) => size.id !== row.id))}><X size={14} /></button>
           </div>
         ))}
-        <div><button type="button" className="btn ghost" onClick={() => setSizes((rows) => [...rows, { id: crypto.randomUUID(), brand: defaultBrand ?? '', size: '', category: 'trousers' }])}>
+        <div><button type="button" className="btn ghost" onClick={addSize}>
           <Plus size={14} />{t('Додати розмір')}
         </button></div>
       </form>
@@ -70,7 +74,7 @@ export function BrandSizing() {
   const records = sizeEvidence(db).filter((row) => row.brand);
   const known = (name: string) => brands.find((brand) => brandKey(brand) === brandKey(name));
   const activeBrand = known(selected) ?? records.map((row) => known(row.brand)).find(Boolean) ?? brands[0];
-  const activeGuides = activeBrand ? sizeGuides(activeBrand) : [];
+  const activeGuides = activeBrand ? sizeGuides(activeBrand, db.profile.wardrobeFocus ?? 'men') : [];
   const personal = records.filter((row) => brandKey(row.brand) === brandKey(activeBrand ?? ''));
   const mine = new Map<string, { size: string; category: SizeEvidence['category']; items: { id: string; title: string }[] }>();
   for (const row of personal) {
@@ -79,12 +83,11 @@ export function BrandSizing() {
     if (row.item) group.items.push(row.item);
     mine.set(key, group);
   }
-  const rowsFor = (guide: ReturnType<typeof sizeGuides>[number]) => {
-    const own = personal.filter((row) => guide.categories.includes(row.category)).map((row) => row.size);
-    const shoe = guide.columns[0] === 'EU' && guide.categories.includes('shoes') && db.profile.shoeSizeEu ? [db.profile.shoeSizeEu] : [];
-    return myRows(guide, own.length ? own : shoe);
-  };
-  const marked = activeGuides.map(rowsFor);
+  const marked = activeGuides.map((guide) => {
+    const mySizes = personal.filter((row) => guide.categories.includes(row.category)).map((row) => row.size);
+    if (guide.categories.includes('shoes') && db.profile.shoeSizeEu) mySizes.push(db.profile.shoeSizeEu);
+    return myRows(guide, mySizes);
+  });
   return (
     <section className="card lg brand-sizing" aria-labelledby="brand-sizing-title">
       <div className="section-head">
@@ -92,6 +95,7 @@ export function BrandSizing() {
         <button type="button" className="icon-btn" aria-label={t('Редагувати розміри')} onClick={() => setEditing(true)}><Pencil size={14} /></button>
       </div>
       {db.profile.shoeSizeEu && <p className="small muted">{t('Мій розмір взуття (EU)')} <strong>{db.profile.shoeSizeEu}</strong></p>}
+      {!activeBrand && !db.profile.shoeSizeEu && <p className="small muted">{t('Додай розмір через олівець.')}</p>}
       {activeBrand && (
         <>
           <div className="filters start brand-size-brands" role="group" aria-label={t('Бренд')}>
@@ -110,7 +114,7 @@ export function BrandSizing() {
             </li>)}
           </ul> : !marked.some((rows) => rows.size) && <p className="small muted brand-size-none">{t('Мій розмір ще не записано')}</p>}
           {activeGuides.length ? activeGuides.map((guide, guideIndex) => (
-            <section className="brand-guide" key={guide.title}>
+            <section className="brand-guide" key={`${guide.focus}:${guide.title}`}>
               <div className="section-head">
                 <h3>{t(guide.title)}</h3>
                 <a href={guide.url} target="_blank" rel="noreferrer">{t('Оригінал')}</a>
@@ -120,8 +124,9 @@ export function BrandSizing() {
                   <thead><tr>{guide.columns.map((column) => <th scope="col" key={column}>{t(column)}</th>)}</tr></thead>
                   <tbody>{guide.rows.map(([size, ...cells]) => {
                     const own = marked[guideIndex].has(size);
-                    return <tr key={size} className={own ? 'mine' : undefined} aria-current={own || undefined}>
-                      <th scope="row">{size}</th>{cells.map((cell, index) => <td key={guide.columns[index + 1]}>{cell}</td>)}
+                    return <tr key={size} className={own ? 'my-row' : undefined}>
+                      <th scope="row" aria-label={own ? t('Мій розмір {size}', { size }) : undefined}>{size}</th>
+                      {cells.map((cell, index) => <td key={guide.columns[index + 1]}>{cell}</td>)}
                     </tr>;
                   })}</tbody>
                 </table>

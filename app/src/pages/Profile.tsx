@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Camera, Check, CircleCheck, Copy, Heart, Link2, Loader2, LocateFixed, MapPin, Minus, Plus, Ruler, Store, Trash2, TriangleAlert, UserRound, Users, X } from 'lucide-react';
 import type { MeasureKey, QuotaKind, QuotaStatus } from '../api.ts';
@@ -6,10 +6,11 @@ import { api, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
 import { Badge, ConfirmButton, PageHead, PhotoPicker, SubNav } from '../components/ui.tsx';
 import { useIntake } from './Home.tsx';
-import { BrandSizing } from './BrandSizing.tsx';
 import { InfoMark } from './Glossary.tsx';
 import { MEASURES, fmtDay, plainShopName, shopLocation, wardrobeBrands } from '../lib.ts';
 import { LOOKS, currentLanguage, plural, t } from '../i18n.ts';
+
+const BrandSizing = lazy(() => import('./BrandSizing.tsx').then((module) => ({ default: module.BrandSizing })));
 
 const STANDARD = [
   '2–3 фото на повний зріст спереду',
@@ -49,8 +50,8 @@ function BasePhotos() {
   const { act } = useApp();
   const prof = db.profile;
   const [picker, setPicker] = useState(false);
-  const intake = useIntake();
-  const busy = db.jobs.filter((j) => j.kind === 'intake' && (j.state === 'queued' || j.state === 'running')).length;
+  const intake = useIntake('person');
+  const busy = db.jobs.filter((j) => j.kind === 'intake' && j.intakeIntent === 'person' && (j.state === 'queued' || j.state === 'running')).length;
   const originals = (prof.identity ? [prof.identity.sourcePhotoId] : prof.basePhotoIds).map((id) => db.photos.find((p) => p.id === id)).filter(Boolean) as typeof db.photos;
   const base = prof.identity?.approvedPortrait ? originals.map((p) => ({ ...p, path: prof.identity!.face.path, originalName: t('Схвалений портрет') })) : originals;
   const ok = base.filter((p) => p.meetsStandard).length;
@@ -58,17 +59,17 @@ function BasePhotos() {
     <Section
       title={t('Мої фото')}
       sub={prof.identity?.disabledReason ?? (prof.identity ? `${base[0]?.originalName ?? t('Оригінал')} ${t('— опора обличчя.')} ${t(prof.identity.preserveHeadAngle ? 'Оригінальний ракурс.' : 'Прямий погляд, голова рівно.')} ${prof.identity.noGlasses ? t('Без окулярів.') : ''} ${prof.identity.hairstyle ?? ''}` : t('Обличчя для примірок береться лише з цих фото.'))}
-      actions={!prof.identity && <button className="btn" onClick={() => setPicker(true)}>{t('Вибрати з наявних')}</button>}
+      actions={<><a className="btn primary" href="/setup">{prof.identity ? t('Оновити опору') : t('Налаштувати опору')}</a>{!prof.identity && <button className="btn" onClick={() => setPicker(true)}>{t('Вибрати з наявних')}</button>}</>}
     >
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 280px', gap: 24 }} className="profile-base">
         <div className="stack" style={{ gap: 18 }}>
           {intake.field}
           <a className="btn" href="/gallery?type=original">{t('Усі мої оригінали й референси')}</a>
-          <a className="btn" href="/gallery?type=face">{t('Референси обличчя ·')} {db.photos.filter((p) => p.referenceRole === 'face').length}</a>
+          <a className="btn" href="/gallery?type=face">{t('Референси обличчя ·')} {db.photos.filter((p) => p.referenceRole === 'face' && !p.archivedAt).length}</a>
           <button className="dropzone" onClick={intake.pick} disabled={intake.busy} style={{ cursor: 'pointer', width: '100%' }}>
             {intake.busy || busy ? <Loader2 size={22} className="spin" style={{ margin: '0 auto' }} /> : <Camera size={22} style={{ margin: '0 auto' }} />}
             <b>{busy ? t('Розбираю фото: {n}', { n: busy }) : t('Додати фото')}</b>
-            {t('Сайт сам визначить: твоє фото для примірок, одяг чи етикетка.')}
+            {t('Додай фото обличчя або на повний зріст — для опори й примірок.')}
           </button>
           {base.length > 0 && (
             <div className="photo-grid">
@@ -499,7 +500,12 @@ export function ProfilePage({ tab }: { tab?: string }) {
         <SubNav value={current} onChange={(k) => go(`/profile/${k}`)} groups={[{ items: tabs }]} />
         <div>
           {current === 'base' && <BasePhotos />}
-          {current === 'measurements' && <><Measurements /><BrandSizing /></>}
+          {current === 'measurements' && (
+            <>
+              <Measurements />
+              <Suspense fallback={null}><BrandSizing /></Suspense>
+            </>
+          )}
           {current === 'shops' && <Shops />}
           {current === 'preferences' && <Preferences />}
           {current === 'account' && <Account />}

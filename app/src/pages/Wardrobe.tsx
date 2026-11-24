@@ -4,7 +4,7 @@ import { Archive, Camera, Check, CircleCheck, CircleDashed, Dumbbell, Grid2x2, M
 import type { Category, Item, ItemStatus, Job, Photo } from '../api.ts';
 import { api, media, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
-import { Badge, CategoryIcon, ConfirmButton, Empty, JobBar, LookArt, Missing, Modal, PageHead, SubNav, UploadButton } from '../components/ui.tsx';
+import { Badge, CategoryIcon, ConfirmButton, Empty, JobBar, LookArt, Missing, Modal, PageHead, PhotoPicker, SubNav, UploadButton } from '../components/ui.tsx';
 import { CATEGORY_LABEL, capsuleCount, isBlockedEyewear, itemArt, itemPlacements, itemRating, itemVerdict, scoreLabel, usageLabel, wardrobeCapsule } from '../lib.ts';
 import { itemCoverOptions, primaryPhotoFirst } from '../item-images.ts';
 
@@ -15,6 +15,10 @@ const STATUS_LABEL: Record<ItemStatus, string> = { needs_confirmation: 'Потр
 const STATUS_SHORT: Record<ItemStatus, string> = { needs_confirmation: 'звірити', confirmed: 'моя річ', inactive: 'неактуальна' };
 const STATUS_TONE: Record<ItemStatus, string> = { needs_confirmation: 'warn', confirmed: 'ok', inactive: '' };
 const CATS = Object.keys(CATEGORY_LABEL) as Category[];
+
+const duplicateTarget = (items: Item[], item: Item) => item.possibleDuplicateOf
+  ? items.find((x) => x.id === item.possibleDuplicateOf && !x.mergedInto && x.status !== 'inactive')
+  : undefined;
 
 function usePackshotState() {
   const db = useDb();
@@ -32,17 +36,50 @@ function usePackshotState() {
  */
 function ItemPage({ item }: { item: Item }) {
   const db = useDb();
-  const { act } = useApp();
+  const { act, refresh } = useApp();
   const busy = usePackshotState();
   const [editing, setEditing] = useState(false);
-  const photos = item.photoIds.map((id) => db.photos.find((p) => p.id === id)).filter(Boolean) as typeof db.photos;
+  const [picking, setPicking] = useState(false);
+  const [attaching, setAttaching] = useState(false);
+  const [resolving, setResolving] = useState(false);
+  const photos = item.photoIds.flatMap((id) => db.photos.filter((p) => p.id === id));
   const { art, photo } = itemArt(db, item.id);
   const main = art ?? photo;
+  const dupTarget = duplicateTarget(db.items, item);
+  const dupArt = dupTarget && itemArt(db, dupTarget.id);
+  const dupPath = dupArt?.art ?? dupArt?.photo;
   const { looks, capsules } = itemPlacements(db, item.id);
   const covers = db.needs.filter((n) => n.coveredByItem === item.id);
   const verdict = itemVerdict(db, item);
   const patch = (body: Record<string, unknown>, msg: string) => act(() => api('PATCH', `/api/items/${item.id}`, { rev: item.rev, ...body }), msg);
   const notWorn = () => void patch({ status: 'inactive' }, t('Прибрано в «Неактуальні»'));
+  const confirmSeparate = () => patch({
+    ...(item.status === 'needs_confirmation' ? { status: 'confirmed' } : {}),
+    ...(item.possibleDuplicateOf ? { clearDuplicate: true } : {}),
+  }, t(item.status === 'needs_confirmation' ? 'Моя річ' : 'Збережено'));
+  const resolveDuplicate = async (target?: Item) => {
+    setResolving(true);
+    if (target) {
+      const ok = await act(() => api('POST', `/api/items/${target.id}/absorb`, { sourceId: item.id }), t('Фото прикріплено'));
+      if (ok) go(`/wardrobe/${target.id}`);
+    } else {
+      await confirmSeparate();
+    }
+    setResolving(false);
+  };
+  const attachable = (p: Photo) => p.source !== 'generated' && p.kind !== 'worn' && !p.inspiration && !p.archivedAt && !item.photoIds.includes(p.id);
+  const attachPhotos = async (ids: string[]) => {
+    setPicking(false);
+    const pending = ids.filter((id) => db.photos.some((p) => p.id === id && attachable(p)));
+    if (!pending.length) return;
+    setAttaching(true);
+    const ok = await act(async () => {
+      for (const id of pending) await api('PATCH', `/api/photos/${id}`, { attachItemId: item.id });
+      return true;
+    }, t('Фото прикріплено'));
+    if (!ok) await refresh(); // Earlier photos may already have been attached.
+    setAttaching(false);
+  };
   const findLooks = async () => {
     const ok = await act(() => api('POST', '/api/discover', { itemIds: [item.id] }), t('Підбираю образи з цією річчю'));
     if (ok) go(`/capsules?tab=new&item=${encodeURIComponent(item.id)}`);
@@ -81,15 +118,32 @@ function ItemPage({ item }: { item: Item }) {
             <a key={p.id} className="item-thumb" href={media(p.path)} target="_blank" rel="noreferrer"><img src={thumb(p.path, 240)} alt="" loading="lazy" /></a>
           ))}
           <UploadButton kind="item" params={{ item: item.id }} className="item-thumb add" label="" />
+          <button className="quiet-toggle item-photo-picker" disabled={attaching || !db.photos.some(attachable)} onClick={() => setPicking(true)}>{t('З моїх фото')}</button>
         </div>
       </div>
 
-      {item.status === 'needs_confirmation' && (
+      {dupTarget && (
+        <div className="its-me duplicate-review">
+          <a className="row" href={`/wardrobe/${dupTarget.id}`}>
+            <span className="item-thumb">{dupPath ? <img src={thumb(dupPath, 160)} alt="" /> : <CategoryIcon category={dupTarget.category} />}</span>
+            {t('Можливо, це «{title}»', { title: dupTarget.title })}
+          </a>
+          <div className="row wrap">
+            <button className="btn sm primary" disabled={resolving} onClick={() => void resolveDuplicate(dupTarget)}>{t('Додати фото до «{title}»', { title: dupTarget.title })}</button>
+            <button className="quiet-toggle" disabled={resolving} onClick={() => void resolveDuplicate()}>{t('Це окрема річ')}</button>
+            {item.status === 'needs_confirmation' && <>
+              <button className="quiet-toggle" disabled={resolving} onClick={notWorn}>{t('Не ношу')}</button>
+              <DeleteItem item={item} className="btn">{t('Не моя')}</DeleteItem>
+            </>}
+          </div>
+        </div>
+      )}
+      {!dupTarget && item.status === 'needs_confirmation' && (
         <div className="its-me">
           <span>{t('Це моя річ?')}</span>
           <DeleteItem item={item} className="btn">{t('Не моя')}</DeleteItem>
           <button className="btn" onClick={notWorn}>{t('Не ношу')}</button>
-          <button className="btn primary" onClick={() => void patch({ status: 'confirmed' }, t('Моя річ'))}><Check size={15} /> {t('Ношу')}</button>
+          <button className="btn primary" onClick={() => void confirmSeparate()}><Check size={15} /> {t('Ношу')}</button>
         </div>
       )}
       {item.status === 'confirmed' && (
@@ -128,7 +182,8 @@ function ItemPage({ item }: { item: Item }) {
       {covers.map((n) => (
         <a key={n.id} className="small muted" style={{ display: 'block', marginTop: 16 }} href={`/shopping?need=${n.id}`}>{t('Закриває покупку «{title}»', { title: n.title })}</a>
       ))}
-      {editing && <ItemEdit item={item} onClose={() => setEditing(false)} />}
+      {picking && <PhotoPicker title={t('З моїх фото')} selected={[]} filter={attachable} onClose={() => setPicking(false)} onSave={attachPhotos} />}
+      {editing && <ItemEdit item={item} photos={photos} onClose={() => setEditing(false)} />}
     </div>
   );
 }
@@ -152,37 +207,57 @@ function DeleteItem({ item, className, children }: { item: Item; className: stri
 }
 
 /** Everything editable about an item, in one modal behind the pencil. */
-function ItemEdit({ item, onClose }: { item: Item; onClose: () => void }) {
+function ItemEdit({ item, photos, onClose }: { item: Item; photos: Photo[]; onClose: () => void }) {
   const db = useDb();
   const { act } = useApp();
   const [sport, setSport] = useState(Boolean(item.sport));
-  const originals = item.origin === 'merge' ? item.photoIds.flatMap((id) => db.photos.filter((photo) => photo.id === id)) : [];
-  const covers = item.origin === 'merge' ? itemCoverOptions(db, [item]) : [];
-  const [primary, setPrimary] = useState(originals[0]?.id);
-  const [cover, setCover] = useState(covers[0]?.id);
+  const covers = itemCoverOptions(db, [item]);
+  const [primaryChoice, setPrimary] = useState<string>();
+  const [coverChoice, setCover] = useState<string>();
+  const primary = photos.find((p) => p.id === primaryChoice)?.id ?? photos[0]?.id;
+  const cover = covers.find((p) => p.id === coverChoice)?.id ?? covers[0]?.id;
+  // Replacing photoIds on the server would drop archived or worn links from older items.
+  const canReorder = photos.every((p) => !p.archivedAt && p.kind !== 'worn');
+  const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({ title: item.title, category: item.category, color: item.color ?? '', brand: item.brand ?? '', model: item.model ?? '', composition: item.composition ?? '', fit: item.fit ?? '', size: item.size ?? '' });
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) => setForm((f) => ({ ...f, [k]: e.target.value }));
   const field = (k: keyof typeof form, label: string) => (
     <label className="field"><span>{t(label)}</span><input className="input" value={form[k]} onChange={set(k)} /></label>
   );
   const save = async () => {
+    setSaving(true);
     const pictures = {
-      ...(primary && primary !== item.photoIds[0] ? { photoIds: primaryPhotoFirst(item.photoIds, primary) } : {}),
+      ...(canReorder && primary && primary !== item.photoIds[0] ? { photoIds: primaryPhotoFirst(item.photoIds, primary) } : {}),
       ...(cover && cover !== item.packshotId ? { packshotId: cover } : {}),
     };
     const ok = await act(() => api('PATCH', `/api/items/${item.id}`, { rev: item.rev, ...form, sport, ...pictures }), t('Збережено'));
+    setSaving(false);
     if (ok) onClose();
+  };
+  const detach = async (photoId: string) => {
+    setSaving(true);
+    await act(() => api('PATCH', `/api/photos/${photoId}`, { detachItemId: item.id }), t('Фото відкріплено'));
+    setSaving(false);
+  };
+  const split = async (photoId: string) => {
+    setSaving(true);
+    const part = await act(() => api<Item>('POST', `/api/items/${item.id}/split`, { rev: item.rev, photoIds: [photoId] }), t('Річ додано'));
+    setSaving(false);
+    if (part) {
+      onClose();
+      go(`/wardrobe/${part.id}`);
+    }
   };
   return (
     <Modal
       title={t('Річ')}
-      onClose={onClose}
+      onClose={() => { if (!saving) onClose(); }}
       footer={
         <>
           <DeleteItem item={item} className="btn ghost danger"><Trash2 size={14} /> {t('Видалити річ')}</DeleteItem>
-          <button className="btn ghost" onClick={() => void act(() => api('POST', '/api/packshots', { itemIds: [item.id], run: true }), t('Нове фото речі в роботі'))}><Wand2 size={14} /> {t('Нове фото')}</button>
+          <button className="btn ghost" disabled={saving} onClick={() => void act(() => api('POST', '/api/packshots', { itemIds: [item.id], run: true }), t('Нове фото речі в роботі'))}><Wand2 size={14} /> {t('Нове фото')}</button>
           <span style={{ flex: 1 }} />
-          <button className="btn primary" onClick={() => void save()}>{t('Зберегти')}</button>
+          <button className="btn primary" disabled={saving} onClick={() => void save()}>{t('Зберегти')}</button>
         </>
       }
     >
@@ -201,20 +276,30 @@ function ItemEdit({ item, onClose }: { item: Item; onClose: () => void }) {
         {field('composition', 'Склад')}
         {field('fit', 'Крій')}
         <label className="row"><input type="checkbox" checked={sport} onChange={(event) => setSport(event.target.checked)} /> {t('Спорт')}</label>
-        {covers.length > 1 && <PhotoChoices title={t('Каталожна обкладинка')} photos={covers} selected={cover} onSelect={setCover} />}
-        {originals.length > 1 && <PhotoChoices title={t('Основне фото')} photos={originals} selected={primary} onSelect={setPrimary} />}
+        {covers.length > 1 && <PhotoChoices title={t('Каталожна обкладинка')} photos={covers} selected={cover} onSelect={setCover} disabled={saving} />}
+        {photos.length > 1 && <PhotoChoices title={t('Основне фото')} photos={photos} selected={primary} onSelect={setPrimary} disabled={saving || !canReorder} />}
+        {photos.length > 0 && <div className="field full">
+          <span>{t('Фото речі')}</span>
+          <div className="item-photo-list">
+            {photos.map((p) => <div className="row" key={p.id} role="group" aria-label={p.originalName}>
+              <span className="item-thumb"><img src={thumb(p.path, 160)} alt="" loading="lazy" /></span>
+              <button className="quiet-toggle" disabled={saving} onClick={() => void detach(p.id)}>{t('Відкріпити')}</button>
+              {photos.length >= 2 && <button className="quiet-toggle" disabled={saving} onClick={() => void split(p.id)}>{t('В окрему річ')}</button>}
+            </div>)}
+          </div>
+        </div>}
       </div>
     </Modal>
   );
 }
 
-function PhotoChoices({ title, photos, selected, onSelect }: { title: string; photos: Photo[]; selected?: string; onSelect: (id: string) => void }) {
+function PhotoChoices({ title, photos, selected, onSelect, disabled }: { title: string; photos: Photo[]; selected?: string; onSelect: (id: string) => void; disabled?: boolean }) {
   return (
     <div className="field full">
       <span>{title}</span>
       <div className="item-thumbs" role="group" aria-label={title}>
         {photos.map((photo) => (
-          <button key={photo.id} type="button" className="item-thumb" aria-label={photo.originalName} aria-pressed={selected === photo.id} onClick={() => onSelect(photo.id)}>
+          <button key={photo.id} type="button" className="item-thumb" aria-label={photo.originalName} aria-pressed={selected === photo.id} disabled={disabled} onClick={() => onSelect(photo.id)}>
             <img src={thumb(photo.path, 240)} alt="" />
             {selected === photo.id && <span className="tr sel-box"><Check size={14} /></span>}
           </button>
@@ -235,7 +320,8 @@ function MergeItems({ ids, onClose, onMerged }: { ids: string[]; onClose: () => 
   const [saving, setSaving] = useState(false);
   const merge = async () => {
     setSaving(true);
-    const item = await act(() => api<Item>('POST', '/api/items/merge', { ids, primaryPhotoId: primary, packshotId: cover }), t('Дублікати обʼєднано, джерела збережено'));
+    const targetId = sources.find((item) => item.status === 'confirmed')?.id ?? sources[0]?.id;
+    const item = await act(() => api<Item>('POST', '/api/items/merge', { ids, targetId, primaryPhotoId: primary, packshotId: cover }), t('Дублікати обʼєднано, джерела збережено'));
     setSaving(false);
     if (item) onMerged(item.id);
   };
@@ -327,7 +413,7 @@ export function WardrobePage({ openId }: { openId?: string }) {
   const missing = db.items.filter((i) => !i.packshotId && i.status !== 'inactive' && !busy.has(i.id)).length;
   const title = t(view === 'new' ? 'Нові з фото' : sport ? 'Спорт' : cat ? CATEGORY_LABEL[cat] : status ? STATUS_LABEL[status] : 'Усі речі');
   // An item opens as its own page, not a side panel over the grid.
-  if (open) return <ItemPage item={open} />;
+  if (open) return <ItemPage key={open.id} item={open} />;
 
   return (
     <div className="page">
@@ -393,6 +479,7 @@ export function WardrobePage({ openId }: { openId?: string }) {
                 const selected = mergeSel?.includes(i.id);
                 const st = busy.get(i.id);
                 const usage = mergeSel ? null : itemPlacements(db, i.id, ready);
+                const duplicate = duplicateTarget(visible, i);
                 return (
                   <button
                     key={i.id}
@@ -401,8 +488,9 @@ export function WardrobePage({ openId }: { openId?: string }) {
                   >
                     <div className="img">
                       {art ? <img src={thumb(art, 480)} alt={i.title} loading="lazy" /> : photo ? <img className="photo" src={thumb(photo, 480)} alt={i.title} loading="lazy" /> : <CategoryIcon category={i.category} size={22} />}
-                      {i.status !== 'needs_confirmation' && <span className="tl"><Badge tone={`${STATUS_TONE[i.status]} glass`}>{t(STATUS_SHORT[i.status])}</Badge></span>}
-                      {i.origin === 'intake' && i.status === 'needs_confirmation' && <span className="tl"><Badge tone="info glass">{t('нова')}</Badge></span>}
+                      {duplicate ? <span className="tl"><Badge tone="warn glass">{t('дублікат?')}</Badge></span>
+                        : i.status !== 'needs_confirmation' ? <span className="tl"><Badge tone={`${STATUS_TONE[i.status]} glass`}>{t(STATUS_SHORT[i.status])}</Badge></span>
+                        : isNew(i) && <span className="tl"><Badge tone="info glass">{t('нова')}</Badge></span>}
                       {mergeSel && <span className="tr sel-box">{selected && <Check size={14} />}</span>}
                       {st?.state === 'running' && <JobBar job={st} />}
                     </div>

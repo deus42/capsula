@@ -117,6 +117,11 @@ async function imaging<T>(mode: 'preview' | 'crop' | 'sheet', dir: string, reque
   return stdout.trim() ? JSON.parse(stdout) as T : undefined;
 }
 
+export async function buildContactSheet(dir: string, sources: string[], destination: string) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+  await imaging('sheet', dir, { sources, destination });
+}
+
 function validCrop(slot: SnapshotSlot, resolve: (p: string) => string): Crop | undefined {
   const [file, source] = slot.photoHashes ?? [];
   if (!file || !source || file.path !== slot.photoPaths[0]) return;
@@ -212,7 +217,6 @@ export async function fitGarmentCards(slots: SnapshotSlot[], limit: number, dir:
   if (cards.length <= limit) return cards;
   const direct = cards.slice(0, limit - 1);
   const grouped = cards.slice(limit - 1);
-  fs.mkdirSync(path.dirname(sheet), { recursive: true, mode: 0o700 });
-  await imaging('sheet', dir, { sources: grouped.map((c) => c.file), destination: sheet });
+  await buildContactSheet(dir, grouped.map((c) => c.file), sheet);
   return [...direct, ...grouped.map((c, i) => ({ slotIndex: c.slotIndex, file: sheet, card: i + 1 }))];
 }

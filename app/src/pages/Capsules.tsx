@@ -230,13 +230,15 @@ function EditCapsule({ capsule, onClose }: { capsule: Capsule; onClose: () => vo
   // The set (owner, 20.11) is sent only when it changed, so renaming never trips over an unsaved, too-large set.
   const [initialSet] = useState(() => initialSetDraft(db, capsule));
   const [setDraft, setSetDraft] = useState(initialSet);
+  const [multi, setMulti] = useState(capsule.accessoryLimit === 4);
   const [name, setName] = useState(capsule.name);
   const [description, setDescription] = useState(capsule.description);
   const [season, setSeason] = useState<Season>(capsule.season);
   const [situations, setSituations] = useState(capsule.situations.join('\n'));
   const save = async () => {
     const set = !isSelection && !sameSetDraft(setDraft, initialSet) ? setDraftPayload(setDraft) : {};
-    const ok = await act(() => api('PATCH', `/api/capsules/${capsule.id}`, { rev: capsule.rev, name, description, season, situations: situations.split('\n'), ...set }), t('Збережено'));
+    const limit = isSelection ? {} : { accessoryLimit: multi ? 4 : null };
+    const ok = await act(() => api('PATCH', `/api/capsules/${capsule.id}`, { rev: capsule.rev, name, description, season, situations: situations.split('\n'), ...limit, ...set }), t('Збережено'));
     if (ok) onClose();
   };
   return (
@@ -272,7 +274,10 @@ function EditCapsule({ capsule, onClose }: { capsule: Capsule; onClose: () => vo
           </select>
         </label>
         <label className="field full"><span>{t('Ситуації (по рядку)')}</span><textarea className="textarea" value={situations} onChange={(e) => setSituations(e.target.value)} /></label>
-        {!isSelection && <CapsuleSetEditor capsule={capsule} draft={setDraft} onChange={setSetDraft} />}
+        {!isSelection && <>
+          <label className="row full"><input type="checkbox" checked={multi} onChange={(event) => setMulti(event.target.checked)} /> {t('4 аксесуари (мультиспорт)')}</label>
+          <CapsuleSetEditor capsule={{ ...capsule, accessoryLimit: multi ? 4 : undefined }} draft={setDraft} onChange={setSetDraft} />
+        </>}
       </div>
     </Modal>
   );

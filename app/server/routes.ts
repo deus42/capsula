@@ -2,13 +2,14 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import type { Capsule, DB, Item, Job, Look, Need, Photo, PhotoKind, ReworkReason, SlotKey, SlotRef, Slots, SnapshotSlot, Language, WardrobeFocus, Wear } from './schema.ts';
-import { CATEGORIES, ITEM_STATUSES, LANGUAGES, MEASURE_KEYS, PHOTO_KINDS, REWORK_REASONS, SEASONS, SLOT_KEYS, WARDROBE_FOCUS } from './schema.ts';
+import { CATEGORIES, ITEM_STATUSES, LANGUAGES, MEASURE_KEYS, PERIODS, PHOTO_KINDS, REWORK_REASONS, SEASONS, SLOT_KEYS, WARDROBE_FOCUS } from './schema.ts';
 import type { Store } from './store.ts';
 import { HttpError, bump, findOr404, newId, now } from './store.ts';
 import { folderBytesAsync, prewarm, saveUpload, type StorageLimits } from './media.ts';
 import { pickTheme } from './analysis.ts';
 import { acceptSuggestion, dropReplacementsFor, keepItem, queueAdvice, rememberDeclined } from './advisor.ts';
 import { looksNeedingRender } from '../src/render-need.ts';
+import { pieceSetError } from '../src/capsule-pieces.ts';
 import { itemCoverOptions, primaryPhotoFirst } from '../src/item-images.ts';
 import { hasPieces, isBlockedEyewear, resolveRef } from '../src/lib.ts';
 import { productKey, queueStoreFind } from './shop-search.ts';
@@ -19,13 +20,15 @@ import { queueDiscover } from './discover.ts';
 import { sameIdentity } from './identity.ts';
 import { assertLookFits, placeLook, replaceInSets, requireParentCapsule, setCapsulePieces, stripFromSets } from './capsule-membership.ts';
 import { MAX_WEAR_PHOTOS, newWearId, queueWearReview, reviewPending, wearRender } from './wear-review.ts';
+import { approveIdentityDraft, queueIdentityPrep } from './identity-prep.ts';
+import { approveCapsules, approveSets, queueCapsuleMatch, queueCapsulePlan, type ApprovedSetInput } from './onboarding.ts';
 
 type Body = Record<string, unknown>;
 export interface Ctx {
   store: Store;
   projectRoot: string;
   drain: () => void;
-  /** False when this account cannot use AI. */
+  /** False when try-ons must be started explicitly. */
   autoTryOn?: boolean;
   /** Accounts mode: refuses AI work beyond this month's allowance or while the budget is spent (429). */
   admit?: (kind: QuotaKind, n?: number) => void;
@@ -82,7 +85,7 @@ export function snapshotSlots(db: DB, slots: Slots): SnapshotSlot[] {
       if (ref.kind === 'item') {
         const item = findOr404(db.items, ref.id, 'Річ');
         const usable = item.photoIds.map((pid) => findOr404(db.photos, pid, 'Фото'))
-          .filter((p) => !p.inspiration && p.kind !== 'label' && p.referenceRole !== 'face');
+          .filter((p) => !p.archivedAt && !p.inspiration && p.kind !== 'label' && p.referenceRole !== 'face');
         const real = usable.filter((p) => p.source !== 'generated');
         // A bought item keeps its shop photo until the owner photographs it: the photo its product slot used.
         const photos = (real.length ? real : usable.filter((p) => p.kind === 'product')).slice(-4).map((p) => p.path);
@@ -97,7 +100,8 @@ export function snapshotSlots(db: DB, slots: Slots): SnapshotSlot[] {
       } else {
         const p = findOr404(db.products, ref.id, 'Товар');
         const photo = p.photoId ? findOr404(db.photos, p.photoId, 'Фото') : undefined;
-        const originals = photo?.kind === 'product' && !photo.inspiration ? [photo.path] : [];
+        const garmentUpload = photo?.source === 'upload' && (photo.kind === 'item' || photo.kind === 'detail');
+        const originals = photo && !photo.inspiration && !photo.referenceRole && !photo.archivedAt && (photo.kind === 'product' || garmentUpload) ? [photo.path] : [];
         out.push({ slot, kind: 'product', id: p.id, title: `${p.brand} ${p.model}`.trim(), description: [p.composition, p.fit].filter(Boolean).join(', '), owned: false, photoPaths: [], originalPhotoPaths: originals });
       }
     }
@@ -107,7 +111,7 @@ export function snapshotSlots(db: DB, slots: Slots): SnapshotSlot[] {
 
 export function createJob(db: DB, look: Look, basePhotoIds: string[], instructions: string, retryOf?: string, frozen?: Job['snapshot']): Job {
   const identity = db.profile.identity;
-  const selectedIds = identity ? [identity.sourcePhotoId] : basePhotoIds;
+  const selectedIds = identity ? [identity.sourcePhotoId] : basePhotoIds.filter((id) => !db.photos.find((p) => p.id === id)?.archivedAt);
   const basePaths = identity ? [identity.face.path, identity.body.path, ...(identity.hair ? [identity.hair.crop.path] : [])] : selectedIds.map((id) => findOr404(db.photos, id, 'Базове фото').path);
   const snapshot = structuredClone(frozen ?? { lookName: look.name, slots: snapshotSlots(db, look.slots), basePhotoIds: selectedIds, basePhotoPaths: basePaths, identity });
   const job: Job = { id: newId('J'), lookId: look.id, lookVersion: frozen ? (db.jobs.find((j) => j.id === retryOf)?.lookVersion ?? look.version) : look.version, snapshot, instructions, state: 'queued', origin: 'site', retryOf, createdAt: now() };
@@ -132,7 +136,7 @@ const ITEM_SLOT: Record<Item['category'], SlotKey> = { outerwear: 'layer', knitw
 
 function packshotSources(db: DB, item: Item): string[] {
   const photos = item.photoIds.map((id) => findOr404(db.photos, id, 'Фото'))
-    .filter((photo) => !photo.inspiration && photo.referenceRole !== 'face' && !['label', 'packshot', 'worn'].includes(photo.kind));
+    .filter((photo) => !photo.archivedAt && !photo.inspiration && photo.referenceRole !== 'face' && !['label', 'packshot', 'worn'].includes(photo.kind));
   const own = photos.filter((photo) => photo.kind !== 'product' && photo.source !== 'generated');
   return (own.length ? own : photos.filter((photo) => photo.kind === 'product')).slice(0, 3).map((photo) => photo.path);
 }
@@ -160,7 +164,7 @@ export function queueMissingItemPackshots(db: DB, itemIds: string[]): number {
   let queued = 0;
   for (const id of new Set(itemIds)) {
     const item = db.items.find((candidate) => candidate.id === id);
-    if (!item || item.status === 'inactive' || item.mergedInto || item.packshotId || activeIds.has(id) || !packshotSources(db, item).length) continue;
+    if (!item || item.status === 'inactive' || item.mergedInto || item.possibleDuplicateOf || item.packshotId || activeIds.has(id) || !packshotSources(db, item).length) continue;
     packshotJob(db, { itemId: id });
     queued += 1;
   }
@@ -311,60 +315,97 @@ async function checkStorage(ctx: Ctx, limits: StorageLimits, bytes: number) {
   if ((await folderBytesAsync(ctx.store.dataDir)) + bytes > limits.storageBytes) throw new HttpError(413, `Місце закінчилося: ${Math.round(limits.storageBytes / 1024 ** 3)} ГБ на акаунт`);
 }
 
-export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, filename: string) {
+function parseIntakeIntent(value: unknown): NonNullable<Job['intakeIntent']> {
+  if (value === undefined || value === null || value === 'auto') return 'auto';
+  if (value === 'person' || value === 'garments') return value;
+  throw new HttpError(400, 'Невідомий намір розпізнавання фото');
+}
+
+function intakeJob(db: DB, photo: Photo, intakeIntent: NonNullable<Job['intakeIntent']>, instructions: string, batch = false) {
+  const job: Job = { id: newId('J'), kind: 'intake', inputPhotoIds: [photo.id], intakeIntent, ...(batch ? { batch } : {}), lookVersion: 0, snapshot: { lookName: photo.originalName, slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions, state: 'queued', origin: 'site', createdAt: now() };
+  db.jobs.push(job);
+  return job;
+}
+
+// Serialize identical uploads from the same wardrobe, including asynchronous HEIC conversion.
+const pendingUploads = new Map<string, Promise<Photo>>();
+
+export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, filename: string): Promise<Photo> {
   const intake = query.get('kind') === 'intake';
   const kind = (intake ? 'item' : (query.get('kind') ?? 'item')) as PhotoKind;
   if (!PHOTO_KINDS.includes(kind) || kind === 'source' || kind === 'packshot') throw new HttpError(400, 'Невідомий тип фото');
-  // A photo of a worn look is kept once: the same file chosen again (a retry after a reload) is the same photo.
-  const worn = kind === 'worn';
-  const sha256 = worn ? createHash('sha256').update(buf).digest('hex') : undefined;
-  const known = (db: DB) => (worn ? db.photos.find((p) => p.kind === 'worn' && p.sha256 === sha256) : undefined);
-  const existing = known(ctx.store.read());
-  if (existing) return existing;
-  if (ctx.limits) await checkStorage(ctx, ctx.limits, buf.length);
-  if (intake) ctx.admit?.('intake');
-  const id = newId('P');
-  const saved = await saveUpload(ctx.projectRoot, ctx.store.dataDir, id, buf);
-  prewarm(ctx.projectRoot, ctx.store.dataDir, [saved.path]);
-  // A worn photo is never a garment or product source.
-  const itemId = worn ? null : query.get('item');
-  const productId = worn ? null : query.get('product');
-  let queuedPackshot = false;
-  let duplicate = false;
-  return ctx.store.mutate((db) => {
-    const same = known(db);
-    if (same) {
-      duplicate = true;
-      return same;
+  const intent = intake ? parseIntakeIntent(query.get('intent')) : 'auto';
+  const sha256 = createHash('sha256').update(buf).digest('hex');
+  const key = `${ctx.store.dataDir}:${kind === 'worn'}:${sha256}`;
+  const previous = pendingUploads.get(key);
+  const run = (async () => {
+    await previous?.catch(() => undefined);
+    const worn = kind === 'worn';
+    const known = (db: DB) => db.photos.find((p) => p.sha256 === sha256 && (worn ? p.kind === 'worn' : p.kind !== 'worn' && p.source !== 'generated'));
+    const id = newId('P');
+    let queued = false;
+    const apply = (db: DB, saved?: Awaited<ReturnType<typeof saveUpload>>) => {
+      let photo = known(db);
+      if (!photo) {
+        if (!saved) return;
+        photo = { id, kind, ...saved, originalName: path.basename(filename || 'upload').slice(0, 200), source: 'upload', preserveAsReference: true, meetsStandard: kind === 'base' ? null : undefined, sha256, createdAt: now() };
+        db.photos.push(photo);
+      }
+      delete photo.archivedAt;
+      if (worn) return photo;
+      if (kind === 'base') {
+        photo.kind = 'base';
+        if (query.get('role') === 'face') photo.referenceRole = 'face';
+        selectBasePhoto(db, photo.id);
+      }
+      const itemId = query.get('item');
+      if (itemId) {
+        const item = findOr404(db.items, itemId, 'Річ');
+        if (attachItemPhoto(item, photo) && !intake && kind === 'item') {
+          clearStaleCrop(item, photo);
+          queued = queueMissingItemPackshots(db, [itemId]) > 0;
+        }
+      }
+      const productId = query.get('product');
+      if (productId) {
+        const product = findOr404(db.products, productId, 'Товар');
+        if (product.photoId !== photo.id) {
+          product.photoId = photo.id;
+          bump(product, undefined);
+        }
+      }
+      if (intake && (query.get('reanalyze') === '1' || !db.jobs.some((j) =>
+        j.kind === 'intake' && j.inputPhotoIds?.includes(photo.id) && ['queued', 'running', 'done'].includes(j.state)))) {
+        ctx.admit?.('intake');
+        intakeJob(db, photo, intent, str(query.get('note')) ?? '', query.get('batch') === '1');
+        queued = true;
+      }
+      return photo;
+    };
+
+    const existing = known(ctx.store.read());
+    if (worn && existing && !existing.archivedAt) return existing;
+    let photo = existing ? await ctx.store.mutate((db) => apply(db)) : undefined;
+    if (!photo) {
+      if (ctx.limits) await checkStorage(ctx, ctx.limits, buf.length);
+      const saved = await saveUpload(ctx.projectRoot, ctx.store.dataDir, id, buf);
+      try {
+        photo = (await ctx.store.mutate((db) => apply(db, saved)))!;
+      } finally {
+        // Another process may have registered the same bytes while this request saved them.
+        if (photo?.id !== id) for (const rel of [saved.path, saved.originalPath]) if (rel) fs.rmSync(path.join(ctx.projectRoot, rel), { force: true });
+      }
+      if (photo.id === id) prewarm(ctx.projectRoot, ctx.store.dataDir, [saved.path]);
     }
-    const photo: Photo = { id, kind, path: saved.path, originalPath: saved.originalPath, originalName: path.basename(filename || 'upload').slice(0, 200), source: 'upload', preserveAsReference: true, meetsStandard: kind === 'base' ? null : undefined, ...(sha256 ? { sha256 } : {}), createdAt: now() };
-    db.photos.push(photo);
-    if (kind === 'base') {
-      db.profile.basePhotoIds.push(id);
-      db.profile.rev += 1;
-    }
-    if (itemId) {
-      const item = findOr404(db.items, itemId, 'Річ');
-      item.photoIds.push(id);
-      bump(item, undefined);
-      history(item, 'photo_added', `${kind}: ${photo.originalName}`);
-      if (!intake && kind === 'item') queuedPackshot = queueMissingItemPackshots(db, [itemId]) > 0;
-    }
-    if (productId) {
-      const p = findOr404(db.products, productId, 'Товар');
-      p.photoId = id;
-      bump(p, undefined);
-    }
-    if (intake) {
-      db.jobs.push({ id: newId('J'), kind: 'intake', inputPhotoIds: [id], lookVersion: 0, snapshot: { lookName: photo.originalName, slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: str(query.get('note')) ?? '', state: 'queued', origin: 'site', createdAt: now() });
-    }
+    if (queued && query.get('run') !== '0') ctx.drain();
     return photo;
-  }).then((photo) => {
-    // Two requests with the same file at once: the second copy on disk is dropped.
-    if (duplicate) for (const rel of [saved.path, saved.originalPath]) if (rel) fs.rmSync(path.join(ctx.projectRoot, rel), { force: true });
-    if ((intake || queuedPackshot) && query.get('run') !== '0') ctx.drain();
-    return photo;
-  });
+  })();
+  pendingUploads.set(key, run);
+  try {
+    return await run;
+  } finally {
+    if (pendingUploads.get(key) === run) pendingUploads.delete(key);
+  }
 }
 
 // ── Deletion with cascades (validateDb rejects anything left dangling) ────
@@ -426,6 +467,7 @@ export function deleteCapsule(db: DB, id: string) {
     if (other.redirectCapsuleIds?.includes(id)) other.redirectCapsuleIds = other.redirectCapsuleIds.filter((target) => target !== id);
   }
   for (const j of db.jobs) if (j.capsuleId === id) delete j.capsuleId;
+  if (db.onboarding?.matchDrafts) db.onboarding.matchDrafts = db.onboarding.matchDrafts.filter((m) => m.capsuleId !== id);
   db.capsules = db.capsules.filter((x) => x.id !== id);
 }
 
@@ -464,6 +506,14 @@ export function deleteItem(db: DB, id: string) {
     delete n.coveredByItem;
     n.status = 'open';
   }
+  if (db.onboarding?.matchDrafts) {
+    for (const m of db.onboarding.matchDrafts) {
+      m.ownedItemIds = m.ownedItemIds.filter((x) => x !== id);
+      m.baseItemIds = m.baseItemIds.filter((x) => x !== id);
+    }
+  }
+  if (db.onboarding?.unmatchedItemIds) db.onboarding.unmatchedItemIds = db.onboarding.unmatchedItemIds.filter((x) => x !== id);
+  for (const other of db.items) if (other.possibleDuplicateOf === id) delete other.possibleDuplicateOf;
   db.items = db.items.filter((i) => i.id !== id);
 }
 
@@ -484,6 +534,31 @@ function manualItem(category: Item['category'], fields: Body, photoIds: string[]
 
 function clearDetachedCrop(db: DB, item: Item) {
   if (item.tryonReference && !item.photoIds.some((id) => db.photos.some((p) => p.id === id && p.path === item.tryonReference!.source.path))) delete item.tryonReference;
+}
+
+function clearStaleCrop(item: Item, photo: Photo) {
+  if (item.tryonReference && item.tryonReference.source.path !== photo.path && photo.source !== 'generated'
+    && !photo.inspiration && !photo.referenceRole && photo.kind !== 'product' && photo.kind !== 'label') delete item.tryonReference;
+}
+
+function attachItemPhoto(item: Item, photo: Photo) {
+  if (item.photoIds.includes(photo.id)) return false;
+  item.photoIds.push(photo.id);
+  bump(item, undefined);
+  history(item, 'photo_added', `${photo.kind}: ${photo.originalName}`);
+  return true;
+}
+
+function selectBasePhoto(db: DB, id: string) {
+  if (db.profile.basePhotoIds.includes(id)) return;
+  db.profile.basePhotoIds.push(id);
+  db.profile.rev += 1;
+}
+
+function removeBasePhoto(db: DB, id: string) {
+  if (!db.profile.basePhotoIds.includes(id)) return;
+  db.profile.basePhotoIds = db.profile.basePhotoIds.filter((photoId) => photoId !== id);
+  db.profile.rev += 1;
 }
 
 on('POST', '/api/items', async (ctx, _p, b) => {
@@ -510,7 +585,7 @@ on('PATCH', '/api/items/:id', async (ctx, [id], b) => {
     if (b.status && ITEM_STATUSES.includes(b.status as never)) item.status = b.status as Item['status'];
     // «Це моя річ? — Ні»: a rejected item no longer covers a recommendation; its looks get the stand-in back.
     if (item.status === 'inactive' && before !== 'inactive') for (const n of db.needs) if (n.coveredByItem === item.id && n.status === 'covered' && !db.products.some((p) => p.needId === n.id && p.status === 'purchased')) uncoverNeed(db, n.id);
-    if (Array.isArray(b.photoIds)) item.photoIds = (b.photoIds as string[]).filter((pid) => db.photos.some((p) => p.id === pid && p.kind !== 'worn'));
+    if (Array.isArray(b.photoIds)) item.photoIds = (b.photoIds as string[]).filter((pid) => db.photos.some((p) => p.id === pid && p.kind !== 'worn' && !p.archivedAt));
     if (b.packshotId !== undefined) {
       const cover = itemCoverOptions(db, [item]).find((photo) => photo.id === b.packshotId);
       if (!cover) throw new HttpError(400, 'Вибери каталожне зображення цієї речі');
@@ -520,8 +595,96 @@ on('PATCH', '/api/items/:id', async (ctx, [id], b) => {
     if (!item.title) throw new HttpError(400, 'Назва не може бути порожньою');
     history(item, before !== item.status ? `status:${item.status}` : 'edited');
     if (item.status === 'inactive') dropReplacementsFor(db, item.id);
+    if (b.clearDuplicate === true) {
+      delete item.possibleDuplicateOf;
+      queueMissingItemPackshots(db, [item.id]);
+    }
     queueAdvice(db, `Змінено річ: ${item.title}`);
     return item;
+  });
+  ctx.drain();
+  return out;
+});
+
+const MERGE_FIELDS = ['brand', 'model', 'color', 'size', 'fit', 'composition'] as const;
+
+function repointMergedItems(db: DB, ids: string[], target: Item) {
+  replaceRefs(db, (r) => r.kind === 'item' && ids.includes(r.id), { kind: 'item', id: target.id }, `Обʼєднання речей → ${target.id}`);
+  for (const n of db.needs) {
+    if (n.coveredByItem && ids.includes(n.coveredByItem)) n.coveredByItem = target.id;
+    if (n.replaces && ids.includes(n.replaces) && n.coveredByItem !== target.id) n.replaces = target.id;
+  }
+  for (const p of db.products) {
+    if (p.purchasedItemId && ids.includes(p.purchasedItemId)) {
+      p.purchasedItemId = target.id;
+      bump(p, undefined);
+    }
+  }
+  for (const item of db.items) {
+    if (!item.possibleDuplicateOf || !ids.includes(item.possibleDuplicateOf)) continue;
+    if (item.id === target.id) delete item.possibleDuplicateOf;
+    else {
+      item.possibleDuplicateOf = target.id;
+      bump(item, undefined);
+    }
+  }
+}
+
+function markMerged(source: Item, target: Item) {
+  source.status = 'inactive';
+  source.mergedInto = target.id;
+  delete source.possibleDuplicateOf;
+  bump(source, undefined);
+  history(source, 'merged_into', target.id);
+}
+
+function mergedPhotoIds(db: DB, items: Item[]) {
+  const worn = new Set(db.photos.filter((p) => p.kind === 'worn').map((p) => p.id));
+  return [...new Set(items.flatMap((item) => item.photoIds))].filter((id) => !worn.has(id));
+}
+
+function mergedCrop(db: DB, sources: Item[], photoIds: string[]) {
+  return sources.map((item) => item.tryonReference).find((crop) =>
+    crop && db.photos.some((photo) => photo.path === crop.source.path && photoIds.includes(photo.id)));
+}
+
+function dropUnusedAbsorbedPackshot(db: DB, source: Item) {
+  const id = source.packshotId;
+  if (!id || !db.photos.some((p) => p.id === id && p.kind === 'packshot' && p.source === 'generated' && !p.preserveAsReference)) return;
+  const sourceJob = (job: Job) => job.kind === 'packshot' && job.itemId === source.id;
+  if (db.items.some((i) => i.photoIds.includes(id) || (i.id !== source.id && i.packshotId === id))
+    || db.needs.some((n) => n.conceptPhotoId === id) || db.products.some((p) => p.photoId === id)
+    || db.profile.basePhotoIds.includes(id) || db.wears?.some((wear) => wear.photoIds.includes(id))
+    || db.jobs.some((j) => j.inputPhotoIds?.includes(id) || j.snapshot.basePhotoIds.includes(id) || (j.photoId === id && !sourceJob(j)))) return;
+  delete source.packshotId;
+  for (const job of db.jobs) if (sourceJob(job) && job.photoId === id) delete job.photoId;
+  db.photos = db.photos.filter((photo) => photo.id !== id);
+}
+
+on('POST', '/api/items/:id/absorb', async (ctx, [id], b) => {
+  const out = await ctx.store.mutate((db) => {
+    const target = findOr404(db.items, id, 'Річ');
+    const source = findOr404(db.items, str(b.sourceId) ?? '', 'Річ');
+    if (target.id === source.id) throw new HttpError(400, 'Вибери іншу річ для обʼєднання');
+    if (target.mergedInto || source.mergedInto) throw new HttpError(409, 'Ці речі вже обʼєднано');
+    busyJob(db, (j) => j.itemId === source.id);
+    target.photoIds = [...new Set([...target.photoIds, ...mergedPhotoIds(db, [source])])];
+    for (const field of [...MERGE_FIELDS, 'confirmedFact'] as const) if (!target[field] && source[field]) target[field] = source[field];
+    if (source.sport) target.sport = true;
+    if (!target.packshotId && source.packshotId) target.packshotId = source.packshotId;
+    if (!target.tryonReference) {
+      const crop = mergedCrop(db, [source], target.photoIds);
+      if (crop) target.tryonReference = crop;
+    }
+    target.mergedFrom = [...new Set([...(target.mergedFrom ?? []), source.id])];
+    markMerged(source, target);
+    repointMergedItems(db, [source.id], target);
+    dropJobs(db, (j) => j.kind === 'packshot' && j.itemId === source.id && j.state === 'queued');
+    dropUnusedAbsorbedPackshot(db, source);
+    bump(target, undefined);
+    history(target, 'merged', source.id);
+    queueAdvice(db, `Обʼєднано речі: ${target.title}`);
+    return target;
   });
   ctx.drain();
   return out;
@@ -533,12 +696,17 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
     if (ids.length < 2) throw new HttpError(400, 'Для обʼєднання потрібно щонайменше дві речі');
     const sources = ids.map((id) => findOr404(db.items, id, 'Річ'));
     if (sources.some((item) => item.mergedInto)) throw new HttpError(409, 'Ці речі вже обʼєднано');
-    const photoIds = [...new Set(sources.flatMap((item) => item.photoIds))];
+    const donor = sources.find((item) => item.id === b.targetId) ?? sources.find((item) => item.status === 'confirmed') ?? sources[0];
+    const donors = [donor, ...sources.filter((item) => item !== donor)];
+    const photoIds = mergedPhotoIds(db, sources);
     const primary = str(b.primaryPhotoId);
     if (primary && !photoIds.includes(primary)) throw new HttpError(400, 'Вибери основне фото з цих речей');
     const covers = itemCoverOptions(db, sources);
-    const cover = b.packshotId === undefined ? covers[0] : covers.find((photo) => photo.id === b.packshotId);
-    if (b.packshotId !== undefined && !cover) throw new HttpError(400, 'Вибери каталожне зображення цієї речі');
+    const coverId = b.coverPhotoId ?? b.packshotId;
+    const cover = coverId === undefined ? covers.find((photo) => photo.id === donor.packshotId) ?? covers[0] : covers.find((photo) => photo.id === coverId);
+    if (coverId !== undefined && !cover) throw new HttpError(400, 'Вибери каталожне зображення цієї речі');
+    const crop = mergedCrop(db, donors, photoIds);
+    const duplicate = donors.find((item) => item.possibleDuplicateOf && !ids.includes(item.possibleDuplicateOf))?.possibleDuplicateOf;
     const at = now();
     const merged: Item = {
       id: newId('W'),
@@ -547,9 +715,11 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
       ...(sources.some((item) => item.sport) ? { sport: true } : {}),
       title: str(b.title, 200) || sources[0].title,
       // Merging items the owner already confirmed does not ask «Це моя річ?» again.
-      status: sources.every((s) => s.status === 'confirmed') ? 'confirmed' : 'needs_confirmation',
+      status: sources.some((s) => s.status === 'confirmed') ? 'confirmed' : 'needs_confirmation',
       photoIds: primaryPhotoFirst(photoIds, primary),
       ...(cover ? { packshotId: cover.id } : {}),
+      ...(crop ? { tryonReference: crop } : {}),
+      ...(duplicate ? { possibleDuplicateOf: duplicate } : {}),
       observation: sources.map((s) => `${s.id}: ${s.observation ?? ''}`).join(' · '),
       confirmedFact: sources.map((s) => s.confirmedFact).filter(Boolean).join(' ') || undefined,
       origin: 'merge',
@@ -558,19 +728,16 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
       createdAt: at,
       updatedAt: at,
     };
+    for (const field of [...MERGE_FIELDS, 'purchasedFromProduct'] as const) {
+      const value = donors.find((item) => item[field])?.[field];
+      if (value) merged[field] = value;
+    }
     // «Ні» on «варто замінити» survives a merge: the merged piece is rated again, still kept.
     const kept = sources.find((x) => x.rating?.kept)?.rating;
     if (kept) merged.rating = { ...kept, replace: undefined, replaceWith: undefined, rev: -1, kept: true };
     db.items.push(merged);
-    for (const s of sources) {
-      s.status = 'inactive';
-      s.mergedInto = merged.id;
-      bump(s, undefined);
-      history(s, 'merged_into', merged.id);
-    }
-    replaceRefs(db, (r) => r.kind === 'item' && ids.includes(r.id), { kind: 'item', id: merged.id }, `Обʼєднання речей → ${merged.id}`);
-    for (const n of db.needs) if (n.coveredByItem && ids.includes(n.coveredByItem)) n.coveredByItem = merged.id;
-    for (const id of ids) dropReplacementsFor(db, id);
+    for (const source of sources) markMerged(source, merged);
+    repointMergedItems(db, ids, merged);
     queueMissingItemPackshots(db, [merged.id]);
     queueAdvice(db, `Обʼєднано речі: ${merged.title}`);
     return merged;
@@ -595,7 +762,56 @@ on('POST', '/api/items/:id/split', (ctx, [id], b) =>
   }),
 );
 
+// Batch confirmation/removal during Step 3 wardrobe triage (without opening every item page one by one).
+on('POST', '/api/items/batch-status', (ctx, _p, b) =>
+  ctx.store.mutate((db) => {
+    const status = str(b.status) as Item['status'];
+    if (status !== 'confirmed' && status !== 'inactive') throw new HttpError(400, 'Невідомий статус');
+    const ids = [...new Set((Array.isArray(b.ids) ? b.ids : []).filter((x): x is string => typeof x === 'string'))];
+    if (!ids.length) return { updated: 0 };
+    let updated = 0;
+    for (const id of ids) {
+      const item = db.items.find((i) => i.id === id && !i.mergedInto);
+      if (!item || item.status === status) continue;
+      item.status = status;
+      item.rev += 1;
+      item.updatedAt = now();
+      history(item, `status:${status}`);
+      if (status === 'inactive') dropReplacementsFor(db, item.id);
+      updated += 1;
+    }
+    return { updated };
+  }),
+);
+
 // ── Capsules & looks ───────────────────────────────────────────────────────
+function setAccessoryLimit(capsule: Capsule, limit: unknown) {
+  if (limit === undefined) return;
+  if (limit === 4) capsule.accessoryLimit = 4;
+  else if (limit === null || limit === 3) delete capsule.accessoryLimit;
+  else throw new HttpError(400, 'Некоректний ліміт аксесуарів');
+}
+
+on('POST', '/api/capsules', (ctx, _p, b) =>
+  ctx.store.mutate((db) => {
+    const name = str(b.name, 80);
+    if (!name) throw new HttpError(400, 'Назва не може бути порожньою');
+    if (db.capsules.some((c) => !c.redirectCapsuleIds && c.name.toLowerCase() === name.toLowerCase())) throw new HttpError(409, 'Така капсула вже є');
+    const season = SEASONS.includes(b.season as never) ? (b.season as Capsule['season']) : 'all';
+    const periods = Array.isArray(b.periods) ? [...new Set((b.periods as string[]).filter((p): p is NonNullable<Capsule['periods']>[number] => PERIODS.includes(p as never)))] : [];
+    const at = now();
+    const capsule: Capsule = {
+      id: newId('C'), rev: 1, kind: 'capsule', name, season, ...(periods.length ? { periods } : {}),
+      description: str(b.description, 1200) ?? '',
+      situations: Array.isArray(b.situations) ? (b.situations as string[]).map((s) => String(s).trim()).filter(Boolean).slice(0, 6) : [],
+      favorite: false, lookIds: [], origin: 'owner', createdAt: at, updatedAt: at,
+    };
+    setAccessoryLimit(capsule, b.accessoryLimit);
+    db.capsules.push(capsule);
+    return capsule;
+  }),
+);
+
 on('PATCH', '/api/capsules/:id', (ctx, [id], b) =>
   ctx.store.mutate((db) => {
     const c = findOr404(db.capsules, id, 'Капсула');
@@ -612,8 +828,13 @@ on('PATCH', '/api/capsules/:id', (ctx, [id], b) =>
       }
       c.lookIds = ids as string[];
     }
-    // The capsule's closed set (owner, 20.11): up to 10 garments, 3 shoes, 3 accessories; null clears it.
+    const previousLimit = c.accessoryLimit;
+    setAccessoryLimit(c, b.accessoryLimit);
     if ('pieces' in b || 'base' in b) setCapsulePieces(db, c, b.pieces, b.base);
+    else if (c.accessoryLimit !== previousLimit && c.pieces) {
+      const error = pieceSetError(db, c.pieces, c.base ?? [], c);
+      if (error) throw new HttpError(422, error);
+    }
     return c;
   }),
 );
@@ -708,15 +929,15 @@ on('POST', '/api/looks', async (ctx, _p, b) => {
     const capsule = requireParentCapsule(db, str(b.capsuleId));
     const slots = cleanSlots(b.slots);
     const duplicate = hasPieces({ slots }) && db.looks.find((look) => look.capsuleId === capsule.id && sameComposition(db, look.slots, slots));
-    if (duplicate) return { look: duplicate, queued: false };
+    if (duplicate) return { look: duplicate, queuedIds: [] };
     const at = now();
     const look: Look = { id: newId('L'), rev: 1, capsuleId: capsule.id, name: str(b.name, 120) || 'Мій образ', note: str(b.note), slots, version: 1, versions: [{ version: 1, slots, at }], favorite: false, origin: 'owner', createdAt: at, updatedAt: at };
     db.looks.push(look);
     placeLook(db, look, capsule);
     const jobs = ctx.autoTryOn !== false ? queueNewLookRenders(db, [look.id]) : [];
-    return { look, queued: jobs.some((job) => job.state === 'queued') };
+    return { look, queuedIds: jobs.filter((job) => job.state === 'queued').map((job) => job.id) };
   });
-  if (out.queued) ctx.drain();
+  if (out.queuedIds.length && (!ctx.admit || kept(ctx, out.queuedIds).length)) ctx.drain();
   return out.look;
 });
 
@@ -1202,7 +1423,7 @@ on('PATCH', '/api/profile', (ctx, _p, b) =>
       const pr = b.preferences as Record<string, unknown>;
       for (const k of ['comfort', 'materials', 'fit', 'branding'] as const) if (typeof pr[k] === 'string') prof.preferences[k] = str(pr[k])!;
     }
-    if (Array.isArray(b.basePhotoIds)) prof.basePhotoIds = (b.basePhotoIds as string[]).filter((id) => db.photos.some((p) => p.id === id && p.kind !== 'worn'));
+    if (Array.isArray(b.basePhotoIds)) prof.basePhotoIds = (b.basePhotoIds as string[]).filter((id) => db.photos.some((p) => p.id === id && p.kind !== 'worn' && !p.archivedAt));
     // First sign-in and «Побажання»: language, what to dress the person in, the consent, the hemisphere.
     if (b.language !== undefined) {
       if (!LANGUAGES.includes(b.language as never)) throw new HttpError(400, 'Невідома мова');
@@ -1219,14 +1440,84 @@ on('PATCH', '/api/profile', (ctx, _p, b) =>
   }),
 );
 
-on('PATCH', '/api/photos/:id', (ctx, [id], b) =>
-  ctx.store.mutate((db) => {
+function isProtectedIdentityPhoto(db: DB, photo: Photo) {
+  const identity = db.profile.identity;
+  return Boolean(identity && (identity.sourcePhotoId === photo.id || identity.original.path === photo.path
+    || identity.bodyOriginal?.path === photo.path || identity.hair?.sourcePhotoId === photo.id || identity.hair?.original.path === photo.path));
+}
+
+function assertEditablePhoto(photo: Photo) {
+  if (photo.kind === 'worn' || photo.source === 'generated' || photo.inspiration) throw new HttpError(409, 'Цю дію можна виконати лише з власним оригіналом поза фото образу');
+}
+
+on('PATCH', '/api/photos/:id', async (ctx, [id], b) => {
+  let queued = false;
+  const photo = await ctx.store.mutate((db) => {
     const p = findOr404(db.photos, id, 'Фото');
     if ('meetsStandard' in b) p.meetsStandard = b.meetsStandard === null ? null : Boolean(b.meetsStandard);
     if ('note' in b) p.note = str(b.note);
+    if (b.role !== undefined) {
+      assertEditablePhoto(p);
+      const role = b.role;
+      if (role !== 'face' && role !== 'base' && role !== 'item' && role !== 'label') throw new HttpError(400, 'Невідома роль фото');
+      if ((role === 'item' || role === 'label') && isProtectedIdentityPhoto(db, p)) throw new HttpError(409, 'Фото використовується як опора зовнішності');
+      p.kind = role === 'face' ? 'base' : role;
+      if (role === 'face') p.referenceRole = 'face';
+      else delete p.referenceRole;
+      if (p.kind === 'base') {
+        delete p.archivedAt;
+        selectBasePhoto(db, id);
+      } else {
+        removeBasePhoto(db, id);
+      }
+    }
+    if (typeof b.detachItemId === 'string') {
+      const item = findOr404(db.items, b.detachItemId, 'Річ');
+      if (item.photoIds.includes(id)) {
+        item.photoIds = item.photoIds.filter((photoId) => photoId !== id);
+        clearDetachedCrop(db, item);
+        bump(item, undefined);
+        history(item, 'photo_removed', p.originalName);
+      }
+    }
+    if (typeof b.attachItemId === 'string') {
+      assertEditablePhoto(p);
+      const item = findOr404(db.items, b.attachItemId, 'Річ');
+      delete p.archivedAt;
+      if (attachItemPhoto(item, p)) clearStaleCrop(item, p);
+      queued = queueMissingItemPackshots(db, [item.id]) > 0;
+    }
+    if (b.archived === true) {
+      if (isProtectedIdentityPhoto(db, p)) throw new HttpError(409, 'Фото використовується як опора зовнішності');
+      if (db.wears?.some((wear) => wear.photoIds.includes(id))
+        || db.items.some((item) => item.status !== 'inactive' && !item.mergedInto && (item.photoIds.includes(id) || item.packshotId === id))) {
+        throw new HttpError(409, 'Фото використовується в гардеробі або в образі');
+      }
+      p.archivedAt ??= now();
+      removeBasePhoto(db, id);
+    }
+    if (b.archived === false) delete p.archivedAt;
     return p;
-  }),
-);
+  });
+  if (queued) ctx.drain();
+  return photo;
+});
+
+on('POST', '/api/photos/:id/reanalyze', async (ctx, [id], b) => {
+  const job = await ctx.store.mutate((db) => {
+    const photo = findOr404(db.photos, id, 'Фото');
+    assertEditablePhoto(photo);
+    if (db.jobs.some((j) => j.kind === 'intake' && j.inputPhotoIds?.includes(id) && (j.state === 'queued' || j.state === 'running'))) {
+      throw new HttpError(409, 'Фото ще в обробці');
+    }
+    const intent = parseIntakeIntent(b.intent);
+    ctx.admit?.('intake');
+    delete photo.archivedAt;
+    return intakeJob(db, photo, intent, str(b.note) ?? '');
+  });
+  ctx.drain();
+  return job;
+});
 
 on('PATCH', '/api/settings', (ctx, _p, b) =>
   ctx.store.mutate((db) => {
@@ -1313,17 +1604,87 @@ on('POST', '/api/products/:id/unpurchase', async (ctx, [id]) => {
   const out = await ctx.store.mutate((db) => {
     const p = findOr404(db.products, id, 'Товар');
     if (p.status !== 'purchased') throw new HttpError(409, 'Товар не позначено купленим');
-    const itemId = p.purchasedItemId;
+    const item = db.items.find((i) => i.id === p.purchasedItemId);
     p.status = 'option';
     delete p.purchasedItemId;
     bump(p, undefined);
-    if (itemId && db.items.some((i) => i.id === itemId)) deleteItem(db, itemId);
+    if (item?.mergedFrom?.length) {
+      // A merged item can also represent an independently owned piece or another purchase.
+      const need = db.needs.find((n) => n.id === p.needId && n.coveredByItem === item.id && n.status === 'covered');
+      if (need && !db.products.some((other) => other.needId === need.id && other.status === 'purchased')) uncoverNeed(db, need.id);
+      if (item.purchasedFromProduct === p.id) {
+        const remaining = db.products.find((other) => other.purchasedItemId === item.id && other.status === 'purchased');
+        if (remaining) item.purchasedFromProduct = remaining.id;
+        else delete item.purchasedFromProduct;
+        bump(item, undefined);
+      }
+    } else if (item) deleteItem(db, item.id);
     queueAdvice(db, `Скасовано покупку: ${p.model}`);
     return p;
   });
   ctx.drain();
   return out;
 });
+
+// ── Identity setup & step-by-step onboarding (human-in-the-loop) ───────────
+on('POST', '/api/identity/prepare', async (ctx, _p, b) => {
+  ctx.admit?.('tryon');
+  const job = await ctx.store.mutate((db) =>
+    queueIdentityPrep(db, {
+      facePhotoId: str(b.facePhotoId) ?? '',
+      bodyPhotoId: str(b.bodyPhotoId) ?? '',
+      noGlasses: typeof b.noGlasses === 'boolean' ? b.noGlasses : undefined,
+      hairstyle: str(b.hairstyle, 200),
+      instructions: str(b.instructions, 400),
+    }),
+  );
+  ctx.drain();
+  return job;
+});
+
+on('POST', '/api/identity/approve', (ctx) =>
+  ctx.store.mutate((db) => approveIdentityDraft(db, ctx.projectRoot, ctx.store.dataDir)),
+);
+
+on('DELETE', '/api/identity/draft', (ctx) =>
+  ctx.store.mutate((db) => {
+    if (db.onboarding) delete db.onboarding.identityDraft;
+    return { ok: true };
+  }),
+);
+
+on('POST', '/api/onboarding/plan-capsules', async (ctx, _p, b) => {
+  ctx.admit?.('styling');
+  const job = await ctx.store.mutate((db) => queueCapsulePlan(db, str(b.prompt, 800) ?? ''));
+  ctx.drain();
+  return job;
+});
+
+on('POST', '/api/onboarding/approve-capsules', (ctx, _p, b) =>
+  ctx.store.mutate((db) => approveCapsules(db, Array.isArray(b.capsules) ? (b.capsules as never) : [])),
+);
+
+on('POST', '/api/onboarding/match-capsules', async (ctx, _p, b) => {
+  ctx.admit?.('styling');
+  const capsuleIds = Array.isArray(b.capsuleIds) ? (b.capsuleIds as string[]).filter((x) => typeof x === 'string') : undefined;
+  const job = await ctx.store.mutate((db) => queueCapsuleMatch(db, capsuleIds));
+  ctx.drain();
+  return job;
+});
+
+on('POST', '/api/onboarding/approve-sets', (ctx, _p, b) =>
+  ctx.store.mutate((db) => approveSets(db, Array.isArray(b.sets) ? (b.sets as ApprovedSetInput[]) : [])),
+);
+
+on('PATCH', '/api/onboarding', (ctx, _p, b) =>
+  ctx.store.mutate((db) => {
+    db.onboarding ??= {};
+    if (typeof b.step === 'number' && [1, 2, 3, 4, 5].includes(b.step)) db.onboarding.step = b.step as 1 | 2 | 3 | 4 | 5;
+    if (b.complete === true) db.onboarding.completedAt = now();
+    if (b.complete === false) delete db.onboarding.completedAt;
+    return db.onboarding;
+  }),
+);
 
 // «Нові» (owner, 19.11): one search for new looks — the owner's words, a capsule and picked pieces are optional.
 on('POST', '/api/discover', async (ctx, _p, b) => {

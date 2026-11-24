@@ -98,8 +98,10 @@ export interface Photo {
   /** Owner-supplied face references are separate from full-body sources. */
   referenceRole?: 'face';
   observation?: string;
-  /** SHA-256 of the stored original (worn photos): the same file chosen again reuses this photo. */
+  /** SHA-256 of the uploaded original. */
   sha256?: string;
+  archivedAt?: string;
+  baseCandidate?: { suitable: boolean; issues?: string };
   /** Owner's check against the base-photo standard; null = not checked. */
   meetsStandard?: boolean | null;
   note?: string;
@@ -136,6 +138,7 @@ export interface Item {
   mergedInto?: string;
   splitFrom?: string;
   purchasedFromProduct?: string;
+  possibleDuplicateOf?: string;
   /** Generated catalogue image (reconstruction, not evidence). */
   packshotId?: string;
   /** Advisor's rating (agent judgement; the site adds the counts). Stale when `rev` differs from the item's. */
@@ -310,12 +313,19 @@ export interface SnapshotSlot {
 export interface Job {
   id: string;
   /** Missing kind means a try-on (records created before packshots). */
-  kind?: 'tryon' | 'packshot' | 'intake' | 'analyze' | 'shopsearch' | 'advise' | 'storefind' | 'discover' | 'wearreview';
+  kind?: 'tryon' | 'packshot' | 'intake' | 'analyze' | 'shopsearch' | 'advise' | 'storefind' | 'discover' | 'wearreview' | 'identity_prep' | 'capsule_plan' | 'capsule_match';
   lookId?: string;
   /** wearreview: the worn look whose real photos are read. */
   wearId?: string;
   /** intake: uploaded photos to recognise. */
   inputPhotoIds?: string[];
+  intakeIntent?: 'auto' | 'person' | 'garments';
+  /** intake: batch upload during onboarding defers per-photo background advisor runs. */
+  batch?: boolean;
+  /** identity_prep: original photos and preferences for building the candidate base portrait + headless body crop. */
+  identityInput?: { facePhotoId: string; bodyPhotoId: string; noGlasses: boolean; hairstyle?: string };
+  /** capsule_match: optional subset of capsule ids to match wardrobe pieces onto. */
+  targetCapsuleIds?: string[];
   /** intake: wardrobe candidates created from the photo. */
   createdItemIds?: string[];
   /** Existing items an upload was attached to (shown and linked so nothing disappears silently). */
@@ -492,6 +502,60 @@ export interface Suggestion {
   decidedAt?: string;
 }
 
+/** Candidate identity reference awaiting the person's own «Це я?» review on site before becoming profile.identity. */
+export interface IdentityDraft {
+  jobId: string;
+  sourcePhotoId: string;
+  bodyPhotoId: string;
+  original: HashedFile;
+  bodyOriginal: HashedFile;
+  body: HashedFile;
+  face: HashedFile;
+  noGlasses: boolean;
+  hairstyle?: string;
+  notes?: string;
+  createdAt: string;
+}
+
+/** Proposed fashion capsule awaiting human review before entering db.capsules. */
+export interface CapsuleDraft {
+  id: string;
+  name: string;
+  season: Season;
+  periods: Period[];
+  description: string;
+  situations: string[];
+  keyPieces: string[];
+  selected: boolean;
+}
+
+/** Proposed closed set (≤10 garments, ≤3 shoes, ≤3 accessories) per capsule awaiting human review. */
+export interface CapsuleMatchDraft {
+  capsuleId: string;
+  ownedItemIds: string[];
+  baseItemIds: string[];
+  missing: {
+    id: string;
+    title: string;
+    category: Category;
+    priority: 'core' | 'optional';
+    why: string;
+    selected: boolean;
+  }[];
+  note?: string;
+}
+
+/** Resumable step-by-step onboarding state; proposals stay here until explicitly approved by the person. */
+export interface OnboardingState {
+  step?: 1 | 2 | 3 | 4 | 5;
+  completedAt?: string;
+  identityDraft?: IdentityDraft;
+  capsulePrompt?: string;
+  capsuleDrafts?: CapsuleDraft[];
+  matchDrafts?: CapsuleMatchDraft[];
+  unmatchedItemIds?: string[];
+}
+
 export interface DB {
   schemaVersion: number;
   revision: number;
@@ -517,6 +581,8 @@ export interface DB {
   stores?: StorePlace[];
   /** Real photos of saved looks (optional: older databases have none). */
   wears?: Wear[];
+  /** Step-by-step setup drafts and progress (optional: older databases have none). */
+  onboarding?: OnboardingState;
 }
 
 export function emptySlots(): Slots {
@@ -552,6 +618,7 @@ export function validateDb(db: unknown): string | null {
     if (!PHOTO_KINDS.includes(p.kind)) return `Фото ${p.id}: невідомий тип`;
     if (!isRelativeSafe(p.path)) return `Фото ${p.id}: недозволений шлях`;
     if (p.originalPath && !isRelativeSafe(p.originalPath)) return `Фото ${p.id}: недозволений шлях оригіналу`;
+    if (p.archivedAt !== undefined && typeof p.archivedAt !== 'string') return `Фото ${p.id}: некоректна дата архівування`;
     if (p.referenceRole && (p.referenceRole !== 'face' || p.source === 'generated' || p.inspiration)) return `Фото ${p.id}: референс обличчя повинен бути власним оригіналом`;
     if (p.kind === 'worn' && (p.source !== 'upload' || p.referenceRole || p.inspiration)) return `Фото ${p.id}: фото образу повинно бути власним завантаженням`;
   }
@@ -576,6 +643,7 @@ export function validateDb(db: unknown): string | null {
     if (i.sport !== undefined && typeof i.sport !== 'boolean') return `Річ ${i.id}: некоректна категорія «Спорт»`;
     if (!ITEM_STATUSES.includes(i.status)) return `Річ ${i.id}: невідомий статус`;
     if (!i.title?.trim()) return `Річ ${i.id}: порожня назва`;
+    if (i.possibleDuplicateOf !== undefined && (typeof i.possibleDuplicateOf !== 'string' || i.possibleDuplicateOf === i.id || !has('items', i.possibleDuplicateOf))) return `Річ ${i.id}: некоректне посилання на можливий дублікат`;
     for (const pid of i.photoIds) if (!has('photos', pid)) return `Річ ${i.id}: немає фото ${pid}`;
     if (i.packshotId && !has('photos', i.packshotId)) return `Річ ${i.id}: немає packshot`;
     if (i.tryonReference) {
@@ -598,6 +666,7 @@ export function validateDb(db: unknown): string | null {
     (r.kind === 'item' && has('items', r.id)) || (r.kind === 'need' && has('needs', r.id)) || (r.kind === 'product' && has('products', r.id));
   for (const l of d.looks) {
     if (l.capsuleId && !has('capsules', l.capsuleId)) return `Образ ${l.id}: немає капсули`;
+    if (l.variantOf !== undefined && (typeof l.variantOf !== 'string' || l.variantOf === l.id || !has('looks', l.variantOf))) return 'Некоректне посилання на основний образ';
     for (const k of SLOT_KEYS) {
       if (!Array.isArray(l.slots?.[k])) return `Образ ${l.id}: немає слота ${k}`;
       for (const r of l.slots[k]) if (!refOk(r)) return `Образ ${l.id}: битий звʼязок ${r.kind}:${r.id}`;
@@ -626,7 +695,9 @@ export function validateDb(db: unknown): string | null {
     if (j.kind === 'shopsearch' && !(j.needId && has('needs', j.needId))) return `Завдання ${j.id}: немає покупки`;
     if (j.photoId && !has('photos', j.photoId)) return `Завдання ${j.id}: немає фото результату`;
     if (j.kind === 'wearreview' && !(j.wearId && d.wears?.some((w) => w.id === j.wearId))) return `Завдання ${j.id}: немає образу в житті`;
+    if (j.kind === 'identity_prep' && !(j.identityInput && has('photos', j.identityInput.facePhotoId) && has('photos', j.identityInput.bodyPhotoId))) return `Завдання ${j.id}: немає вихідних фото для опори`;
     if (j.kind === 'intake' && !(j.inputPhotoIds?.length && j.inputPhotoIds.every((p) => has('photos', p)))) return `Завдання ${j.id}: немає фото для розпізнавання`;
+    if (j.intakeIntent !== undefined && j.intakeIntent !== 'auto' && j.intakeIntent !== 'person' && j.intakeIntent !== 'garments') return `Завдання ${j.id}: невідомий намір розпізнавання`;
     for (const id of j.createdItemIds ?? []) if (!has('items', id)) return `Завдання ${j.id}: немає створеної речі ${id}`;
     for (const id of j.attachedItemIds ?? []) if (!has('items', id)) return `Завдання ${j.id}: немає речі ${id}`;
     if (j.capsuleId && !has('capsules', j.capsuleId)) return `Завдання ${j.id}: немає підбірки`;
@@ -658,6 +729,14 @@ export function validateDb(db: unknown): string | null {
   if (d.profile.language !== undefined && !LANGUAGES.includes(d.profile.language)) return 'Профіль: невідома мова';
   if (d.profile.wardrobeFocus !== undefined && !WARDROBE_FOCUS.includes(d.profile.wardrobeFocus)) return 'Профіль: невідомий гардероб';
   if (d.profile.hemisphere !== undefined && d.profile.hemisphere !== 'north' && d.profile.hemisphere !== 'south') return 'Профіль: невідома півкуля';
+  if (d.onboarding?.identityDraft) {
+    const draft = d.onboarding.identityDraft;
+    const fp = d.photos.find((p) => p.id === draft.sourcePhotoId);
+    const bp = d.photos.find((p) => p.id === draft.bodyPhotoId);
+    if (!fp || !bp || fp.source === 'generated' || bp.source === 'generated' || fp.kind === 'worn' || bp.kind === 'worn') return 'Чернетка опори повинна походити з власних оригіналів';
+    if (![draft.original, draft.bodyOriginal, draft.body, draft.face].every(validHashedFile)) return 'Чернетка опори: некоректний файл';
+    if (draft.original.path !== fp.path || draft.bodyOriginal.path !== bp.path) return 'Чернетка опори: шлях оригіналу не збігається';
+  }
   if (!d.settings?.codexModel) return 'Налаштування: немає моделі Codex';
   return null;
 }

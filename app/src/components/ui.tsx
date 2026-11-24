@@ -158,7 +158,7 @@ export function PhotoPicker({
 }) {
   const db = useDb();
   const [sel, setSel] = useState<string[]>(selected);
-  const photos = db.photos.filter((p) => (filter ? filter(p) : true)).slice().reverse();
+  const photos = db.photos.filter((p) => !p.archivedAt && (!filter || filter(p))).reverse();
   const toggle = (id: string) => setSel((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
   return (
     <Modal

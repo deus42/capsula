@@ -150,8 +150,11 @@ export function shopSearchPrompt(db: DB, job: Job) {
     : need.category === 'trousers' || need.category === 'shorts' ? ['waist', 'hips', 'inseam'] as const
       : ['chest', 'waist', 'hips'] as const;
   const body = measureKeys.flatMap((key) => measures[key].value == null ? [] : [`${key} ${measures[key].value} cm`]).join(', ');
+  const focus = db.profile.wardrobeFocus ?? 'men';
   const guides = sizingBrands(db).flatMap((brand) => {
-    const urls = [...new Set(sizeGuides(brand).filter((guide) => guide.categories.includes(need.category)).map((guide) => guide.url))];
+    const urls = [...new Set(sizeGuides(brand, focus)
+      .filter((guide) => guide.categories.includes(need.category) && (focus !== 'any' || guide.focus === 'unisex'))
+      .map((guide) => guide.url))];
     return urls.length ? [`${brand}: ${urls.join(', ')}`] : [];
   }).join('; ');
   const looks = siteLooks(db)

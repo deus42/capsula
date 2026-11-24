@@ -6,15 +6,17 @@ import type { DB, Job, SnapshotSlot } from './schema.ts';
 import type { Store } from './store.ts';
 import { newId, now } from './store.ts';
 import { detectImageType, prewarm, resolveAllowed, thumbnail } from './media.ts';
-import { ANALYZE_SCHEMA, INTAKE_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakePrompt, lookPieces } from './analysis.ts';
+import { ANALYZE_SCHEMA, INTAKE_SCHEMA, VISUAL_DEDUP_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakePrompt, lookPieces, ownedItems, visualDedupPrompt, type IntakeReply } from './analysis.ts';
 import { coverNeed, queueMissingItemPackshots, queueNewLookRenders } from './routes.ts';
 import { DISCOVER_SCHEMA, applyDiscover, discoverPrompt } from './discover.ts';
 import { SHOP_SEARCH_SCHEMA, STORE_FIND_SCHEMA, applyShopSearch, applyStoreFind, fetchProductImage, queueStoreFind, shopSearchPrompt, storeFindPrompt } from './shop-search.ts';
 import { ADVISE_SCHEMA, adviceDue, advisePrompt, applyAdvice, itemsToRate, queueAdvice, seenRevs } from './advisor.ts';
 import { sameIdentity, verifyReferenceFiles } from './identity.ts';
-import { FACE_CHECK_PROMPT, FACE_CHECK_SCHEMA, fitGarmentCards, GARMENT_BOUNDS_SCHEMA, prepareGarmentCrops, type GarmentCard } from './garment-references.ts';
+import { FACE_CHECK_PROMPT, FACE_CHECK_SCHEMA, buildContactSheet, fitGarmentCards, GARMENT_BOUNDS_SCHEMA, prepareGarmentCrops, type GarmentCard } from './garment-references.ts';
 import { apiImagePrompt, type OpenAIEngine } from './openai-engine.ts';
 import { WEAR_REVIEW_SCHEMA, applyWearReview, pinnedRender, wearPhotos, wearReviewPrompt } from './wear-review.ts';
+import { HEAD_BOUNDS_PROMPT, HEAD_BOUNDS_SCHEMA, applyIdentityDraft, buildPortraitPrompt, prepareBodyCrop } from './identity-prep.ts';
+import { CAPSULE_MATCH_SCHEMA, CAPSULE_PLAN_SCHEMA, applyCapsuleMatch, applyCapsulePlan, capsuleMatchPrompt, capsulePlanPrompt, matchableItems } from './onboarding.ts';
 
 const SLOT_LABEL: Record<string, string> = { top: 'Top', layer: 'Outer layer', bottom: 'Bottom', shoes: 'Shoes', accessories: 'Accessory' };
 const JOB_TIMEOUT_MS = 15 * 60 * 1000;
@@ -215,6 +217,24 @@ function parseReply(text: string): { status?: string; notes?: string; reason?: s
   }
 }
 
+/** Extracts the last human-readable error message from Codex `--json` event logs when a run exits non-zero. */
+function codexLogError(logFile: string): string | undefined {
+  if (!fs.existsSync(logFile)) return undefined;
+  let last: string | undefined;
+  for (const line of fs.readFileSync(logFile, 'utf8').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('{')) continue;
+    try {
+      const ev = JSON.parse(trimmed) as { type?: string; message?: string; error?: { message?: string } };
+      if (ev.type === 'turn.failed' && ev.error?.message) last = ev.error.message;
+      else if (ev.type === 'error' && ev.message) last = ev.message;
+    } catch {
+      /* ignore partial lines */
+    }
+  }
+  return last?.slice(0, 300);
+}
+
 /**
  * Queue worker pool. Each job runs an isolated `codex exec`: personal Codex
  * config ignored, workspace-write sandbox limited to the job folder, inputs
@@ -245,7 +265,7 @@ export function createLimiter(max: number): Limiter {
  * `codexShell: false` runs Codex without commands
  * (see CODEX_SHELL_DEFAULT); `codexHome` is where that Codex keeps its generated images.
  */
-export function createRunner(store: Store, projectRoot: string, codexBin = findCodex(), opts: { limiter?: Limiter; engine?: OpenAIEngine; canStart?: (job: Job) => boolean; codexShell?: boolean; codexHome?: string } = {}) {
+export function createRunner(store: Store, projectRoot: string, codexBin = findCodex(), opts: { limiter?: Limiter; engine?: OpenAIEngine; canStart?: (job: Job) => boolean; codexShell?: boolean; codexHome?: string; autoTryOn?: boolean } = {}) {
   const shell = opts.codexShell ?? CODEX_SHELL_DEFAULT;
   const codexHome = opts.codexHome ?? codexHomeDefault();
   const noCommands = shell ? [] : NO_COMMANDS;
@@ -281,7 +301,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
       child.on('close', (code) => {
         clearTimeout(timer);
         // Resolved once the log is on disk: the image collection reads the thread id from it.
-        log.end(() => resolve({ code }));
+        log.end(() => resolve({ code, err: code && code !== 0 ? codexLogError(logFile) : undefined }));
       });
       // A Codex that exits before reading the prompt closes the pipe (EPIPE); its exit code reports the failure.
       child.stdin.on('error', () => {});
@@ -317,6 +337,68 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     return reply;
   }
 
+  async function matchIntakeGarments(db: DB, jobDir: string, upload: string, garments: IntakeReply['garments']) {
+    if (!upload || !fs.existsSync(upload)) return;
+    const named = new Set(garments.map((g) => g.duplicateOf).filter(Boolean));
+    const unresolved = garments.filter((g) => !g.duplicateOf);
+    const normalized = (color?: string) => color?.trim().toLowerCase() || undefined;
+    const candidates = ownedItems(db).flatMap((item) => {
+      if (named.has(item.id)) return [];
+      const sameCategory = unresolved.filter((g) => g.category === item.category);
+      if (!sameCategory.length) return [];
+      const color = normalized(item.color);
+      return [{ item, colorMatch: Boolean(color && sameCategory.some((g) => normalized(g.color) === color)) }];
+    }).sort((a, b) => Number(b.colorMatch) - Number(a.colorMatch));
+
+    const selected: { item: (typeof candidates)[number]['item']; file: string }[] = [];
+    for (const { item } of candidates) {
+      for (const id of [item.packshotId, ...item.photoIds]) {
+        const photo = db.photos.find((p) => p.id === id);
+        if (!photo || photo.archivedAt || photo.kind === 'worn' || photo.kind === 'label' || photo.referenceRole || photo.inspiration) continue;
+        try {
+          const file = resolveAllowed(projectRoot, store.dataDir, photo.path);
+          if (!fs.existsSync(file)) continue;
+          selected.push({ item, file });
+          break;
+        } catch {
+          // An unavailable source does not rule out the item's other photos.
+        }
+      }
+      if (selected.length === 6) break;
+    }
+    if (!selected.length) return;
+
+    const sheet = path.join(jobDir, 'visual-dedup.png');
+    try {
+      await buildContactSheet(jobDir, selected.map(({ file }) => file), sheet);
+      const request = { prompt: visualDedupPrompt(garments, selected.map(({ item }) => item)), schema: VISUAL_DEDUP_SCHEMA, images: [upload, sheet] };
+      const answer = opts.engine
+        ? (await opts.engine.json({ ...request, logFile: path.join(jobDir, 'visual-dedup.log') })).reply
+        : await codexJson(jobDir, db.settings, 'visual-dedup', request);
+      if (!Array.isArray(answer?.matches)) return;
+      for (const confidence of ['high', 'possible']) {
+        for (const match of answer.matches) {
+          if (match?.confidence !== confidence || !Number.isInteger(match.garmentIndex)) continue;
+          const garment = garments[match.garmentIndex];
+          if (!garment || garment.duplicateOf || !selected.some(({ item }) => item.id === match.itemId && item.category === garment.category)) continue;
+          garment.duplicateOf = match.itemId;
+        }
+      }
+    } catch {
+      // The secondary visual check is optional. Keep the primary intake result.
+    } finally {
+      fs.rmSync(sheet, { force: true });
+    }
+  }
+
+  function deferArchivedIntake(db: DB, job: Job) {
+    if (job.kind !== 'intake' || !db.photos.some((photo) => photo.archivedAt && job.inputPhotoIds?.includes(photo.id))) return false;
+    job.state = 'needs_data';
+    job.stateNote = 'Фото архівовано';
+    job.finishedAt = now();
+    return true;
+  }
+
   /** Intake (photo → wardrobe candidates) and analyzer (owned-only outfits): JSON answers, read-only sandbox. */
   async function runAnalysis(jobId: string) {
     const db0 = store.read();
@@ -344,6 +426,26 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     } else if (job.kind === 'discover') {
       prompt = discoverPrompt(db0, job);
       schema = DISCOVER_SCHEMA;
+    } else if (job.kind === 'capsule_plan') {
+      prompt = capsulePlanPrompt(db0, job);
+      schema = CAPSULE_PLAN_SCHEMA;
+    } else if (job.kind === 'capsule_match') {
+      const dir = path.join(jobDir, 'items');
+      fs.mkdirSync(dir, { recursive: true });
+      for (const it of matchableItems(db0)) {
+        const p = it.packshotId ? db0.photos.find((x) => x.id === it.packshotId) : it.photoIds.map((id) => db0.photos.find((x) => x.id === id)).find(Boolean);
+        if (!p) continue;
+        try {
+          const t = await thumbnail(projectRoot, store.dataDir, p.path, p.path, 320);
+          const dest = path.join(dir, `${it.id}.jpg`);
+          fs.copyFileSync(t, dest);
+          images.push(dest);
+        } catch {
+          /* missing thumbnail only removes visual context */
+        }
+      }
+      prompt = capsuleMatchPrompt(db0, job, images);
+      schema = CAPSULE_MATCH_SCHEMA;
     } else if (job.kind === 'wearreview') {
       // The person's own photos of one appearance, then the pinned render of the same look version when it is still shown.
       const wear = db0.wears?.find((w) => w.id === job.wearId);
@@ -417,13 +519,16 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
       '-s', 'read-only', '-C', jobDir, '-m', settings.codexModel, '-c', `model_reasoning_effort="${settings.reasoningEffort}"`, ...(webSearch ? WORKER_ISOLATION_SEARCH : WORKER_ISOLATION), ...noCommands,
       '--output-schema', schemaFile, '-o', lastMsg, ...images.flatMap((p) => ['-i', p]),
     ];
-    await store.mutate((db) => {
+    const started = await store.mutate((db) => {
       const j = db.jobs.find((x) => x.id === jobId)!;
+      if (deferArchivedIntake(db, j)) return false;
       j.state = 'running';
       j.startedAt = now();
-      j.stateNote = job.kind === 'intake' ? 'Розпізнаю речі на фото…' : job.kind === 'shopsearch' ? 'Шукаю варіанти в магазинах…' : job.kind === 'storefind' ? 'Шукаю найближчі магазини…' : job.kind === 'discover' ? 'Шукаю нові образи…' : job.kind === 'advise' ? 'Порадник оцінює гардероб…' : job.kind === 'wearreview' ? 'Стиліст дивиться фото образу…' : 'Складаю образи з твоїх речей…';
+      j.stateNote = job.kind === 'intake' ? (job.intakeIntent === 'person' ? 'Перевіряю фото для примірок…' : 'Розпізнаю речі на фото…') : job.kind === 'shopsearch' ? 'Шукаю варіанти в магазинах…' : job.kind === 'storefind' ? 'Шукаю найближчі магазини…' : job.kind === 'discover' ? 'Шукаю нові образи…' : job.kind === 'capsule_plan' ? 'Підбираю капсули за запитом…' : job.kind === 'capsule_match' ? 'Розкладаю гардероб по капсулах…' : job.kind === 'advise' ? 'Порадник оцінює гардероб…' : job.kind === 'wearreview' ? 'Стиліст дивиться фото образу…' : 'Складаю образи з твоїх речей…';
       j.logPath = path.relative(projectRoot, logFile);
+      return true;
     });
+    if (!started) return;
     let exit: { code: number | null; err?: string };
     let reply: Record<string, unknown> | null = null;
     let productImages: { productId: string; url: string }[] = [];
@@ -440,8 +545,13 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         reply = null;
       }
     }
+    if (job.kind === 'intake' && job.intakeIntent !== 'person' && reply && reply.status !== 'error'
+      && reply.photoType !== 'person_face' && reply.photoType !== 'label' && Array.isArray(reply.garments) && reply.garments.length) {
+      await matchIntakeGarments(db0, jobDir, images[0], reply.garments);
+    }
     await store.mutate((db) => {
       const j = db.jobs.find((x) => x.id === jobId)!;
+      if (deferArchivedIntake(db, j)) return;
       j.finishedAt = now();
       if (!reply) {
         j.state = 'error';
@@ -470,6 +580,16 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         j.stateNote = applyDiscover(db, j, reply as never);
         return;
       }
+      if (j.kind === 'capsule_plan') {
+        j.state = 'done';
+        j.stateNote = applyCapsulePlan(db, j, reply as never);
+        return;
+      }
+      if (j.kind === 'capsule_match') {
+        j.state = 'done';
+        j.stateNote = applyCapsuleMatch(db, j, reply as never);
+        return;
+      }
       if (j.kind === 'storefind') {
         j.state = 'done';
         j.stateNote = applyStoreFind(db, reply as never);
@@ -490,7 +610,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         // A label photo joins its item too, so the upload card links to it.
         j.attachedItemIds = [...new Set([...outcome.attachedTo, ...(outcome.labelFor ? [outcome.labelFor] : [])])];
         queueMissingItemPackshots(db, [...outcome.created, ...outcome.attachedTo]);
-        if (outcome.created.length || outcome.covers.length) queueAdvice(db, `Нові речі з фото: ${outcome.created.length}`);
+        if (!j.batch && (outcome.created.length || outcome.covers.length)) queueAdvice(db, `Нові речі з фото: ${outcome.created.length}`);
         // An upload that is an open recommendation leaves the shopping list and replaces the stand-in in looks and renders.
         const covered: string[] = [];
         for (const c of outcome.covers) {
@@ -512,9 +632,10 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         return;
       }
       j.capsuleId = capsuleId;
-      const renders = queueNewLookRenders(db, db.capsules.find((c) => c.id === capsuleId)?.lookIds ?? []).filter((j) => j.state === 'queued');
+      const lookIds = db.capsules.find((c) => c.id === capsuleId)?.lookIds ?? [];
+      const renders = opts.autoTryOn !== false ? queueNewLookRenders(db, lookIds).filter((job) => job.state === 'queued') : [];
       j.state = 'done';
-      j.stateNote = `Підбірка готова: ${db.capsules.find((c) => c.id === capsuleId)?.lookIds.length ?? 0} образів${renders.length ? ` — примірки в черзі: ${renders.length}` : ''}`;
+      j.stateNote = `Підбірка готова: ${lookIds.length} образів${renders.length ? ` — примірки в черзі: ${renders.length}` : ''}`;
     });
     // Drop intermediate copies (item thumbnails, wear copies) once the analysis is done.
     cleanupJobDir(jobDir);
@@ -532,10 +653,108 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     }
   }
 
+  /** Step 1 of onboarding: headless body crop + clean studio base portrait saved to onboarding.identityDraft for «Це я?» review. */
+  async function runIdentityPrep(jobId: string) {
+    const db0 = store.read();
+    const job = db0.jobs.find((j) => j.id === jobId)!;
+    const inp = job.identityInput;
+    if (!inp) throw Error('Не вказано фото для опори зовнішності');
+    const facePhoto = db0.photos.find((p) => p.id === inp.facePhotoId);
+    const bodyPhoto = db0.photos.find((p) => p.id === inp.bodyPhotoId);
+    if (!facePhoto || !bodyPhoto) throw Error('Не знайдено вихідні фото для опори зовнішності');
+    const resolve = (p: string) => resolveAllowed(projectRoot, store.dataDir, p);
+    const faceAbs = resolve(facePhoto.path);
+    const bodyAbs = resolve(bodyPhoto.path);
+    const jobDir = path.join(store.dataDir, 'jobs', job.id);
+    const mediaDir = path.join(store.dataDir, 'media', 'identity', job.id);
+    fs.mkdirSync(jobDir, { recursive: true });
+    fs.mkdirSync(mediaDir, { recursive: true, mode: 0o700 });
+    const bodyDest = path.join(mediaDir, 'body.png');
+    const portraitDest = path.join(mediaDir, 'portrait.png');
+    const resultFile = path.join(jobDir, 'result.png');
+    const lastMsg = path.join(jobDir, 'last-message.txt');
+    const logFile = path.join(jobDir, 'codex.jsonl');
+    const settings = db0.settings;
+
+    await store.mutate((db) => {
+      const j = db.jobs.find((x) => x.id === jobId)!;
+      j.state = 'running';
+      j.startedAt = now();
+      j.stateNote = 'Готую опору статури…';
+      j.logPath = path.relative(projectRoot, logFile);
+    });
+
+    const faceCheck = async (files: string[]) => {
+      const reply = opts.engine
+        ? (await opts.engine.json({ prompt: FACE_CHECK_PROMPT, schema: FACE_CHECK_SCHEMA, images: files, logFile: path.join(jobDir, 'face-check.log') })).reply
+        : await codexJson(jobDir, settings, 'face-check', { prompt: FACE_CHECK_PROMPT, schema: FACE_CHECK_SCHEMA, images: files });
+      return (reply?.faces as boolean[] | undefined) ?? files.map(() => true);
+    };
+    const locateHead = async (previewFile: string) => {
+      const reply = opts.engine
+        ? (await opts.engine.json({ prompt: HEAD_BOUNDS_PROMPT, schema: HEAD_BOUNDS_SCHEMA, images: [previewFile], logFile: path.join(jobDir, 'head-bounds.log') })).reply
+        : await codexJson(jobDir, settings, 'head-bounds', { prompt: HEAD_BOUNDS_PROMPT, schema: HEAD_BOUNDS_SCHEMA, images: [previewFile] });
+      return reply as { hasPerson?: boolean; headBottom?: number } | null;
+    };
+    await prepareBodyCrop({ sourceAbs: bodyAbs, destAbs: bodyDest, jobDir, locateHead, faceCheck });
+
+    const faceRefs = [faceAbs];
+    const built = buildPortraitPrompt(job, resultFile, faceRefs);
+    const prompt = shell || opts.engine ? built : collectedImagePrompt(built);
+    fs.writeFileSync(path.join(jobDir, 'references.json'), JSON.stringify({ identity: faceRefs, bodySource: bodyAbs, bodyCrop: bodyDest }, null, 2));
+    fs.writeFileSync(path.join(jobDir, 'prompt.txt'), prompt);
+
+    await store.mutate((db) => {
+      const j = db.jobs.find((x) => x.id === jobId);
+      if (j && j.state === 'running') j.stateNote = 'Генерую базовий портрет…';
+    });
+
+    let exit: { code: number | null; err?: string };
+    let reply: { status?: string; notes?: string; reason?: string };
+    if (opts.engine) {
+      const out = await opts.engine.image({ prompt: apiImagePrompt(prompt, faceRefs), images: faceRefs, resultFile, packshot: false, logFile });
+      exit = { code: out.ok ? 0 : 1, err: out.err };
+      reply = out.ok ? { status: 'done' } : { status: 'error', reason: out.err };
+    } else {
+      const args = [
+        'exec', '--ignore-user-config', '--skip-git-repo-check', '--ephemeral', '--color', 'never', '--json',
+        '-s', shell ? 'workspace-write' : 'read-only', '-C', jobDir, '-m', settings.codexModel,
+        '-c', `model_reasoning_effort="${settings.reasoningEffort}"`, ...WORKER_ISOLATION, ...noCommands,
+        '--enable', 'image_generation', '-o', lastMsg, ...faceRefs.flatMap((p) => ['-i', p]),
+      ];
+      exit = await spawnCodex(args, prompt, jobDir, logFile);
+      reply = fs.existsSync(lastMsg) ? parseReply(fs.readFileSync(lastMsg, 'utf8')) : {};
+      if (!shell && !fs.existsSync(resultFile)) collectGeneratedImage(codexHome, logFile, resultFile);
+    }
+
+    let image = fs.existsSync(resultFile) ? resultFile : null;
+    if (image && detectImageType(fs.readFileSync(image)) !== 'png') image = null;
+
+    await store.mutate((db) => {
+      const j = db.jobs.find((x) => x.id === jobId)!;
+      if (j.state !== 'running') return;
+      j.finishedAt = now();
+      if (!image) {
+        j.state = 'error';
+        j.stateNote = reply.reason || exit.err || (exit.code === 0 ? 'Не вдалося згенерувати базовий портрет' : `Codex завершився з кодом ${String(exit.code)} — див. журнал`);
+        return;
+      }
+      fs.copyFileSync(image, portraitDest);
+      const faceRel = path.relative(projectRoot, portraitDest);
+      const bodyRel = path.relative(projectRoot, bodyDest);
+      prewarm(projectRoot, store.dataDir, [faceRel, bodyRel], [160, 480, 960]);
+      applyIdentityDraft(db, j, { faceRel, bodyRel, projectRoot, dataDir: store.dataDir, notes: reply.notes });
+      j.state = 'done';
+      j.stateNote = 'Опора готова — перевір «Це я?»';
+    });
+    if (image) cleanupJobDir(jobDir);
+  }
+
   async function runOne(jobId: string) {
     const db0 = store.read();
     const job = db0.jobs.find((j) => j.id === jobId)!;
-    if (job.kind === 'intake' || job.kind === 'analyze' || job.kind === 'shopsearch' || job.kind === 'advise' || job.kind === 'storefind' || job.kind === 'discover' || job.kind === 'wearreview') return runAnalysis(jobId);
+    if (job.kind === 'intake' || job.kind === 'analyze' || job.kind === 'shopsearch' || job.kind === 'advise' || job.kind === 'storefind' || job.kind === 'discover' || job.kind === 'wearreview' || job.kind === 'capsule_plan' || job.kind === 'capsule_match') return runAnalysis(jobId);
+    if (job.kind === 'identity_prep') return runIdentityPrep(jobId);
     const isPackshot = job.kind === 'packshot';
     if (!isPackshot && (db0.profile.identity?.disabledReason || job.snapshot.identity?.disabledReason)) throw Error(db0.profile.identity?.disabledReason || job.snapshot.identity!.disabledReason);
     const jobDir = path.join(store.dataDir, 'jobs', job.id);
@@ -795,7 +1014,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         // What the owner starts by hand (photo intake, analyzer) goes first, then try-ons, then packshots.
         // Shop searches take minutes: they come after uploads and «Підібрати», one at a time, so a slot stays free.
         // The advisor is background text work: after try-ons, alongside packshots.
-        const batch = (k?: string) => (k === 'intake' || k === 'analyze' || k === 'discover' || k === 'wearreview' ? 0 : k === 'shopsearch' || k === 'storefind' ? 0.5 : k === 'packshot' || k === 'advise' ? 2 : 1);
+        const batch = (k?: string) => (k === 'intake' || k === 'analyze' || k === 'discover' || k === 'wearreview' || k === 'identity_prep' || k === 'capsule_plan' || k === 'capsule_match' ? 0 : k === 'shopsearch' || k === 'storefind' ? 0.5 : k === 'packshot' || k === 'advise' ? 2 : 1);
         const queued = db.jobs
           .filter((j) => j.state === 'queued' && !active.has(j.id) && (!opts.canStart || opts.canStart(j)))
           // Within try-ons the newest request goes first, so a picture the owner just asked for does not wait behind a batch.

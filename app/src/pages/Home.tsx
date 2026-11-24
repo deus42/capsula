@@ -79,8 +79,8 @@ function StyleTile({ s }: { s: CatalogueStyle }) {
   );
 }
 
-/** Starts photo intake: every chosen photo becomes a recognition job. */
-export function useIntake() {
+/** Starts photo intake with the intent of the upload surface. */
+export function useIntake(intent: 'garments' | 'person' | 'auto' = 'garments') {
   const { act } = useApp();
   const input = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
@@ -97,7 +97,7 @@ export function useIntake() {
         if (!files.length) return;
         setBusy(true);
         await act(async () => {
-          for (const f of files) await uploadFile(f, { kind: 'intake' });
+          for (const f of files) await uploadFile(f, { kind: 'intake', intent, ...(files.length > 1 ? { batch: '1' } : {}) });
         }, files.length > 1 ? t('Додано фото: {n}', { n: files.length }) : t('Фото додано'));
         setBusy(false);
         if (input.current) input.current.value = '';
@@ -127,6 +127,7 @@ export function HomePage() {
 
   const fresh = openSuggestions(db).length;
   const next = purchaseRanking(db)[0];
+  const needsSetup = !db.onboarding?.completedAt && (!db.profile.identity || capsules.length === 0);
   // Capsula is about capsules (owner, 20.11): the question and the composer in the centre, two small chips,
   // then the capsules as tiles, the best rated first, left to right — like app.fashn.ai.
   return (
@@ -134,8 +135,9 @@ export function HomePage() {
       <section className="home-top">
         <h1 className="home-title">{t('Що одягнемо сьогодні?')}</h1>
         <Composer className="home-ask" value={text} onChange={setText} onSend={() => void analyze()} busy={analyzing} label={t('Підібрати')} placeholder={t('Уточни: вечеря, довга прогулянка, буду в приміщенні')} />
-        {(fresh > 0 || (next && next.looksIn > 0)) && (
+        {(needsSetup || fresh > 0 || (next && next.looksIn > 0)) && (
           <div className="home-chips">
+            {needsSetup && <a href="/setup" className="home-chip"><span className="chip-ic"><Sparkles size={14} /></span>{t('Налаштувати гардероб')}</a>}
             {fresh > 0 && <a href="/capsules?tab=new" className="home-chip"><span className="chip-ic"><Sparkles size={14} /></span>{t('Нові образи')}<span className="chip-n">{fresh}</span></a>}
             {next && next.looksIn > 0 && <a href={`/shopping?need=${next.need.id}`} className="home-chip"><span className="chip-ic"><ShoppingBag size={14} /></span>{t('Наступна покупка')}</a>}
           </div>

@@ -1,3 +1,11 @@
+.original-lightbox .filters.start { gap: 0 16px; }
+.original-lightbox .filters button:disabled { opacity: .4; cursor: default; }
+.gallery-photo-links { list-style: none; padding: 0; margin: 0; }
+.gallery-photo-links li { border-bottom: 1px solid var(--line); padding-block: 2px; }
+.gallery-photo-links .row { justify-content: space-between; }
+.gallery-photo-links a { display: inline-block; overflow-wrap: anywhere; }
+.gallery-photo-links button { flex: none; padding-inline: 8px; }
+
 @media (max-width: 640px) {
   .lightbox.inspiration-lightbox {
     display: flex;
