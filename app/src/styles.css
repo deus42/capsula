@@ -887,6 +887,7 @@ button.wtile { border: 0; background: none; padding: 0; font: inherit; color: in
 .set-edit { gap: 10px; }
 .set-counts { display: flex; flex-wrap: wrap; gap: 0 18px; margin: 0; font-size: 12.5px; color: var(--muted); }
 .set-counts .over { color: var(--warn); }
+.filters.set-filters { justify-content: flex-start; gap: 0 16px; margin: 0; }
 .set-choices { display: grid; gap: 16px; max-height: min(41vh, 360px); overflow-y: auto; padding: 2px 4px 6px; }
 .set-choice-group { display: grid; gap: 8px; }
 .set-choice-group h3 { font-size: 13px; font-weight: 500; color: var(--muted); }

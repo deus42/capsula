@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
 import { Plus, X } from 'lucide-react';
-import type { Capsule, SlotRef } from '../api.ts';
+import type { Capsule, Category, SlotRef } from '../api.ts';
 import { api, thumb } from '../api.ts';
 import { useApp, useDb } from '../store.tsx';
 import { CATEGORY_LABEL, resolveRef } from '../lib.ts';
@@ -11,6 +11,10 @@ import { LOOKS, t, plural as pluralize } from '../i18n.ts';
 const looksText = (n: number) => (n ? pluralize(n, LOOKS) : t('без образів'));
 const combosText = (n: number) => pluralize(n, { one: '{n} поєднання', few: '{n} поєднання', many: '{n} поєднань' });
 const GROUP_TEXT: Record<PieceGroup, string> = { garments: 'Одяг', shoes: 'Взуття', accessories: 'Аксесуари' };
+const CATEGORIES = Object.keys(CATEGORY_LABEL) as Category[];
+type PieceFilter = Category | 'all' | 'sport' | 'new' | 'needs_confirmation' | 'confirmed';
+const SPORT = /(?:^|[^\p{L}])(?:спорт(?:ивн\p{L}*)?|зал|біг|вело|плавання|тріатлон|фітнес|gym|sport|sports|running|cycling|swimming|triathlon|fitness)(?=$|[^\p{L}])/iu;
+const sportCapsule = (capsule: Capsule) => capsule.accessoryLimit === 4 || SPORT.test([capsule.name, ...capsule.situations].join(' '));
 const ROLE_ORDER = ['layer', 'top', 'bottom', 'shoes', 'accessories'];
 const byRole = (a: CapsulePiece, b: CapsulePiece) => ROLE_ORDER.indexOf(a.role) - ROLE_ORDER.indexOf(b.role) || Number(b.base) - Number(a.base) || b.looks - a.looks;
 const pieceHref = (r: SlotRef) => (r.kind === 'item' ? `/wardrobe/${r.id}` : `/shopping?need=${r.id}`);
@@ -93,6 +97,7 @@ export const initialSetDraft = (db: Parameters<typeof capsuleSet>[0], capsule: C
 export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsule; draft: SetDraft; onChange: (next: SetDraft) => void }) {
   const db = useDb();
   const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<PieceFilter>(() => sportCapsule(capsule) ? 'sport' : 'all');
   const searchInput = useRef<HTMLInputElement>(null);
   const limits = capsuleLimits(capsule);
   const groupOf = (r: SlotRef): PieceGroup => {
@@ -105,8 +110,26 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
   const pendingGroup = draft.pending ? groupOf(draft.pending) : null;
   const search = query.trim().toLocaleLowerCase();
   const matches = (...values: Array<string | undefined>) => values.join(' ').toLocaleLowerCase().includes(search);
-  const items = db.items.filter((i) => i.status !== 'inactive' && !i.mergedInto && !inSet.has(`item:${i.id}`) && matches(i.title, t(CATEGORY_LABEL[i.category]), i.brand, i.model));
-  const needs = db.needs.filter((n) => n.status === 'open' && !inSet.has(`need:${n.id}`) && matches(n.title, t(CATEGORY_LABEL[n.category])));
+  const availableItems = db.items.filter((i) => i.status !== 'inactive' && !i.mergedInto && !inSet.has(`item:${i.id}`));
+  const availableNeeds = db.needs.filter((n) => n.status === 'open' && !inSet.has(`need:${n.id}`));
+  const availableCategories = new Set([...availableItems, ...availableNeeds].map((piece) => piece.category));
+  const isNew = (item: typeof availableItems[number]) => item.origin === 'intake' && item.status === 'needs_confirmation';
+  const filters: { key: PieceFilter; label: string; available?: boolean }[] = [
+    { key: 'all', label: 'Усі речі' },
+    { key: 'sport', label: 'Спорт' },
+    { key: 'new', label: 'Нові з фото', available: availableItems.some(isNew) },
+    ...CATEGORIES.map((category) => ({ key: category, label: CATEGORY_LABEL[category], available: availableCategories.has(category) })),
+    { key: 'needs_confirmation', label: 'Звірити', available: availableItems.some((item) => item.status === 'needs_confirmation') },
+    { key: 'confirmed', label: 'Мої речі', available: availableItems.some((item) => item.status === 'confirmed') },
+  ];
+  const items = availableItems.filter((item) => {
+    const inFilter = filter === 'sport' ? item.sport : filter === 'new' ? isNew(item) : filter === 'all' || filter === item.category || filter === item.status;
+    return inFilter && matches(item.title, t(CATEGORY_LABEL[item.category]), item.brand, item.model);
+  });
+  const needs = availableNeeds.filter((need) => (
+    (filter === 'all' || filter === need.category || (filter === 'sport' && need.forCapsule === capsule.id))
+    && matches(need.title, t(CATEGORY_LABEL[need.category]))
+  ));
   const roleOf = (r: SlotRef) => {
     const c = pieceCategory(db, r);
     return c === 'outerwear' ? 'layer' : c === 'trousers' || c === 'shorts' || c === 'skirts' ? 'bottom' : c === 'shoes' || c === 'accessories' ? c : 'top';
@@ -165,6 +188,11 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
           <button type="button" className="quiet-toggle" onClick={() => onChange({ ...draft, pending: null })}>{t('Скасувати')}</button>
         </p>
       ) : <>
+        <div className="filters set-filters" role="group" aria-label={t('Категорії')}>
+          {filters.filter(({ key, available }) => available !== false || key === filter).map(({ key, label }) => (
+            <button key={key} type="button" className={key === filter ? 'on' : undefined} aria-pressed={key === filter} onClick={() => setFilter(key)}>{t(label)}</button>
+          ))}
+        </div>
         <input ref={searchInput} type="search" className="input" aria-label={t('Пошук речі')} placeholder={t('Пошук речі')} value={query} onChange={(event) => setQuery(event.target.value)} />
         {items.length + needs.length > 0 ? (
           <div className="set-choices">
