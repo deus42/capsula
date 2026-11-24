@@ -118,6 +118,8 @@ export interface Item {
   id: string;
   rev: number;
   category: Category;
+  /** Wardrobe filter independent of the outfit slot. */
+  sport?: boolean;
   title: string;
   color?: string;
   brand?: string;
@@ -283,6 +285,8 @@ export interface Capsule {
   pieces?: SlotRef[];
   /** One or two pieces of the set the capsule's looks are built on, like Karan's bodysuit. */
   base?: SlotRef[];
+  /** Multisport equipment can use a fourth accessory place. */
+  accessoryLimit?: 4;
   /** A retired capsule's old URL leads to the capsules that received its looks. */
   redirectCapsuleIds?: string[];
   origin: 'source' | 'agent' | 'owner';
@@ -568,6 +572,7 @@ export function validateDb(db: unknown): string | null {
   }
   for (const i of d.items) {
     if (!CATEGORIES.includes(i.category)) return `Річ ${i.id}: невідома категорія`;
+    if (i.sport !== undefined && typeof i.sport !== 'boolean') return `Річ ${i.id}: некоректна категорія «Спорт»`;
     if (!ITEM_STATUSES.includes(i.status)) return `Річ ${i.id}: невідомий статус`;
     if (!i.title?.trim()) return `Річ ${i.id}: порожня назва`;
     for (const pid of i.photoIds) if (!has('photos', pid)) return `Річ ${i.id}: немає фото ${pid}`;
@@ -606,9 +611,10 @@ export function validateDb(db: unknown): string | null {
     if (c.disliked !== undefined && typeof c.disliked !== 'boolean') return `Капсула ${c.id}: некоректна оцінка`;
     if (c.disliked && c.favorite) return `Капсула ${c.id}: лайк і дизлайк одночасно`;
     if (c.base && !c.pieces) return `Капсула ${c.id}: база без набору`;
+    if (c.accessoryLimit !== undefined && c.accessoryLimit !== 4) return `Капсула ${c.id}: некоректний ліміт аксесуарів`;
     if (c.pieces !== undefined) {
       if (!Array.isArray(c.pieces) || (c.base !== undefined && !Array.isArray(c.base))) return `Капсула ${c.id}: некоректний набір`;
-      const err = pieceSetError(d, c.pieces, c.base ?? []);
+      const err = pieceSetError(d, c.pieces, c.base ?? [], c);
       if (err) return `Капсула ${c.id}: ${err}`;
     }
   }

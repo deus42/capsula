@@ -268,7 +268,7 @@ function EditCapsule({ capsule, onClose }: { capsule: Capsule; onClose: () => vo
           </select>
         </label>
         <label className="field full"><span>{t('Ситуації (по рядку)')}</span><textarea className="textarea" value={situations} onChange={(e) => setSituations(e.target.value)} /></label>
-        {!isSelection && <CapsuleSetEditor draft={setDraft} onChange={setSetDraft} />}
+        {!isSelection && <CapsuleSetEditor capsule={capsule} draft={setDraft} onChange={setSetDraft} />}
       </div>
     </Modal>
   );

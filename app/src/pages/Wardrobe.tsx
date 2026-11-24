@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { ReactNode } from 'react';
-import { Archive, Camera, Check, CircleCheck, CircleDashed, Grid2x2, Merge, Pencil, Plus, Search, Sparkles, Trash2, Wand2 } from 'lucide-react';
+import { Archive, Camera, Check, CircleCheck, CircleDashed, Dumbbell, Grid2x2, Merge, Pencil, Plus, Search, Sparkles, Trash2, Wand2 } from 'lucide-react';
 import type { Category, Item, ItemStatus, Job } from '../api.ts';
 import { api, media, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
@@ -153,13 +153,14 @@ function DeleteItem({ item, className, children }: { item: Item; className: stri
 /** Everything editable about an item, in one modal behind the pencil. */
 function ItemEdit({ item, onClose }: { item: Item; onClose: () => void }) {
   const { act } = useApp();
+  const [sport, setSport] = useState(Boolean(item.sport));
   const [form, setForm] = useState({ title: item.title, category: item.category, color: item.color ?? '', brand: item.brand ?? '', model: item.model ?? '', composition: item.composition ?? '', fit: item.fit ?? '', size: item.size ?? '' });
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) => setForm((f) => ({ ...f, [k]: e.target.value }));
   const field = (k: keyof typeof form, label: string) => (
     <label className="field"><span>{t(label)}</span><input className="input" value={form[k]} onChange={set(k)} /></label>
   );
   const save = async () => {
-    const ok = await act(() => api('PATCH', `/api/items/${item.id}`, { rev: item.rev, ...form }), t('Збережено'));
+    const ok = await act(() => api('PATCH', `/api/items/${item.id}`, { rev: item.rev, ...form, sport }), t('Збережено'));
     if (ok) onClose();
   };
   return (
@@ -189,6 +190,7 @@ function ItemEdit({ item, onClose }: { item: Item; onClose: () => void }) {
         {field('model', 'Модель')}
         {field('composition', 'Склад')}
         {field('fit', 'Крій')}
+        <label className="row"><input type="checkbox" checked={sport} onChange={(event) => setSport(event.target.checked)} /> {t('Спорт')}</label>
       </div>
     </Modal>
   );
@@ -198,6 +200,7 @@ function NewItem({ onClose }: { onClose: () => void }) {
   const { act } = useApp();
   const [title, setTitle] = useState('');
   const [category, setCategory] = useState<Category>('tees');
+  const [sport, setSport] = useState(false);
   return (
     <Modal
       title={t('Нова річ')}
@@ -208,7 +211,7 @@ function NewItem({ onClose }: { onClose: () => void }) {
           <button
             className="btn primary"
             onClick={async () => {
-              const item = await act(() => api<Item>('POST', '/api/items', { title, category }), t('Річ додано'));
+              const item = await act(() => api<Item>('POST', '/api/items', { title, category, sport }), t('Річ додано'));
               if (item) {
                 onClose();
                 go(`/wardrobe/${item.id}`);
@@ -228,6 +231,7 @@ function NewItem({ onClose }: { onClose: () => void }) {
             {CATS.map((c) => <option key={c} value={c}>{t(CATEGORY_LABEL[c])}</option>)}
           </select>
         </label>
+        <label className="row"><input type="checkbox" checked={sport} onChange={(event) => setSport(event.target.checked)} /> {t('Спорт')}</label>
       </div>
     </Modal>
   );
@@ -257,14 +261,15 @@ export function WardrobePage({ openId }: { openId?: string }) {
   const status = (['needs_confirmation', 'confirmed', 'inactive'] as ItemStatus[]).includes(view as ItemStatus) ? (view as ItemStatus) : null;
   const isNew = (i: Item) => i.origin === 'intake' && i.status === 'needs_confirmation';
   const cat = CATS.includes(view as Category) ? (view as Category) : null;
+  const sport = view === 'sport';
   // Inactive items only appear in the «Неактуальні» filter.
   const list = db.items.filter(
-    (i) => !i.mergedInto && !(mode === 'compose' && isBlockedEyewear(db, i.title)) && (view !== 'new' || isNew(i)) && (!cat || i.category === cat) && (status ? i.status === status : i.status !== 'inactive') && `${i.title} ${i.id} ${i.brand ?? ''}`.toLowerCase().includes(q.trim().toLowerCase()),
+    (i) => !i.mergedInto && !(mode === 'compose' && isBlockedEyewear(db, i.title)) && (view !== 'new' || isNew(i)) && (!cat || i.category === cat) && (!sport || i.sport) && (status ? i.status === status : i.status !== 'inactive') && `${i.title} ${i.id} ${i.brand ?? ''}`.toLowerCase().includes(q.trim().toLowerCase()),
   );
   const visible = db.items.filter((i) => i.status !== 'inactive' && !i.mergedInto);
   const open = openId ? db.items.find((i) => i.id === openId) : undefined;
   const missing = db.items.filter((i) => !i.packshotId && i.status !== 'inactive' && !busy.has(i.id)).length;
-  const title = t(view === 'new' ? 'Нові з фото' : cat ? CATEGORY_LABEL[cat] : status ? STATUS_LABEL[status] : 'Усі речі');
+  const title = t(view === 'new' ? 'Нові з фото' : sport ? 'Спорт' : cat ? CATEGORY_LABEL[cat] : status ? STATUS_LABEL[status] : 'Усі речі');
   // An item opens as its own page, not a side panel over the grid.
   if (open) return <ItemPage item={open} />;
 
@@ -301,7 +306,10 @@ export function WardrobePage({ openId }: { openId?: string }) {
                 ...(db.items.some(isNew) ? [{ key: 'new', label: 'Нові з фото', icon: <Camera size={17} />, n: db.items.filter(isNew).length }] : []),
               ],
             },
-            { label: 'Категорії', items: CATS.map((c) => ({ key: c, label: CATEGORY_LABEL[c], icon: <CategoryIcon category={c} size={17} />, n: visible.filter((i) => i.category === c).length })) },
+            { label: 'Категорії', items: [
+              { key: 'sport', label: 'Спорт', icon: <Dumbbell size={17} />, n: visible.filter((i) => i.sport).length },
+              ...CATS.map((c) => ({ key: c, label: CATEGORY_LABEL[c], icon: <CategoryIcon category={c} size={17} />, n: visible.filter((i) => i.category === c).length })),
+            ] },
             {
               label: 'Статус',
               items: [

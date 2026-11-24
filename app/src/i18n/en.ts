@@ -202,6 +202,8 @@ export const en: Record<string, string> = {
   "У капсулі до 10 речей одягу. Що замінити?": "A capsule holds up to 10 garments. What should go?",
   "У капсулі до 3 пар взуття. Що замінити?": "A capsule holds up to 3 pairs of shoes. What should go?",
   "У капсулі до 3 аксесуарів. Що замінити?": "A capsule holds up to 3 accessories. What should go?",
+  "У капсулі до 4 аксесуарів. Що замінити?": "This capsule holds up to 4 accessories. What should go?",
+  "Спорт": "Sports",
   "База капсули — до 2 речей": "A capsule base has up to 2 pieces",
   "База капсули має бути з її набору": "A capsule base must come from its set",
   // Look

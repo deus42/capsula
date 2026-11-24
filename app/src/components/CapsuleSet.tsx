@@ -4,7 +4,7 @@ import type { Capsule, SlotRef } from '../api.ts';
 import { thumb } from '../api.ts';
 import { useDb } from '../store.tsx';
 import { CATEGORY_LABEL, resolveRef } from '../lib.ts';
-import { CAPSULE_LIMITS, MAX_BASE_PIECES, capsuleSet, pieceCategory, pieceGroup, pieceKey, type CapsulePiece, type PieceGroup } from '../capsule-pieces.ts';
+import { CAPSULE_LIMITS, MAX_BASE_PIECES, capsuleLimits, capsuleSet, pieceCategory, pieceGroup, pieceKey, type CapsulePiece, type PieceGroup } from '../capsule-pieces.ts';
 import { Badge, CategoryIcon } from './ui.tsx';
 import { LOOKS, t, plural as pluralize } from '../i18n.ts';
 
@@ -66,8 +66,9 @@ export const initialSetDraft = (db: Parameters<typeof capsuleSet>[0], capsule: C
 });
 
 /** The set inside the capsule's pencil modal: remove, add, replace at the limit, mark the base. */
-export function CapsuleSetEditor({ draft, onChange }: { draft: SetDraft; onChange: (next: SetDraft) => void }) {
+export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsule; draft: SetDraft; onChange: (next: SetDraft) => void }) {
   const db = useDb();
+  const limits = capsuleLimits(capsule);
   const groupOf = (r: SlotRef): PieceGroup => {
     const c = pieceCategory(db, r);
     return c ? pieceGroup(c) : 'garments';
@@ -89,7 +90,7 @@ export function CapsuleSetEditor({ draft, onChange }: { draft: SetDraft; onChang
     if (!id) return;
     const ref: SlotRef = { kind, id };
     const g = groupOf(ref);
-    if (counts[g] >= CAPSULE_LIMITS[g]) onChange({ ...draft, pending: ref });
+    if (counts[g] >= limits[g]) onChange({ ...draft, pending: ref });
     else onChange({ ...draft, pieces: [...draft.pieces, ref], pending: null });
   };
   const remove = (r: SlotRef) => onChange({ ...draft, pieces: draft.pieces.filter((x) => pieceKey(x) !== pieceKey(r)), base: draft.base.filter((k) => k !== pieceKey(r)) });
@@ -108,8 +109,8 @@ export function CapsuleSetEditor({ draft, onChange }: { draft: SetDraft; onChang
     <div className="field full set-edit">
       <span>{t('Речі')}</span>
       <p className="set-counts">
-        {(Object.keys(CAPSULE_LIMITS) as PieceGroup[]).map((g) => (
-          <span key={g} className={counts[g] > CAPSULE_LIMITS[g] ? 'over' : ''}>{t(GROUP_TEXT[g])} {counts[g]}/{CAPSULE_LIMITS[g]}</span>
+        {(Object.keys(limits) as PieceGroup[]).map((g) => (
+          <span key={g} className={counts[g] > limits[g] ? 'over' : ''}>{t(GROUP_TEXT[g])} {counts[g]}/{limits[g]}</span>
         ))}
       </p>
       <ul className="set-list">
@@ -135,7 +136,7 @@ export function CapsuleSetEditor({ draft, onChange }: { draft: SetDraft; onChang
       </ul>
       {draft.pending && pendingGroup && (
         <p className="set-note">
-          {t('{group} уже {n}/{max}: що замінить «{title}»?', { group: t(GROUP_TEXT[pendingGroup]), n: counts[pendingGroup], max: CAPSULE_LIMITS[pendingGroup], title: resolveRef(db, draft.pending).title })}
+          {t('{group} уже {n}/{max}: що замінить «{title}»?', { group: t(GROUP_TEXT[pendingGroup]), n: counts[pendingGroup], max: limits[pendingGroup], title: resolveRef(db, draft.pending).title })}
           <button type="button" className="quiet-toggle" onClick={() => onChange({ ...draft, pending: null })}>{t('Скасувати')}</button>
         </p>
       )}

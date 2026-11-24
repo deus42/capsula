@@ -477,6 +477,7 @@ on('POST', '/api/items', async (ctx, _p, b) => {
     const at = now();
     const item: Item = { id: newId('W'), rev: 1, category, title: str(b.title, 200) || 'Нова річ', status: 'confirmed', photoIds: [], origin: 'manual', history: [{ at, action: 'created', note: 'Додано власником' }], createdAt: at, updatedAt: at };
     pick(item, b, ['color', 'brand', 'model', 'composition', 'fit', 'size']);
+    if (b.sport === true) item.sport = true;
     db.items.push(item);
     queueAdvice(db, `Нова річ: ${item.title}`);
     return item;
@@ -491,6 +492,7 @@ on('PATCH', '/api/items/:id', async (ctx, [id], b) => {
     bump(item, b.rev);
     const before = item.status;
     pick(item, b, ['title', 'color', 'brand', 'model', 'composition', 'fit', 'size']);
+    if (typeof b.sport === 'boolean') item.sport = b.sport;
     if (b.category && CATEGORIES.includes(b.category as never)) item.category = b.category as Item['category'];
     if (b.status && ITEM_STATUSES.includes(b.status as never)) item.status = b.status as Item['status'];
     // «Це моя річ? — Ні»: a rejected item no longer covers a recommendation; its looks get the stand-in back.
@@ -517,6 +519,7 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
       id: newId('W'),
       rev: 1,
       category: sources[0].category,
+      ...(sources.some((item) => item.sport) ? { sport: true } : {}),
       title: str(b.title, 200) || sources[0].title,
       // Merging items the owner already confirmed does not ask «Це моя річ?» again.
       status: sources.every((s) => s.status === 'confirmed') ? 'confirmed' : 'needs_confirmation',
@@ -555,7 +558,7 @@ on('POST', '/api/items/:id/split', (ctx, [id], b) =>
     const photoIds = (Array.isArray(b.photoIds) ? (b.photoIds as string[]) : []).filter((p) => item.photoIds.includes(p));
     if (!photoIds.length || photoIds.length === item.photoIds.length) throw new HttpError(400, 'Вибери частину фото для окремої речі');
     const at = now();
-    const part: Item = { id: newId('W'), rev: 1, category: item.category, title: str(b.title, 200) || `${item.title} (окрема)`, status: 'needs_confirmation', photoIds, observation: item.observation, origin: 'split', splitFrom: item.id, history: [{ at, action: 'split', note: `Відокремлено від ${item.id}` }], createdAt: at, updatedAt: at };
+    const part: Item = { id: newId('W'), rev: 1, category: item.category, ...(item.sport ? { sport: true } : {}), title: str(b.title, 200) || `${item.title} (окрема)`, status: 'needs_confirmation', photoIds, observation: item.observation, origin: 'split', splitFrom: item.id, history: [{ at, action: 'split', note: `Відокремлено від ${item.id}` }], createdAt: at, updatedAt: at };
     item.photoIds = item.photoIds.filter((p) => !photoIds.includes(p));
     clearDetachedCrop(db, item);
     bump(item, b.rev);

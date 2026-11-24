@@ -71,7 +71,7 @@ export function setCapsulePieces(db: DB, capsule: Capsule, rawPieces: unknown, r
   const base = rawBase === undefined
     ? (capsule.base ?? []).filter((r) => keys.has(pieceKey(r)))
     : rawBase === null ? [] : unique(db, refList(rawBase));
-  const err = pieceSetError(db, pieces, base);
+  const err = pieceSetError(db, pieces, base, capsule);
   if (err) throw new HttpError(422, err);
   const candidate = { ...capsule, pieces };
   const misfits = visibleCapsuleLooks(db, capsule).filter((l) => piecesOutsideSet(db, candidate, l.slots).length);

@@ -186,6 +186,27 @@ test('saved looks and completed drafts automatically request one try-on of their
   assert.equal(jobs(noReference.id)[0].state, 'needs_data');
 });
 
+test('sports tagging preserves item categories and a multisport capsule can store four accessories', async () => {
+  const { store, call } = setup();
+  const refs: DB["looks"][number]["slots"]["accessories"] = [];
+  for (const name of ['Helmet', 'Cycling glasses', 'Swim cap', 'Goggles']) {
+    const item = await call('POST', '/api/items', { title: name, category: 'accessories', sport: true });
+    assert.equal(item.category, 'accessories');
+    assert.equal(item.sport, true);
+    refs.push({ kind: 'item', id: item.id });
+  }
+  await call('PATCH', `/api/items/${refs[0].id}`, { sport: false });
+  assert.equal(store.read().items.find((item) => item.id === refs[0].id)?.sport, false);
+  const capsuleId = 'C-sports';
+  await store.mutate((db) => { db.capsules.push({ ...db.capsules[0], id: capsuleId, name: 'Pool and road', lookIds: [] }); });
+  await assert.rejects(call('PATCH', `/api/capsules/${capsuleId}`, { pieces: refs }), /до 3 аксесуарів/);
+  await store.mutate((db) => { db.capsules.find((capsule) => capsule.id === capsuleId)!.accessoryLimit = 4; });
+  await call('PATCH', `/api/capsules/${capsuleId}`, { pieces: refs });
+  const db = store.read();
+  assert.equal(capsuleSet(db, db.capsules.find((capsule) => capsule.id === capsuleId)!).counts.accessories, 4);
+  assert.equal(validateDb(db), null);
+});
+
 test('fixture is valid and seeds an atomic file with a previous-valid backup', async () => {
   assert.equal(validateDb(fixture()), null);
   const { dir, store, call } = setup();

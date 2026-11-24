@@ -13,6 +13,10 @@ export const MAX_BASE_PIECES = 2;
 
 export type PieceGroup = keyof typeof CAPSULE_LIMITS;
 export type PieceRole = 'top' | 'layer' | 'bottom' | 'shoes' | 'accessories';
+type Limits = Record<PieceGroup, number>;
+type LimitOptions = Pick<Capsule, 'accessoryLimit'>;
+
+export const capsuleLimits = (capsule: LimitOptions): Limits => ({ ...CAPSULE_LIMITS, accessories: capsule.accessoryLimit ?? CAPSULE_LIMITS.accessories });
 
 type PieceDb = Pick<DB, 'items' | 'needs' | 'products'>;
 
@@ -128,7 +132,8 @@ export function capsuleSet(db: DB, c: Capsule): CapsuleSet {
     counts[p.group] += 1;
     roles[p.role] += 1;
   }
-  const over = (Object.keys(CAPSULE_LIMITS) as PieceGroup[]).filter((g) => counts[g] > CAPSULE_LIMITS[g]);
+  const limits = capsuleLimits(c);
+  const over = (Object.keys(limits) as PieceGroup[]).filter((g) => counts[g] > limits[g]);
   // A dress worn as the top is a whole outfit on its own: it counts as a dress, not as a top to pair with bottoms.
   const dresses = pieces.filter((p) => p.category === 'dresses' && p.role === 'top').length;
   return { saved: Boolean(c.pieces), pieces, counts, roles, combinations: capsuleCombinations({ ...roles, top: roles.top - dresses, dresses }), over };
@@ -137,11 +142,11 @@ export function capsuleSet(db: DB, c: Capsule): CapsuleSet {
 const GROUP_LIMIT_TEXT: Record<PieceGroup, string> = {
   garments: `до ${CAPSULE_LIMITS.garments} речей одягу`,
   shoes: `до ${CAPSULE_LIMITS.shoes} пар взуття`,
-  accessories: `до ${CAPSULE_LIMITS.accessories} аксесуарів`,
+  accessories: 'аксесуарів',
 };
 
 /** Why a set cannot be saved, or null. Products must already be normalized to their purchase. */
-export function pieceSetError(db: PieceDb, pieces: SlotRef[], base: SlotRef[] = []): string | null {
+export function pieceSetError(db: PieceDb, pieces: SlotRef[], base: SlotRef[] = [], capsule: LimitOptions = {}): string | null {
   const keys = new Set<string>();
   const counts: Record<PieceGroup, number> = { garments: 0, shoes: 0, accessories: 0 };
   for (const r of pieces) {
@@ -152,8 +157,12 @@ export function pieceSetError(db: PieceDb, pieces: SlotRef[], base: SlotRef[] = 
     keys.add(pieceKey(r));
     counts[pieceGroup(category)] += 1;
   }
-  for (const g of Object.keys(CAPSULE_LIMITS) as PieceGroup[]) {
-    if (counts[g] > CAPSULE_LIMITS[g]) return `У капсулі ${GROUP_LIMIT_TEXT[g]}. Що замінити?`;
+  const limits = capsuleLimits(capsule);
+  for (const g of Object.keys(limits) as PieceGroup[]) {
+    if (counts[g] > limits[g]) {
+      const limit = g === 'accessories' ? `до ${limits[g]} ${GROUP_LIMIT_TEXT[g]}` : GROUP_LIMIT_TEXT[g];
+      return `У капсулі ${limit}. Що замінити?`;
+    }
   }
   if (base.length > MAX_BASE_PIECES) return `База капсули — до ${MAX_BASE_PIECES} речей`;
   for (const r of base) if (!keys.has(pieceKey(r))) return 'База капсули має бути з її набору';
@@ -173,7 +182,7 @@ export const fashionCapsules = (db: DB) => db.capsules.filter((c) => c.kind !== 
 /** Free places of a saved set per group; null while the set is still read from the looks. */
 export function freePlaces(db: PieceDb, c: Capsule): Record<PieceGroup, number> | null {
   if (!c.pieces) return null;
-  const free: Record<PieceGroup, number> = { ...CAPSULE_LIMITS };
+  const free = capsuleLimits(c);
   for (const r of c.pieces) {
     const category = pieceCategory(db, r);
     if (category) free[pieceGroup(category)] -= 1;
