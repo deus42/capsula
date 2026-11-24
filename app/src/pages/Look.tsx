@@ -167,6 +167,11 @@ export function LookPage({ id }: { id: string }) {
         <div className="actions">
           <RateButtons kind="look" target={look} />
           <button className="icon-btn" aria-label={t('Редагувати образ')} onClick={() => setEditing(true)}><Pencil size={14} /></button>
+          {capsule && !hidden && pieces.length > 0 && (
+            <button type="button" className="btn" onClick={() => setSwap({ variant: true })}>
+              <Plus size={15} /> {t('Створити варіант')}
+            </button>
+          )}
         </div>
       </div>
 
@@ -263,7 +268,6 @@ export function LookPage({ id }: { id: string }) {
       {editing && <EditLook
         look={look}
         onClose={() => setEditing(false)}
-        onCreateVariant={capsule && !hidden && pieces.length ? () => { setEditing(false); setSwap({ variant: true }); } : undefined}
         onMakePrimary={canMakePrimary ? () => void act(() => api('POST', `/api/looks/${look.id}/primary`, { rev: look.rev })).then((saved) => { if (saved) setEditing(false); }) : undefined}
       />}
       {swap?.variant && !swap.current ? (

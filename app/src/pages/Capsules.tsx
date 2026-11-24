@@ -100,7 +100,7 @@ function LookGrid({ looks, heading = true, filter, mark = true }: { looks: Look[
   </>;
 }
 
-export function EditLook({ look, onClose, onCreateVariant, onMakePrimary }: { look: Look; onClose: () => void; onCreateVariant?: () => void; onMakePrimary?: () => void }) {
+export function EditLook({ look, onClose, onMakePrimary }: { look: Look; onClose: () => void; onMakePrimary?: () => void }) {
   const db = useDb();
   const { act } = useApp();
   const [name, setName] = useState(look.name);
@@ -151,9 +151,8 @@ export function EditLook({ look, onClose, onCreateVariant, onMakePrimary }: { lo
         </select></label>
         <label className="field full"><span>{t('Нотатка')}</span><textarea className="textarea" value={note} onChange={(e) => setNote(e.target.value)} /></label>
       </div>
-      {(onCreateVariant || onMakePrimary) && <div className="row wrap" style={{ marginTop: 12 }}>
-        {onCreateVariant && <button className="btn ghost" onClick={onCreateVariant}>{t('Створити варіант')}</button>}
-        {onMakePrimary && <button className="btn ghost" onClick={onMakePrimary}>{t('Зробити головним')}</button>}
+      {onMakePrimary && <div className="row wrap" style={{ marginTop: 12 }}>
+        <button className="btn ghost" onClick={onMakePrimary}>{t('Зробити головним')}</button>
       </div>}
     </Modal>
   );
