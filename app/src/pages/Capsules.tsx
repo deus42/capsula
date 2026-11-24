@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { EyeOff, ImageOff, Pencil, Plus, Sparkles, Trash2 } from 'lucide-react';
-import type { Capsule, Look, Season } from '../api.ts';
+import type { Capsule, Look, Season, SlotRef, SlotKey } from '../api.ts';
 import { api } from '../api.ts';
 import { go, useApp, useDb, useRoute } from '../store.tsx';
 import { Badge, ConfirmButton, Empty, LookArt, Missing, Modal, PieceBlocks, RateButtons } from '../components/ui.tsx';
-import { SEASON_LABEL, openSuggestions, periodLine, bestLooks, capsuleLooks, capsuleRating, distinctLooks, isBestLook, lookRating, scoreLabel, isComplete, piecesOf, rankCapsules, rankLooks, readyLine, wardrobeCapsule, BEST_CAPSULE_NAME, WARDROBE_CAPSULE_NAME } from '../lib.ts';
+import { SEASON_LABEL, SLOT_CATEGORIES, SLOT_LABEL, openSuggestions, periodLine, bestLooks, capsuleLooks, capsuleRating, distinctLooks, hasPieces, isBestLook, lookRating, resolveRef, scoreLabel, isComplete, piecesOf, rankCapsules, rankLooks, readyLine, wardrobeCapsule, BEST_CAPSULE_NAME, WARDROBE_CAPSULE_NAME } from '../lib.ts';
+import { capsulePieceRefs, pieceKey } from '../capsule-pieces.ts';
 import { hiddenLookIds, isCapsuleArchived, isCapsuleHidden } from '../rating.ts';
 import { CapsuleTile, tileCovers } from './Home.tsx';
 import { NewLooks } from './NewLooks.tsx';
@@ -154,6 +155,52 @@ export function EditLook({ look, onClose }: { look: Look; onClose: () => void })
   );
 }
 
+function CreateLook({ capsule, onClose }: { capsule: Capsule; onClose: () => void }) {
+  const db = useDb();
+  const { act } = useApp();
+  const [name, setName] = useState('');
+  const [slots, setSlots] = useState<Look['slots']>({ layer: [], top: [], bottom: [], shoes: [], accessories: [] });
+  const [saving, setSaving] = useState(false);
+  const refs: SlotRef[] = capsule.pieces ? capsulePieceRefs(db, capsule) : [
+    ...db.items.filter((item) => item.status !== 'inactive' && !item.mergedInto).map((item) => ({ kind: 'item' as const, id: item.id })),
+    ...db.needs.filter((need) => need.status === 'open').map((need) => ({ kind: 'need' as const, id: need.id })),
+  ];
+  const options = refs.map((ref) => resolveRef(db, ref));
+  const picked = new Set(Object.values(slots).flat().map(pieceKey));
+  const save = async () => {
+    setSaving(true);
+    const look = await act(() => api<Look>('POST', '/api/looks', { capsuleId: capsule.id, name, slots }), t('Образ додано'));
+    setSaving(false);
+    if (look) go(`/looks/${look.id}`);
+  };
+  return <Modal title={t('Новий образ')} onClose={onClose} footer={<>
+    <button className="btn" onClick={onClose}>{t('Скасувати')}</button>
+    <button className="btn primary" disabled={saving || !hasPieces({ slots })} onClick={() => void save()}>{t('Зберегти')}</button>
+  </>}>
+    <div className="grid-form">
+      <label className="field full"><span>{t('Назва')}</span><input className="input" value={name} onChange={(event) => setName(event.target.value)} /></label>
+      {(Object.keys(slots) as SlotKey[]).map((slot) => <div className="field full" key={slot}>
+        <label className="field">
+          <span>{t(SLOT_LABEL[slot])}</span>
+          <select className="select" value="" onChange={(event) => {
+            const option = options.find((entry) => pieceKey(entry.ref) === event.target.value);
+            if (option) setSlots({ ...slots, [slot]: [...slots[slot], option.ref] });
+          }}>
+            <option value="" disabled>{t('Додати річ')}</option>
+            {options.filter((option) => option.category && SLOT_CATEGORIES[slot].includes(option.category) && !picked.has(pieceKey(option.ref))).map((option) =>
+              <option key={pieceKey(option.ref)} value={pieceKey(option.ref)}>{option.title}</option>)}
+          </select>
+        </label>
+        {slots[slot].length > 0 && <div className="row wrap">
+          {slots[slot].map((ref) => <button type="button" className="btn sm ghost" key={pieceKey(ref)} title={t('Прибрати з образу')} onClick={() => setSlots({ ...slots, [slot]: slots[slot].filter((entry) => pieceKey(entry) !== pieceKey(ref)) })}>
+            {resolveRef(db, ref).title} ×
+          </button>)}
+        </div>}
+      </div>)}
+    </div>
+  </Modal>;
+}
+
 function LookCard({ look, mark = false }: { look: Look; mark?: boolean }) {
   const db = useDb();
   const best = mark && isBestLook(db, look.id);
@@ -229,9 +276,9 @@ function EditCapsule({ capsule, onClose }: { capsule: Capsule; onClose: () => vo
 
 export function CapsuleDetail({ id }: { id: string }) {
   const db = useDb();
-  const { act } = useApp();
   const { query } = useRoute();
   const [editing, setEditing] = useState(false);
+  const [creating, setCreating] = useState(false);
   const capsule = db.capsules.find((c) => c.id === id);
   const allLooks = useMemo(() => capsuleLooks(db, capsule?.lookIds ?? []), [capsule, db]);
   if (!capsule) return <div className="page"><Empty icon={<ImageOff />} title={t('Не знайдено')} /></div>;
@@ -263,11 +310,6 @@ export function CapsuleDetail({ id }: { id: string }) {
   const pieces = looks.flatMap((l) => piecesOf(db, l.slots));
   const isSelection = capsule.kind === 'selection';
 
-  const addLook = async () => {
-    const look = await act(() => api<Look>('POST', '/api/looks', { capsuleId: capsule.id, name: `${t('Образ')} ${allLooks.length + 1}`, slots: {} }), t('Образ додано'));
-    if (look) go(`/looks/${look.id}`);
-  };
-
   return (
     <div className="page">
       <div className="crumb"><a href={isSelection ? '/capsules?tab=selections' : '/capsules'}>{isSelection ? t('Підбірки') : t('Капсули')}</a></div>
@@ -285,12 +327,13 @@ export function CapsuleDetail({ id }: { id: string }) {
         <div className="actions">
           <RateButtons kind="capsule" target={capsule} />
           <button className="icon-btn" aria-label={t('Редагувати')} onClick={() => setEditing(true)}><Pencil size={14} /></button>
-          <button className="btn primary" onClick={() => void addLook()}><Plus size={16} /> {t('Образ')}</button>
+          <button className="btn primary" onClick={() => setCreating(true)}><Plus size={16} /> {t('Образ')}</button>
         </div>
       </div>
       <LookGrid looks={looks} filter={!hidden && <div className="filters" role="group" aria-label={t('Фільтр образів')}><Filter active={readyOnly} href={`/capsules/${capsule.id}${readyOnly ? '' : '?owned=1'}`}>{t(WARDROBE_CAPSULE_NAME)}</Filter></div>} />
       {isSelection ? <PieceBlocks pieces={pieces} ownTitle={t('Речі капсули')} /> : <CapsuleSetSection capsule={capsule} />}
       {editing && <EditCapsule capsule={capsule} onClose={() => setEditing(false)} />}
+      {creating && <CreateLook capsule={capsule} onClose={() => setCreating(false)} />}
     </div>
   );
 }
