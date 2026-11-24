@@ -1,9 +1,9 @@
-import { useState } from 'react';
+import { Fragment, useState } from 'react';
 import { Pencil, Plus, X } from 'lucide-react';
 import { CATEGORIES } from '../../server/schema.ts';
 import { api, type KnownSize } from '../api.ts';
-import { brandKey, sizeEvidence, sizingBrands } from '../brand-sizes.ts';
-import { sizeGuides } from '../size-guides.ts';
+import { brandKey, sizeEvidence, sizingBrands, type SizeEvidence } from '../brand-sizes.ts';
+import { myRows, sizeGuides } from '../size-guides.ts';
 import { useApp, useDb } from '../store.tsx';
 import { Modal } from '../components/ui.tsx';
 import { CATEGORY_LABEL } from '../lib.ts';
@@ -52,15 +52,30 @@ function EditSizes({ brands, defaultBrand, onClose }: { brands: string[]; defaul
   );
 }
 
+/** Brands as quiet text toggles; my sizes stand out in the display serif and as marked rows of the original charts. */
 export function BrandSizing() {
   const db = useDb();
   const [editing, setEditing] = useState(false);
   const [selected, setSelected] = useState('');
   const brands = sizingBrands(db);
-  const records = sizeEvidence(db);
-  const activeBrand = brands.find((brand) => brandKey(brand) === selected) ?? db.profile.knownSizes?.[0]?.brand ?? brands[0];
+  const records = sizeEvidence(db).filter((row) => row.brand);
+  const known = (name: string) => brands.find((brand) => brandKey(brand) === brandKey(name));
+  const activeBrand = known(selected) ?? records.map((row) => known(row.brand)).find(Boolean) ?? brands[0];
   const activeGuides = activeBrand ? sizeGuides(activeBrand) : [];
   const personal = records.filter((row) => brandKey(row.brand) === brandKey(activeBrand ?? ''));
+  const mine = new Map<string, { size: string; category: SizeEvidence['category']; items: { id: string; title: string }[] }>();
+  for (const row of personal) {
+    const key = `${row.category}|${row.size.trim().toUpperCase()}`;
+    const group = mine.get(key) ?? { size: row.size.trim(), category: row.category, items: [] };
+    if (row.item) group.items.push(row.item);
+    mine.set(key, group);
+  }
+  const rowsFor = (guide: ReturnType<typeof sizeGuides>[number]) => {
+    const own = personal.filter((row) => guide.categories.includes(row.category)).map((row) => row.size);
+    const shoe = guide.columns[0] === 'EU' && guide.categories.includes('shoes') && db.profile.shoeSizeEu ? [db.profile.shoeSizeEu] : [];
+    return myRows(guide, own.length ? own : shoe);
+  };
+  const marked = activeGuides.map(rowsFor);
   return (
     <section className="card lg brand-sizing" aria-labelledby="brand-sizing-title">
       <div className="section-head">
@@ -70,19 +85,21 @@ export function BrandSizing() {
       {db.profile.shoeSizeEu && <p className="small muted">{t('Мій розмір взуття (EU)')} <strong>{db.profile.shoeSizeEu}</strong></p>}
       {activeBrand && (
         <>
-          <label className="field brand-size-picker">
-            <span>{t('Бренд')}</span>
-            <select className="select" value={brandKey(activeBrand)} onChange={(event) => setSelected(event.target.value)}>
-              {brands.map((brand) => <option key={brandKey(brand)} value={brandKey(brand)}>{brand}</option>)}
-            </select>
-          </label>
-          {personal.length ? <ul className="brand-size-records">
-            {personal.map((row, index) => <li key={row.item?.id ?? index}>
-              {row.item ? <a href={`/wardrobe/${row.item.id}`}>{row.item.title}</a> : <span>{t(CATEGORY_LABEL[row.category])}</span>}
-              <strong>{row.size}</strong>
+          <div className="filters start brand-size-brands" role="group" aria-label={t('Бренд')}>
+            {brands.map((brand) => {
+              const on = brandKey(brand) === brandKey(activeBrand);
+              return <button type="button" key={brandKey(brand)} className={on ? 'on' : undefined} aria-pressed={on} onClick={() => setSelected(brandKey(brand))}>{brand}</button>;
+            })}
+          </div>
+          {mine.size ? <ul className="brand-size-mine">
+            {[...mine.entries()].map(([key, group]) => <li key={key}>
+              <strong>{group.size}</strong>
+              <span>{group.items.length
+                ? group.items.map((item, index) => <Fragment key={item.id}>{index ? ', ' : ''}<a href={`/wardrobe/${item.id}`}>{item.title}</a></Fragment>)
+                : t(CATEGORY_LABEL[group.category])}</span>
             </li>)}
-          </ul> : <p className="small muted">{t('Мій розмір ще не записано')}</p>}
-          {activeGuides.length ? activeGuides.map((guide) => (
+          </ul> : !marked.some((rows) => rows.size) && <p className="small muted brand-size-none">{t('Мій розмір ще не записано')}</p>}
+          {activeGuides.length ? activeGuides.map((guide, guideIndex) => (
             <section className="brand-guide" key={guide.title}>
               <div className="section-head">
                 <h3>{t(guide.title)}</h3>
@@ -91,7 +108,12 @@ export function BrandSizing() {
               {guide.rows.length ? <div className="brand-guide-scroll">
                 <table>
                   <thead><tr>{guide.columns.map((column) => <th scope="col" key={column}>{t(column)}</th>)}</tr></thead>
-                  <tbody>{guide.rows.map(([size, ...cells]) => <tr key={size}><th scope="row">{size}</th>{cells.map((cell, index) => <td key={guide.columns[index + 1]}>{cell}</td>)}</tr>)}</tbody>
+                  <tbody>{guide.rows.map(([size, ...cells]) => {
+                    const own = marked[guideIndex].has(size);
+                    return <tr key={size} className={own ? 'mine' : undefined} aria-current={own || undefined}>
+                      <th scope="row">{size}</th>{cells.map((cell, index) => <td key={guide.columns[index + 1]}>{cell}</td>)}
+                    </tr>;
+                  })}</tbody>
                 </table>
               </div> : <p className="small muted">{t('Точна сітка залежить від моделі')}</p>}
             </section>

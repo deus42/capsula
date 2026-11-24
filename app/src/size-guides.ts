@@ -282,3 +282,23 @@ const guides = new Map<string, Guide[]>([
 ]);
 
 export const sizeGuides = (brand: string): readonly Guide[] => guides.get(brandKey(brand)) ?? [];
+
+const SIZE_ALIAS: Record<string, string> = { SM: 'S', MD: 'M', LG: 'L', '2XS': 'XXS', '2XL': 'XXL' };
+const sizeKey = (value: string) => {
+  const key = value.toUpperCase().replace('½', '.5');
+  return SIZE_ALIAS[key] ?? key;
+};
+
+/** The chart rows that are my size: «W33 L32» is row 33 of a W column and row 32 of an L column; «DE 6 / UK 36» matches row 36. */
+export function myRows(guide: Guide, sizes: readonly string[]): Set<string> {
+  const column = guide.columns[0];
+  const wanted = new Set<string>();
+  for (const size of sizes) {
+    for (const token of size.toUpperCase().replace(/(\d),(\d)/g, '$1.$2').split(/[\s/,;·]+/).filter(Boolean)) {
+      const fit = token.match(/^([WL])(\d+(?:\.\d+)?)$/);
+      if (!fit) wanted.add(sizeKey(token));
+      else if (fit[1] === column) wanted.add(fit[2]);
+    }
+  }
+  return new Set(guide.rows.map(([first]) => first).filter((first) => wanted.has(sizeKey(first))));
+}

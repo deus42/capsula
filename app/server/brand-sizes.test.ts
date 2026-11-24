@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { brandKey, sizeEvidence, sizingBrands } from '../src/brand-sizes.ts';
-import { sizeGuides } from '../src/size-guides.ts';
+import { myRows, sizeGuides } from '../src/size-guides.ts';
 import { dispatch } from './routes.ts';
 import { ownerSizes, shopSearchPrompt } from './shop-search.ts';
 import { createStore } from './store.ts';
@@ -58,4 +58,16 @@ test('published sizing charts contain aligned rows and official source URLs', ()
     }
   }
   assert.deepEqual(sizeGuides('Levi’s')[0].rows.find(([waist]) => waist === '33'), ['33', '83.8', '100.3']);
+});
+
+test('my sizes mark their rows in the original charts', () => {
+  const [waist, length, top] = sizeGuides("Levi's");
+  assert.deepEqual([...myRows(waist, ['W31 L30'])], ['31']);
+  assert.deepEqual([...myRows(length, ['W31 L30'])], ['30']);
+  assert.deepEqual([...myRows(top, ['W31 L30'])], []);
+  assert.deepEqual([...myRows(top, ['m'])], ['M']);
+  assert.deepEqual([...myRows(sizeGuides('Under Armour')[0], ['L'])], ['LG']);
+  assert.deepEqual([...myRows(sizeGuides('Speedo')[0], ['DE 5 / UK 34'])], ['34']);
+  assert.deepEqual([...myRows(sizeGuides('Nike')[0], ['42,5'])], ['42.5']);
+  assert.deepEqual([...myRows(sizeGuides('Vans')[0], ['One Size'])], []);
 });
