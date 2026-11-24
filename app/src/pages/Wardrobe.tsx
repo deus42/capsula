@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import type { ReactNode } from 'react';
 import { Archive, Camera, Check, CircleCheck, CircleDashed, Grid2x2, Merge, Pencil, Plus, Search, Sparkles, Trash2, Wand2 } from 'lucide-react';
 import type { Category, Item, ItemStatus, Job } from '../api.ts';
 import { api, media, thumb } from '../api.ts';
@@ -24,7 +25,9 @@ function usePackshotState() {
 /**
  * Minimal item page (owner, 17.11: always minimal, never side panels): the
  * picture and photos, one "Це моя річ?" question while unconfirmed, the looks
- * it is in. Everything editable sits behind the pencil.
+ * it is in. Everything editable sits behind the pencil. Owner, 24.11: the
+ * question answers «Ношу · Не ношу · Не моя»; a piece one no longer wears goes
+ * to «Неактуальні» with a quiet «Не ношу»; «Не моя» deletes it.
  */
 function ItemPage({ item }: { item: Item }) {
   const db = useDb();
@@ -38,6 +41,11 @@ function ItemPage({ item }: { item: Item }) {
   const covers = db.needs.filter((n) => n.coveredByItem === item.id);
   const verdict = itemVerdict(db, item);
   const patch = (body: Record<string, unknown>, msg: string) => act(() => api('PATCH', `/api/items/${item.id}`, { rev: item.rev, ...body }), msg);
+  const notWorn = () => void patch({ status: 'inactive' }, t('Прибрано в «Неактуальні»'));
+  const findLooks = async () => {
+    const ok = await act(() => api('POST', '/api/discover', { itemIds: [item.id] }), t('Підбираю образи з цією річчю'));
+    if (ok) go(`/capsules?tab=new&item=${encodeURIComponent(item.id)}`);
+  };
 
   return (
     <div className="page">
@@ -78,23 +86,28 @@ function ItemPage({ item }: { item: Item }) {
       {item.status === 'needs_confirmation' && (
         <div className="its-me">
           <span>{t('Це моя річ?')}</span>
-          <button className="btn" onClick={() => void patch({ status: 'inactive' }, t('Прибрано'))}>{t('Ні')}</button>
-          <button className="btn primary" onClick={() => void patch({ status: 'confirmed' }, t('Моя річ'))}><Check size={15} /> {t('Так')}</button>
+          <DeleteItem item={item} className="btn">{t('Не моя')}</DeleteItem>
+          <button className="btn" onClick={notWorn}>{t('Не ношу')}</button>
+          <button className="btn primary" onClick={() => void patch({ status: 'confirmed' }, t('Моя річ'))}><Check size={15} /> {t('Ношу')}</button>
         </div>
       )}
-      {item.status === 'inactive' && (
+      {item.status === 'confirmed' && (
         <div className="its-me">
-          <span>{t('Не моя / неактуальна')}</span>
+          <button className="quiet-toggle" onClick={notWorn}>{t('Не ношу')}</button>
+        </div>
+      )}
+      {item.status === 'inactive' && !item.mergedInto && (
+        <div className="its-me">
+          <span>{t('Не ношу')}</span>
           <button className="btn" onClick={() => void patch({ status: 'confirmed' }, t('Повернуто'))}>{t('Повернути')}</button>
         </div>
       )}
 
       <div className="section-head">
         <h2 className="h2">{t('Де використано')} <span className="count">{usageLabel(capsuleCount(capsules), looks.length)}</span></h2>
-        {item.status !== 'inactive' && !isBlockedEyewear(db, item.title) && (
-          <button className="btn sm" onClick={async () => { const ok = await act(() => api('POST', '/api/discover', { itemIds: [item.id] }), t('Шукаю нові образи з цією річчю')); if (ok) go('/capsules?tab=new'); }}>
-            <Sparkles size={13} /> {t('Ще образ')}
-          </button>
+        {/* New looks only for a piece one wears and the advisor would keep; they wait in «Нові» for «Додати». */}
+        {item.status === 'confirmed' && verdict?.kind !== 'replace' && !isBlockedEyewear(db, item.title) && (
+          <button className="quiet-toggle" onClick={() => void findLooks()}>{t('Підібрати образи з нею')}</button>
         )}
       </div>
       {capsules.length > 0 && <div className="row wrap" style={{ gap: 6, marginBottom: 12 }}>
@@ -119,6 +132,24 @@ function ItemPage({ item }: { item: Item }) {
   );
 }
 
+/** Deletes the item after a confirmation; its original photos stay in the archive. */
+function DeleteItem({ item, className, children }: { item: Item; className: string; children: ReactNode }) {
+  const { act } = useApp();
+  return (
+    <ConfirmButton
+      className={className}
+      title={t('Видалити річ')}
+      message={t('Видалити «{title}» з гардероба? Фото-оригінали лишаться в архіві.', { title: item.title })}
+      onConfirm={async () => {
+        const ok = await act(() => api('DELETE', `/api/items/${item.id}`), t('Річ видалено'));
+        if (ok !== undefined) go('/wardrobe');
+      }}
+    >
+      {children}
+    </ConfirmButton>
+  );
+}
+
 /** Everything editable about an item, in one modal behind the pencil. */
 function ItemEdit({ item, onClose }: { item: Item; onClose: () => void }) {
   const { act } = useApp();
@@ -137,17 +168,7 @@ function ItemEdit({ item, onClose }: { item: Item; onClose: () => void }) {
       onClose={onClose}
       footer={
         <>
-          <ConfirmButton
-            className="btn ghost danger"
-            title={t('Видалити річ')}
-            message={t('Видалити «{title}» з гардероба? Фото-оригінали лишаться в архіві.', { title: item.title })}
-            onConfirm={async () => {
-              const ok = await act(() => api('DELETE', `/api/items/${item.id}`), t('Річ видалено'));
-              if (ok !== undefined) go('/wardrobe');
-            }}
-          >
-            <Trash2 size={14} />
-          </ConfirmButton>
+          <DeleteItem item={item} className="btn ghost danger"><Trash2 size={14} /> {t('Видалити річ')}</DeleteItem>
           <button className="btn ghost" onClick={() => void act(() => api('POST', '/api/packshots', { itemIds: [item.id], run: true }), t('Нове фото речі в роботі'))}><Wand2 size={14} /> {t('Нове фото')}</button>
           <span style={{ flex: 1 }} />
           <button className="btn primary" onClick={() => void save()}>{t('Зберегти')}</button>

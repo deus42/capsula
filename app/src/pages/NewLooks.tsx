@@ -11,6 +11,7 @@ import { LOOKS, plural, t } from '../i18n.ts';
 /**
  * «Нові» (owner, 19.11; spec 2026-11-19-fashion-capsules-design.md, part 6): one line «Що шукаємо?», an optional
  * capsule, and the results as cards «Ні / Додати». Pieces to buy become purchases only on «Додати»; a try-on only on ⟳.
+ * `?item=<id>` (an item's «Підібрати образи з нею», owner 24.11) shows only the proposals with that piece.
  */
 export function NewLooks() {
   const db = useDb();
@@ -19,8 +20,11 @@ export function NewLooks() {
   const [capsuleId, setCapsuleId] = useState('');
   const capsules = db.capsules.filter((c) => !c.redirectCapsuleIds && c.kind !== 'selection' && !isCapsuleHidden(db, c));
   const job = db.jobs.find((j) => j.kind === 'discover' && j.state === 'running') ?? db.jobs.find((j) => j.kind === 'discover' && j.state === 'queued');
+  const itemId = new URLSearchParams(window.location.search).get('item');
+  const pinned = itemId ? db.items.find((i) => i.id === itemId) : undefined;
+  const withPinned = (s: Suggestion) => s.looks.some((l) => Object.values(l.slots).some((refs) => refs?.some((r) => r.kind === 'item' && r.id === itemId)));
   // The newest first: what a search just found comes before older proposals.
-  const list = [...openSuggestions(db)].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const list = [...openSuggestions(db)].filter((s) => !pinned || withPinned(s)).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const search = async () => {
     const ok = await act(() => api('POST', '/api/discover', { prompt: text, capsuleId }), t('Шукаю нові образи'));
     if (ok) setText('');
@@ -33,6 +37,12 @@ export function NewLooks() {
           {capsules.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
         </select>
       </Composer>
+      {pinned && (
+        <div className="section-head">
+          <h2 className="h2">{t('З «{title}»', { title: pinned.title })} <span className="count">{list.length}</span></h2>
+          <a href="/capsules?tab=new">{t('Усі нові')}</a>
+        </div>
+      )}
       {list.length ? (
         <div className="look-grid">{list.map((s) => <NewCard key={s.id} s={s} />)}</div>
       ) : (
