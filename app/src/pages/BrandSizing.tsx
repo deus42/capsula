@@ -1,4 +1,4 @@
-import { Fragment, useState } from 'react';
+import { Fragment, useRef, useState } from 'react';
 import { Pencil, Plus, X } from 'lucide-react';
 import { CATEGORIES } from '../../server/schema.ts';
 import { api, type KnownSize } from '../api.ts';
@@ -57,6 +57,15 @@ export function BrandSizing() {
   const db = useDb();
   const [editing, setEditing] = useState(false);
   const [selected, setSelected] = useState('');
+  const panel = useRef<HTMLDivElement>(null);
+  const [hold, setHold] = useState(0);
+  // Switching brands keeps the toggles in place: the charts below never end above the screen's bottom edge,
+  // so a shorter chart cannot pull the page up (this section is the last one on the page).
+  const pick = (key: string) => {
+    const top = panel.current?.getBoundingClientRect().top;
+    if (top !== undefined) setHold(Math.max(0, Math.ceil(window.innerHeight - top)));
+    setSelected(key);
+  };
   const brands = sizingBrands(db);
   const records = sizeEvidence(db).filter((row) => row.brand);
   const known = (name: string) => brands.find((brand) => brandKey(brand) === brandKey(name));
@@ -88,9 +97,10 @@ export function BrandSizing() {
           <div className="filters start brand-size-brands" role="group" aria-label={t('Бренд')}>
             {brands.map((brand) => {
               const on = brandKey(brand) === brandKey(activeBrand);
-              return <button type="button" key={brandKey(brand)} className={on ? 'on' : undefined} aria-pressed={on} onClick={() => setSelected(brandKey(brand))}>{brand}</button>;
+              return <button type="button" key={brandKey(brand)} className={on ? 'on' : undefined} aria-pressed={on} onClick={() => pick(brandKey(brand))}>{brand}</button>;
             })}
           </div>
+          <div ref={panel} style={hold ? { minHeight: hold } : undefined}>
           {mine.size ? <ul className="brand-size-mine">
             {[...mine.entries()].map(([key, group]) => <li key={key}>
               <strong>{group.size}</strong>
@@ -118,6 +128,7 @@ export function BrandSizing() {
               </div> : <p className="small muted">{t('Точна сітка залежить від моделі')}</p>}
             </section>
           )) : <p className="small muted">{t('Офіційної таблиці ще немає')}</p>}
+          </div>
         </>
       )}
       {editing && <EditSizes brands={brands} defaultBrand={activeBrand} onClose={() => setEditing(false)} />}

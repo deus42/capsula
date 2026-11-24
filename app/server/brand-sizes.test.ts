@@ -70,4 +70,8 @@ test('my sizes mark their rows in the original charts', () => {
   assert.deepEqual([...myRows(sizeGuides('Speedo')[0], ['DE 5 / UK 34'])], ['34']);
   assert.deepEqual([...myRows(sizeGuides('Nike')[0], ['42,5'])], ['42.5']);
   assert.deepEqual([...myRows(sizeGuides('Vans')[0], ['One Size'])], []);
+  const shoesUA = sizeGuides('Under Armour').find((guide) => guide.categories.includes('shoes'));
+  assert.deepEqual(shoesUA && [...myRows(shoesUA, ['42'])], ['42']);
+  const belts = sizeGuides("Levi's").find((guide) => guide.categories.includes('accessories'));
+  assert.deepEqual(belts?.rows.find(([cm]) => cm === '90'), ['90', '36', 'M', '32']);
 });
