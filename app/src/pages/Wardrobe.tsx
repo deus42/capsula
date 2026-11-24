@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Archive, Camera, Check, CircleCheck, CircleDashed, Dumbbell, Grid2x2, Merge, Pencil, Plus, Search, Sparkles, Trash2, Wand2 } from 'lucide-react';
 import type { Category, Item, ItemStatus, Job, Photo } from '../api.ts';
@@ -313,26 +313,46 @@ function MergeItems({ ids, onClose, onMerged }: { ids: string[]; onClose: () => 
   const db = useDb();
   const { act } = useApp();
   const sources = ids.flatMap((id) => db.items.filter((item) => item.id === id && !item.mergedInto));
-  const originals = [...new Set(sources.flatMap((item) => item.photoIds))].flatMap((id) => db.photos.filter((photo) => photo.id === id));
+  const originals = [...new Set(sources.flatMap((item) => item.photoIds))].flatMap((id) =>
+    db.photos.filter((photo) => photo.id === id && photo.kind !== 'worn'));
   const covers = itemCoverOptions(db, sources);
-  const [primary, setPrimary] = useState(originals[0]?.id);
-  const [cover, setCover] = useState(covers[0]?.id);
+  const originalFor = (item?: Item) => item?.photoIds.find((id) => originals.some((photo) => photo.id === id)) ?? originals[0]?.id;
+  const coverFor = (item?: Item) => covers.find((photo) => item?.packshotId === photo.id)?.id ?? covers[0]?.id;
+  const defaultItem = sources.find((item) => item.status === 'confirmed') ?? sources[0];
+  const [keepId, setKeepId] = useState(defaultItem?.id);
+  const [primary, setPrimary] = useState(originalFor(defaultItem));
+  const [cover, setCover] = useState(coverFor(defaultItem));
   const [saving, setSaving] = useState(false);
   const merge = async () => {
     setSaving(true);
-    const targetId = sources.find((item) => item.status === 'confirmed')?.id ?? sources[0]?.id;
-    const item = await act(() => api<Item>('POST', '/api/items/merge', { ids, targetId, primaryPhotoId: primary, packshotId: cover }), t('Дублікати обʼєднано, джерела збережено'));
+    const item = await act(() => api<Item>('POST', '/api/items/merge', { ids, keepId, primaryPhotoId: primary, packshotId: cover }), t('Дублікати обʼєднано, джерела збережено'));
     setSaving(false);
     if (item) onMerged(item.id);
   };
   return <Modal title={t('Обʼєднати дублікати')} onClose={() => { if (!saving) onClose(); }} footer={<>
     <button type="button" className="btn" disabled={saving} onClick={onClose}>{t('Скасувати')}</button>
-    <button type="button" className="btn primary" disabled={saving || sources.length < 2} onClick={() => void merge()}>{t('Обʼєднати')}</button>
+    <button type="button" className="btn primary" disabled={saving || sources.length < 2 || !sources.some((item) => item.id === keepId)} onClick={() => void merge()}>{t('Обʼєднати')}</button>
   </>}>
     <div className="stack" style={{ gap: 14 }}>
+      <div className="field" role="group" aria-label={t('Залишити картку')}>
+        <span>{t('Залишити картку')}</span>
+        <div className="own-picks">
+          {sources.map((item) => {
+            const { art, photo } = itemArt(db, item.id);
+            const selected = keepId === item.id;
+            return <button key={item.id} type="button" className={`own-pick${selected ? ' on' : ''}`} aria-pressed={selected} disabled={saving} onClick={() => {
+              setKeepId(item.id);
+              setPrimary(originalFor(item));
+              setCover(coverFor(item));
+            }}>
+              <span className="img">{art || photo ? <img src={thumb((art ?? photo)!, 240)} alt="" /> : <CategoryIcon category={item.category} size={22} />}</span>
+              <span>{item.title}</span>
+            </button>;
+          })}
+        </div>
+      </div>
       {covers.length > 0 && <PhotoChoices title={t('Каталожна обкладинка')} photos={covers} selected={cover} onSelect={setCover} />}
       {originals.length > 0 && <PhotoChoices title={t('Основне фото')} photos={originals} selected={primary} onSelect={setPrimary} />}
-      {covers.length === 0 && originals.length === 0 && <p>{sources.map((item) => item.title).join(' · ')}</p>}
     </div>
   </Modal>;
 }
@@ -378,6 +398,11 @@ function NewItem({ onClose }: { onClose: () => void }) {
   );
 }
 
+function MergedItemLink({ id }: { id: string }) {
+  useEffect(() => { go(`/wardrobe/${id}`, true); }, [id]);
+  return null;
+}
+
 export function WardrobePage({ openId }: { openId?: string }) {
   const db = useDb();
   const { act } = useApp();
@@ -413,6 +438,7 @@ export function WardrobePage({ openId }: { openId?: string }) {
   const missing = db.items.filter((i) => !i.packshotId && i.status !== 'inactive' && !busy.has(i.id)).length;
   const title = t(view === 'new' ? 'Нові з фото' : sport ? 'Спорт' : cat ? CATEGORY_LABEL[cat] : status ? STATUS_LABEL[status] : 'Усі речі');
   // An item opens as its own page, not a side panel over the grid.
+  if (open?.mergedInto && db.items.some((item) => item.id === open.mergedInto)) return <MergedItemLink id={open.mergedInto} />;
   if (open) return <ItemPage key={open.id} item={open} />;
 
   return (

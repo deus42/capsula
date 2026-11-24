@@ -409,6 +409,8 @@ export const en: Record<string, string> = {
   // Wardrobe
   "Редагувати річ": "Edit piece",
   "Редагувати речі": "Edit pieces",
+  "Залишити картку": "Keep item card",
+  "Вибери картку з цих речей": "Choose one of these item cards",
   "Спершу заміни річ в образах": "Replace the piece in these looks first",
   "Видалити річ": "Delete piece",
   "Нова річ": "New piece",

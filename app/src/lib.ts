@@ -120,6 +120,22 @@ export function resultsForLook(db: DB, lookId: string) {
   return db.results.filter((r) => r.lookId === lookId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+function pendingForCurrentIdentity(db: DB, result: Result) {
+  if (result.hiddenAt || result.review !== 'pending') return false;
+  const snapshot = db.jobs.find((job) => job.id === result.jobId)?.snapshot;
+  if (!snapshot) return false;
+  const identity = db.profile.identity;
+  if (identity) {
+    const frozen = snapshot.identity;
+    return Boolean(frozen && !identity.disabledReason && !frozen.disabledReason
+      && identity.face.sha256 === frozen.face.sha256 && identity.body.sha256 === frozen.body.sha256
+      && identity.hair?.crop.sha256 === frozen.hair?.crop.sha256
+      && identity.noGlasses === frozen.noGlasses && identity.preserveHeadAngle === frozen.preserveHeadAngle);
+  }
+  return !snapshot.identity && snapshot.basePhotoIds.length > 0 && snapshot.basePhotoIds.every((id) =>
+    db.profile.basePhotoIds.includes(id) && db.photos.some((photo) => photo.id === id && !photo.archivedAt && photo.source !== 'generated'));
+}
+
 /**
  * The look's picture: an accepted try-on, else one awaiting the owner's check.
  * A rejected try-on (not the owner's face) is never shown; the look shows its
@@ -127,10 +143,7 @@ export function resultsForLook(db: DB, lookId: string) {
  */
 export function coverForLook(db: DB, look: Look): Result | undefined {
   const rs = resultsForLook(db, look.id).filter((r) => !r.hiddenAt);
-  // A try-on awaiting the owner's check shows only when it was made with the current, active face reference.
-  const face = db.profile.identity && !db.profile.identity.disabledReason ? db.profile.identity.face?.sha256 : undefined;
-  const current = (r: Result) => Boolean(face) && db.jobs.find((j) => j.id === r.jobId)?.snapshot.identity?.face?.sha256 === face;
-  const best = (results: Result[]) => results.find((r) => r.review === 'accepted') ?? results.find((r) => r.review === 'pending' && current(r));
+  const best = (results: Result[]) => results.find((r) => r.review === 'accepted') ?? results.find((r) => pendingForCurrentIdentity(db, r));
   return best(rs.filter((r) => r.lookVersion === look.version)) ?? best(rs);
 }
 
@@ -138,9 +151,12 @@ export function coverForLook(db: DB, look: Look): Result | undefined {
  * The picture shown for a look (owner, 19.11): a try-on of an older composition is not shown — the collage of the
  * current pieces stands in until a new try-on (⟳) — unless the owner answered «Ні» to «Речі змінено» for this version.
  */
-export function currentCover(db: DB, look: Look): Result | undefined {
+export function currentCover(db: DB, look: Look, reviewLatest = false): Result | undefined {
   const cover = coverForLook(db, look);
-  return cover && (cover.lookVersion === look.version || look.keptVersion === look.version) ? cover : undefined;
+  const saved = cover && (cover.lookVersion === look.version || look.keptVersion === look.version) ? cover : undefined;
+  if (!reviewLatest) return saved;
+  const pending = resultsForLook(db, look.id).find((result) => result.lookVersion === look.version && pendingForCurrentIdentity(db, result));
+  return pending && (!saved || saved.lookVersion !== look.version || pending.createdAt > saved.createdAt) ? pending : saved;
 }
 
 /**

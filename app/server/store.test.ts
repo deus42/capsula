@@ -351,6 +351,35 @@ test('a merge without catalogue art queues a packshot from the selected primary 
   assert.equal(job.snapshot.slots[0].photoPaths[0], 'assets/photos/b.jpeg');
 });
 
+test('manual merge retains the selected card and moves its duplicate’s capsule and look references', async () => {
+  const { store, call } = setup();
+  await store.mutate((db) => {
+    db.items[0].packshotId = testPackshot(db, 'P-removed-cover').id;
+    Object.assign(db.items[1], { title: 'Joma shorts', brand: 'Joma', status: 'confirmed', packshotId: testPackshot(db, 'P-kept-cover').id });
+    db.capsules[0].pieces = [{ kind: 'need', id: 'N-1' }, { kind: 'item', id: 'W-1' }];
+    db.capsules[0].base = [{ kind: 'item', id: 'W-1' }];
+    const prior = createJob(db, db.looks[0], [], '');
+    Object.assign(prior, { state: 'done', resultId: 'R-before-merge' });
+    db.results.push({ id: 'R-before-merge', jobId: prior.id, lookId: 'L-1', lookVersion: 1, imagePath: 'renders/before.png', tool: '', model: '', prompt: '', sources: [], usedItemPhotos: true, review: 'accepted', favorite: false, createdAt: at });
+  });
+  await assert.rejects(call('POST', '/api/items/merge', { ids: ['W-1', 'W-2'], keepId: 'W-other' }), { status: 400 });
+  const item = await call('POST', '/api/items/merge', { ids: ['W-1', 'W-2'], keepId: 'W-2', primaryPhotoId: 'P-2' });
+  assert.equal(item.id, 'W-2');
+  assert.equal(item.title, 'Joma shorts');
+  assert.equal(item.brand, 'Joma');
+  assert.equal(item.packshotId, 'P-kept-cover');
+  assert.deepEqual(item.photoIds, ['P-2', 'P-1']);
+  assert.deepEqual(item.mergedFrom, ['W-1']);
+  const db = store.read();
+  assert.equal(db.items.length, 2);
+  assert.equal(db.items[0].mergedInto, 'W-2');
+  assert.deepEqual(db.looks[0].slots.bottom, [{ kind: 'item', id: 'W-2' }]);
+  assert.equal(currentCover(db, db.looks[0])?.id, 'R-before-merge');
+  assert.deepEqual(db.capsules[0].base, [{ kind: 'item', id: 'W-2' }]);
+  assert.ok(db.capsules[0].pieces?.some((piece) => piece.id === 'W-2'));
+  assert.equal(validateDb(db), null);
+});
+
 test('a look requires one capsule and moving it preserves its identity and versions (A04)', async () => {
   const { store, call } = setup();
   await store.mutate((db) => {
@@ -1254,6 +1283,9 @@ test('try-on prompt sends original base photos to the image tool before garments
   assert.deepEqual(list, ['/abs/assets/photos/a.jpeg', '/abs/assets/photos/b.jpeg'], 'identity first, then garments');
   assert.ok(!/renders\//.test(prompt), 'no generated render is used as a reference');
   assert.match(prompt, /exact facial features/);
+  assert.match(prompt, /No shoes, socks or other footwear are permitted/);
+  job.snapshot.slots.push({ ...job.snapshot.slots[0], slot: 'shoes' });
+  assert.match(buildPrompt(job, '/tmp/x/result.png'), /full length from head to shoes/);
 });
 
 test('image references never exceed the tool limit and keep identity first', () => {
@@ -2242,6 +2274,26 @@ test('so-so pieces (honest score under 6 or «варто замінити») are
   await store.mutate((d) => void (d.items.find((i) => i.id === 'W-OK')!.rating!.score = 5));
   db = store.read();
   assert.equal(openSuggestions(db).length, 0);
+});
+
+test('look detail reviews a newer try-on while the capsule keeps the approved picture', () => {
+  const db = fixture();
+  const look = db.looks[0];
+  db.profile.basePhotoIds = ['P-1'];
+  const make = (id: string, review: 'accepted' | 'pending', createdAt: string) => {
+    const job = createJob(db, look, db.profile.basePhotoIds, '');
+    db.results.push({ id, jobId: job.id, lookId: look.id, lookVersion: look.version, imagePath: `${id}.png`, tool: '', model: '', prompt: '', sources: [], usedItemPhotos: true, review, favorite: false, createdAt });
+    return db.results.at(-1)!;
+  };
+  const approved = make('R-approved', 'accepted', '2026-11-24T12:00:00Z');
+  const pending = make('R-refresh', 'pending', '2026-11-24T12:02:00Z');
+  assert.equal(currentCover(db, look)?.id, approved.id);
+  assert.equal(currentCover(db, look, true)?.id, pending.id);
+  db.profile.basePhotoIds = ['P-2'];
+  assert.equal(currentCover(db, look, true)?.id, approved.id);
+  db.profile.basePhotoIds = ['P-1'];
+  pending.review = 'rework';
+  assert.equal(currentCover(db, look, true)?.id, approved.id);
 });
 
 test('a fresh picture, «у приміщенні», today\'s looks and what a purchase gives (owner, 19.11)', async () => {

@@ -616,7 +616,16 @@ on('PATCH', '/api/items/:id', async (ctx, [id], b) => {
 const MERGE_FIELDS = ['brand', 'model', 'color', 'size', 'fit', 'composition'] as const;
 
 function repointMergedItems(db: DB, ids: string[], target: Item) {
-  replaceRefs(db, (r) => r.kind === 'item' && ids.includes(r.id), { kind: 'item', id: target.id }, `Обʼєднання речей → ${target.id}`);
+  const changed = new Set(replaceRefs(db, (r) => r.kind === 'item' && ids.includes(r.id), { kind: 'item', id: target.id }, `Обʼєднання речей → ${target.id}`));
+  // A duplicate changes the catalogue link. Its approved picture still shows the same outfit.
+  for (const look of db.looks) {
+    if (!changed.has(look.id)) continue;
+    const previousVersion = look.version - 1;
+    if (look.keptVersion === previousVersion || db.results.some((result) =>
+      result.lookId === look.id && result.lookVersion === previousVersion && result.review === 'accepted' && !result.hiddenAt)) {
+      look.keptVersion = look.version;
+    }
+  }
   for (const n of db.needs) {
     if (n.coveredByItem && ids.includes(n.coveredByItem)) n.coveredByItem = target.id;
     if (n.replaces && ids.includes(n.replaces) && n.coveredByItem !== target.id) n.replaces = target.id;
@@ -703,7 +712,10 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
     if (ids.length < 2) throw new HttpError(400, 'Для обʼєднання потрібно щонайменше дві речі');
     const sources = ids.map((id) => findOr404(db.items, id, 'Річ'));
     if (sources.some((item) => item.mergedInto)) throw new HttpError(409, 'Ці речі вже обʼєднано');
-    const donor = sources.find((item) => item.id === b.targetId) ?? sources.find((item) => item.status === 'confirmed') ?? sources[0];
+    const keeper = sources.find((item) => item.id === b.keepId);
+    if (b.keepId !== undefined && !keeper) throw new HttpError(400, 'Вибери картку з цих речей');
+    if (keeper) busyJob(db, (job) => job.kind === 'packshot' && Boolean(job.itemId && ids.includes(job.itemId)));
+    const donor = keeper ?? sources.find((item) => item.id === b.targetId) ?? sources.find((item) => item.status === 'confirmed') ?? sources[0];
     const donors = [donor, ...sources.filter((item) => item !== donor)];
     const photoIds = mergedPhotoIds(db, sources);
     const primary = str(b.primaryPhotoId);
@@ -715,24 +727,26 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
     const crop = mergedCrop(db, donors, photoIds);
     const duplicate = donors.find((item) => item.possibleDuplicateOf && !ids.includes(item.possibleDuplicateOf))?.possibleDuplicateOf;
     const at = now();
+    const retired = keeper ? sources.filter((item) => item !== keeper) : sources;
     const merged: Item = {
-      id: newId('W'),
-      rev: 1,
-      category: sources[0].category,
+      ...keeper,
+      id: keeper?.id ?? newId('W'),
+      rev: keeper ? keeper.rev + 1 : 1,
+      category: keeper?.category ?? sources[0].category,
       ...(sources.some((item) => item.sport) ? { sport: true } : {}),
-      title: str(b.title, 200) || sources[0].title,
+      title: str(b.title, 200) || keeper?.title || sources[0].title,
       // Merging items the owner already confirmed does not ask «Це моя річ?» again.
       status: sources.some((s) => s.status === 'confirmed') ? 'confirmed' : 'needs_confirmation',
       photoIds: primaryPhotoFirst(photoIds, primary),
-      ...(cover ? { packshotId: cover.id } : {}),
-      ...(crop ? { tryonReference: crop } : {}),
-      ...(duplicate ? { possibleDuplicateOf: duplicate } : {}),
+      packshotId: cover?.id,
+      tryonReference: crop,
+      possibleDuplicateOf: duplicate,
       observation: sources.map((s) => `${s.id}: ${s.observation ?? ''}`).join(' · '),
       confirmedFact: sources.map((s) => s.confirmedFact).filter(Boolean).join(' ') || undefined,
       origin: 'merge',
-      mergedFrom: ids,
-      history: [{ at, action: 'merged', note: `Обʼєднано з ${ids.join(', ')}` }],
-      createdAt: at,
+      mergedFrom: [...new Set([...(keeper?.mergedFrom ?? []), ...retired.map((item) => item.id)])],
+      history: [...(keeper?.history ?? []), { at, action: 'merged', note: `Обʼєднано з ${retired.map((item) => item.id).join(', ')}` }],
+      createdAt: keeper?.createdAt ?? at,
       updatedAt: at,
     };
     for (const field of [...MERGE_FIELDS, 'purchasedFromProduct'] as const) {
@@ -742,9 +756,11 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
     // «Ні» on «варто замінити» survives a merge: the merged piece is rated again, still kept.
     const kept = sources.find((x) => x.rating?.kept)?.rating;
     if (kept) merged.rating = { ...kept, replace: undefined, replaceWith: undefined, rev: -1, kept: true };
-    db.items.push(merged);
-    for (const source of sources) markMerged(source, merged);
-    repointMergedItems(db, ids, merged);
+    if (keeper) db.items[db.items.indexOf(keeper)] = merged;
+    else db.items.push(merged);
+    for (const source of retired) markMerged(source, merged);
+    repointMergedItems(db, retired.map((item) => item.id), merged);
+    if (keeper) dropJobs(db, (job) => job.kind === 'packshot' && job.state === 'queued' && Boolean(job.itemId && ids.includes(job.itemId)));
     queueMissingItemPackshots(db, [merged.id]);
     queueAdvice(db, `Обʼєднано речі: ${merged.title}`);
     return merged;

@@ -87,7 +87,7 @@ export function LookPage({ id }: { id: string }) {
   const isSelection = capsule?.kind === 'selection';
   const cover = coverForLook(db, look);
   const stale = cover && cover.lookVersion !== look.version;
-  const shown = currentCover(db, look);
+  const shown = currentCover(db, look, true);
   const wear = currentWear(db, look);
   const hidden = hiddenLookIds(db).has(look.id);
   const variants = lookVariants(db, look);
@@ -98,7 +98,8 @@ export function LookPage({ id }: { id: string }) {
   const lookJobs = db.jobs.filter((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === look.id);
   const busy = lookJobs.some((j) => j.state === 'queued' || j.state === 'running');
   const latest = lookJobs.filter((j) => j.lookVersion === look.version).at(-1);
-  const missingPhotos = latest?.state === 'needs_data' && latest.stateNote?.startsWith('Потрібні окремі фото речей:') ? t(latest.stateNote) : undefined;
+  const renderIssue = latest?.state === 'needs_data' ? t(latest.stateNote ?? 'Потрібні дані')
+    : latest?.state === 'error' ? t('Не вдалося оновити картинку') : undefined;
   const paused = rendersPaused(db);
   // Accounts: the month's try-ons are used up (or the budget paused generation).
   const limit = quotaNote(session, 'tryon');
@@ -179,7 +180,7 @@ export function LookPage({ id }: { id: string }) {
         <div className="look-hero">
           <div className="hero-pic">
             <a className="cover" href={shown ? media(shown.imagePath) : undefined} target={shown ? '_blank' : undefined} rel="noreferrer">
-              <LookArt look={look} w={960} busy={busy} label />
+              <LookArt look={look} w={960} busy={busy} label reviewLatest />
             </a>
             {!paused && (
               <button className="refresh-btn" disabled={busy || Boolean(limit)} onClick={() => void update()} aria-label={t('Оновити картинку')} title={limit ?? t('Оновити картинку')}>
@@ -194,7 +195,7 @@ export function LookPage({ id }: { id: string }) {
               <button className="btn sm primary" onClick={() => void itsMe(true)}>{t('Так')}</button>
             </div>
           )}
-          {!busy && missingPhotos && <p className="miss" role="status" style={{ marginTop: 8 }}>{missingPhotos}</p>}
+          {!busy && renderIssue && <p className="miss" role="status" style={{ marginTop: 8 }}>{renderIssue}</p>}
           {limit && <p className="miss" role="status" style={{ marginTop: 8 }}>{limit}{session?.support && <> · <a href={session.support} target="_blank" rel="noreferrer">{t('Підтримати')}</a></>}</p>}
           {askUpdate && (
             <div className="update-ask">

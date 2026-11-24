@@ -347,9 +347,9 @@ export function JobEta({ job }: { job: Job }) {
   return <>{jobProgress(db, job, now).label}</>;
 }
 
-export function LookArt({ look, w = 700, max, busy, label = false }: { look: Look; w?: number; max?: number; busy?: boolean; label?: boolean }) {
+export function LookArt({ look, w = 700, max, busy, label = false, reviewLatest = false }: { look: Look; w?: number; max?: number; busy?: boolean; label?: boolean; reviewLatest?: boolean }) {
   const db = useDb();
-  const cover = currentCover(db, look);
+  const cover = currentCover(db, look, reviewLatest);
   // `busy` = the owner asked on this page: waiting counts too; elsewhere only running work shows.
   const job = busy === false ? undefined : lookJob(db, look.id, busy === true);
   return (
