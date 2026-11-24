@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Check, MapPin, Pencil, Plus, RefreshCw, ShoppingBag, Trash2, Undo2, Wand2, X } from 'lucide-react';
 import type { Need, Product } from '../api.ts';
-import { api, thumb } from '../api.ts';
+import { api, thumb, uploadFile } from '../api.ts';
 import { useApp, useDb } from '../store.tsx';
 import { Badge, CategoryIcon, ConfirmButton, Empty, Img, JobBar, Modal, UploadButton } from '../components/ui.tsx';
 import { activeLocale, distinctLooks, fmtDay, itemArt, looksUsing, plainShopName, purchasePlan, purchaseRanking, shopLocation, shopStores, siteLooks, storeKey } from '../lib.ts';
@@ -203,24 +203,64 @@ function CoverModal({ need, onClose }: { need: Need; onClose: () => void }) {
   const db = useDb();
   const { act, toast } = useApp();
   const [retire, setRetire] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [title, setTitle] = useState(need.title);
+  const [sport, setSport] = useState(() => Boolean(db.capsules.find((capsule) => capsule.id === need.forCapsule)?.base?.some((ref) => ref.kind === 'item' && db.items.some((item) => item.id === ref.id && item.sport))));
+  const [photo, setPhoto] = useState<File>();
+  const photoPicker = useRef<HTMLInputElement>(null);
+  const uploadedPhoto = useRef<{ file: File; id: string } | undefined>(undefined);
   const items = db.items.filter((i) => i.category === need.category && i.status !== 'inactive' && !i.mergedInto && i.id !== need.replaces);
-  const cover = async (itemId: string) => {
-    const r = await act(() => api<CoverReply>('POST', `/api/needs/${need.id}/cover`, { itemId, retire }));
+  const cover = async (itemId?: string) => {
+    if (saving) return;
+    setSaving(true);
+    const r = await act(async () => {
+      let photoId: string | undefined;
+      if (!itemId && photo) {
+        if (uploadedPhoto.current?.file !== photo) uploadedPhoto.current = { file: photo, id: (await uploadFile(photo, { kind: 'item' })).id };
+        photoId = uploadedPhoto.current.id;
+      }
+      return api<CoverReply>('POST', `/api/needs/${need.id}/cover`, { retire, ...(itemId ? { itemId } : { newItem: { title, photoId, sport } }) });
+    });
+    setSaving(false);
     if (!r) return;
     toast(coverToast(t('Прибрано з покупок'), r));
     onClose();
   };
   return (
-    <Modal title={`${t('Вже маю')}: ${need.title}`} onClose={onClose} wide>
+    <Modal
+      title={`${t('Вже маю')}: ${need.title}`}
+      onClose={() => { if (!saving) onClose(); }}
+      wide={!adding}
+      footer={adding ? <>
+        <button type="button" className="btn" disabled={saving} onClick={() => setAdding(false)}>{t('Назад')}</button>
+        <button type="submit" form="cover-new-item" className="btn primary" disabled={saving || !title.trim()}>{t('Зберегти')}</button>
+      </> : (
+        <button type="button" className="btn primary" disabled={saving} onClick={() => setAdding(true)}><Plus size={14} /> {t('Додати річ')}</button>
+      )}
+    >
       <RetireOld need={need} value={retire} onChange={setRetire} />
-      {items.length === 0 ? (
-        <p className="muted">{t('У гардеробі немає речей цієї категорії. Додай фото — збіг знайдеться сам.')}</p>
+      {adding ? (
+        <form id="cover-new-item" className="stack" style={{ gap: 12 }} onSubmit={(event) => { event.preventDefault(); if (title.trim()) void cover(); }}>
+          <label className="field">
+            <span>{t('Назва')}</span>
+            <input className="input" value={title} autoFocus required maxLength={200} disabled={saving} onChange={(event) => setTitle(event.target.value)} />
+          </label>
+          <label className="row"><input type="checkbox" checked={sport} disabled={saving} onChange={(event) => setSport(event.target.checked)} /> {t('Спорт')}</label>
+          <div className="row wrap">
+            <button type="button" className="btn sm" disabled={saving} onClick={() => photoPicker.current?.click()}>{t(photo ? 'Змінити фото' : 'Додати своє фото')}</button>
+            <input ref={photoPicker} type="file" accept="image/*,.heic,.heif" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) setPhoto(file); }} />
+            {photo && <span className="small muted">{photo.name}</span>}
+          </div>
+        </form>
+      ) : items.length === 0 ? (
+        <p className="muted">{t('У гардеробі немає речей цієї категорії')}</p>
       ) : (
         <div className="own-picks">
           {items.map((i) => {
             const { art, photo } = itemArt(db, i.id);
             return (
-              <button key={i.id} className="own-pick" onClick={() => void cover(i.id)}>
+              <button key={i.id} className="own-pick" disabled={saving} onClick={() => void cover(i.id)}>
                 <span className="img"><Img path={art ?? photo} w={320} alt={i.title} /></span>
                 <span>{i.title}</span>
               </button>

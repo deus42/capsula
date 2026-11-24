@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { DB } from './schema.ts';
 import { SCHEMA_VERSION, emptySlots, validateDb } from './schema.ts';
-import { createStore } from './store.ts';
+import { createStore, HttpError } from './store.ts';
 import { stateView } from './state-view.ts';
 import { createJob, dispatch, queueMissingRenders, snapshotSlots, upload } from './routes.ts';
 import { sameIdentity, verifyReferenceFiles } from './identity.ts';
@@ -1050,6 +1050,46 @@ test('an upload that is an open recommendation leaves the shopping list, replace
   assert.equal(db.needs[0].status, 'open', 'deleting the item puts the recommendation back');
   assert.deepEqual(db.looks[0].slots.top, [{ kind: 'need', id: 'N-1' }], 'its looks get the stand-in back instead of a hole');
   assert.equal(validateDb(db), null);
+});
+
+test('already own can add a new item with an optional photo, match it, and undo without duplicating it', async () => {
+  const { store, call } = setup();
+  const original = store.read();
+  const need = original.needs[0];
+  const cover = (newItem: Record<string, unknown>) => call('POST', `/api/needs/${need.id}/cover`, { newItem });
+  const ref = { kind: 'need', id: need.id };
+  await call('PATCH', '/api/capsules/C-1', { pieces: [ref, { kind: 'item', id: 'W-1' }] });
+  await assert.rejects(cover({ title: '  ' }), /Назва не може бути порожньою/);
+  await assert.rejects(cover({ title: 'New tee', photoId: 'P-1' }), /Додай власне фото речі/);
+  await assert.rejects(cover({ title: 'New tee', photoId: 'P-missing' }), (error: unknown) => error instanceof HttpError && error.status === 404);
+  assert.equal(store.read().items.length, original.items.length, 'invalid requests do not leave a manual item behind');
+  assert.equal(store.read().needs[0].status, 'open');
+
+  await store.mutate((db) => db.photos.push({ id: 'P-own', kind: 'item', path: 'media/items/own.png', originalName: 'own.png', source: 'upload', createdAt: at }));
+  const reply = await cover({ title: 'New tee', photoId: 'P-own', sport: true });
+  assert.deepEqual(reply, { looks: 1, queued: 0, waiting: 0 });
+  const linked = store.read();
+  const item = linked.items.at(-1)!;
+  assert.equal(item.category, need.category);
+  assert.equal(item.sport, true);
+  assert.deepEqual(item.photoIds, ['P-own']);
+  assert.equal(linked.needs[0].coveredByItem, item.id);
+  assert.deepEqual(linked.looks[0].slots.top[0], { kind: 'item', id: item.id });
+  assert.ok(linked.capsules[0].pieces?.some((piece) => piece.kind === 'item' && piece.id === item.id));
+  assert.equal(linked.jobs.find((job) => job.itemId === item.id)?.kind, 'packshot');
+  await assert.rejects(cover({ title: 'New tee', photoId: 'P-own' }), /уже закрито/);
+  assert.equal(store.read().items.length, original.items.length + 1);
+
+  await call('POST', `/api/needs/${need.id}/uncover`);
+  const undone = store.read();
+  assert.ok(undone.items.some((saved) => saved.id === item.id));
+  assert.deepEqual(undone.looks[0].slots.top[0], ref);
+  assert.ok(undone.capsules[0].pieces?.some((piece) => piece.kind === 'need' && piece.id === need.id));
+  await cover({ title: 'Tee without photo' });
+  const withoutPhoto = store.read().items.at(-1)!;
+  assert.deepEqual(withoutPhoto.photoIds, []);
+  assert.equal(store.read().needs[0].coveredByItem, withoutPhoto.id);
+  assert.equal(validateDb(store.read()), null);
 });
 
 test('the runner applies a recommendation match from intake and names it in the status', async () => {

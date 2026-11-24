@@ -468,6 +468,14 @@ const routes: [string, RegExp, Handler][] = [];
 const on = (method: string, pattern: string, h: Handler) => routes.push([method, new RegExp(`^${pattern.replace(/:\w+/g, '([^/]+)')}$`), h]);
 
 // ── Wardrobe ───────────────────────────────────────────────────────────────
+function manualItem(category: Item['category'], fields: Body, photoIds: string[] = []): Item {
+  const at = now();
+  const item: Item = { id: newId('W'), rev: 1, category, title: str(fields.title, 200) || 'Нова річ', status: 'confirmed', photoIds, origin: 'manual', history: [{ at, action: 'created', note: 'Додано власником' }], createdAt: at, updatedAt: at };
+  pick(item, fields, ['color', 'brand', 'model', 'composition', 'fit', 'size']);
+  if (fields.sport === true) item.sport = true;
+  return item;
+}
+
 function clearDetachedCrop(db: DB, item: Item) {
   if (item.tryonReference && !item.photoIds.some((id) => db.photos.some((p) => p.id === id && p.path === item.tryonReference!.source.path))) delete item.tryonReference;
 }
@@ -476,10 +484,7 @@ on('POST', '/api/items', async (ctx, _p, b) => {
   const out = await ctx.store.mutate((db) => {
     const category = str(b.category) as Item['category'];
     if (!CATEGORIES.includes(category)) throw new HttpError(400, 'Вибери категорію');
-    const at = now();
-    const item: Item = { id: newId('W'), rev: 1, category, title: str(b.title, 200) || 'Нова річ', status: 'confirmed', photoIds: [], origin: 'manual', history: [{ at, action: 'created', note: 'Додано власником' }], createdAt: at, updatedAt: at };
-    pick(item, b, ['color', 'brand', 'model', 'composition', 'fit', 'size']);
-    if (b.sport === true) item.sport = true;
+    const item = manualItem(category, b);
     db.items.push(item);
     queueAdvice(db, `Нова річ: ${item.title}`);
     return item;
@@ -1008,7 +1013,24 @@ on('POST', '/api/needs/:id/search', async (ctx, [id], b) => {
 // "Вже маю": the owner's own item is what the recommendation asked for.
 on('POST', '/api/needs/:id/cover', async (ctx, [id], b) => {
   const out = await ctx.store.mutate((db) => {
-    const res = coverNeed(db, id, str(b.itemId) ?? '');
+    let itemId = str(b.itemId) ?? '';
+    if (b.newItem !== undefined) {
+      if (itemId || !b.newItem || typeof b.newItem !== 'object' || Array.isArray(b.newItem)) throw new HttpError(400, 'Вибери наявну або додай нову річ');
+      const fields = b.newItem as Body;
+      const need = findOr404(db.needs, id, 'Потреба');
+      if (need.status !== 'open') throw new HttpError(409, `«${need.title}» уже закрито`);
+      if (!str(fields.title, 200)) throw new HttpError(400, 'Назва не може бути порожньою');
+      const photoId = str(fields.photoId);
+      if (photoId) {
+        const photo = findOr404(db.photos, photoId, 'Фото');
+        if (photo.kind !== 'item' || photo.source !== 'upload' || photo.inspiration || photo.referenceRole) throw new HttpError(400, 'Додай власне фото речі');
+      }
+      const item = manualItem(need.category, fields, photoId ? [photoId] : []);
+      db.items.push(item);
+      itemId = item.id;
+    }
+    const res = coverNeed(db, id, itemId);
+    if (b.newItem) queueMissingItemPackshots(db, [itemId]);
     retireReplaced(db, res.need, b.retire);
     queueAdvice(db, `Вже маю: ${res.need.title}`);
     return res;
