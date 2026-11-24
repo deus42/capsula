@@ -4,7 +4,7 @@ import type { Capsule, Look, Season, SlotRef, SlotKey } from '../api.ts';
 import { api } from '../api.ts';
 import { go, useApp, useDb, useRoute } from '../store.tsx';
 import { Badge, ConfirmButton, Empty, LookArt, Missing, Modal, PieceBlocks, RateButtons } from '../components/ui.tsx';
-import { SEASON_LABEL, SLOT_CATEGORIES, SLOT_LABEL, openSuggestions, periodLine, bestLooks, capsuleLooks, capsuleRating, distinctLooks, hasPieces, isBestLook, lookRating, resolveRef, scoreLabel, isComplete, piecesOf, rankCapsules, rankLooks, readyLine, wardrobeCapsule, BEST_CAPSULE_NAME, WARDROBE_CAPSULE_NAME } from '../lib.ts';
+import { SEASON_LABEL, SLOT_CATEGORIES, SLOT_LABEL, isBlockedEyewear, openSuggestions, periodLine, bestLooks, capsuleLooks, capsuleRating, distinctLooks, hasPieces, isBestLook, lookRating, resolveRef, scoreLabel, isComplete, piecesOf, rankCapsules, rankLooks, readyLine, wardrobeCapsule, BEST_CAPSULE_NAME, WARDROBE_CAPSULE_NAME } from '../lib.ts';
 import { capsulePieceRefs, pieceKey } from '../capsule-pieces.ts';
 import { hiddenLookIds, isCapsuleArchived, isCapsuleHidden } from '../rating.ts';
 import { CapsuleTile, tileCovers } from './Home.tsx';
@@ -157,21 +157,25 @@ export function EditLook({ look, onClose }: { look: Look; onClose: () => void })
 
 function CreateLook({ capsule, onClose }: { capsule: Capsule; onClose: () => void }) {
   const db = useDb();
-  const { act } = useApp();
+  const { act, toast } = useApp();
   const [name, setName] = useState('');
   const [slots, setSlots] = useState<Look['slots']>({ layer: [], top: [], bottom: [], shoes: [], accessories: [] });
   const [saving, setSaving] = useState(false);
   const refs: SlotRef[] = capsule.pieces ? capsulePieceRefs(db, capsule) : [
-    ...db.items.filter((item) => item.status !== 'inactive' && !item.mergedInto).map((item) => ({ kind: 'item' as const, id: item.id })),
+    ...db.items.filter((item) => item.status !== 'inactive' && !item.mergedInto && !isBlockedEyewear(db, item.title)).map((item) => ({ kind: 'item' as const, id: item.id })),
     ...db.needs.filter((need) => need.status === 'open').map((need) => ({ kind: 'need' as const, id: need.id })),
   ];
   const options = refs.map((ref) => resolveRef(db, ref));
   const picked = new Set(Object.values(slots).flat().map(pieceKey));
   const save = async () => {
     setSaving(true);
-    const look = await act(() => api<Look>('POST', '/api/looks', { capsuleId: capsule.id, name, slots }), t('Образ додано'));
+    // The server answers an existing composition in this capsule with that look instead of a copy.
+    const known = new Set(db.looks.map((l) => l.id));
+    const look = await act(() => api<Look>('POST', '/api/looks', { capsuleId: capsule.id, name, slots }));
     setSaving(false);
-    if (look) go(`/looks/${look.id}`);
+    if (!look) return;
+    toast(known.has(look.id) ? t('Такий образ уже є в цій капсулі') : t('Образ додано'));
+    go(`/looks/${look.id}`);
   };
   return <Modal title={t('Новий образ')} onClose={onClose} footer={<>
     <button className="btn" onClick={onClose}>{t('Скасувати')}</button>

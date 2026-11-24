@@ -783,6 +783,8 @@ button.wtile { border: 0; background: none; padding: 0; font: inherit; color: in
 .wear-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 10px; }
 .wear-pair figure { margin: 0; display: flex; flex-direction: column; gap: 6px; }
 .wear-pair figcaption { font-size: 12px; color: var(--faint); text-align: center; }
+/* Without the compared render (it is the look's cover) the real photo takes the whole row. */
+.wear-pair:not(:has(figure)) > .worn { grid-column: 1 / -1; }
 .wear-angles { grid-column: 1 / -1; display: flex; gap: 6px; flex-wrap: wrap; }
 .look-hero .wear-angles .cover { width: 52px; border-radius: 7px; }
 .wear-review { display: flex; flex-direction: column; gap: 14px; margin-top: 4px; }

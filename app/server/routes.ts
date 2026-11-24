@@ -413,6 +413,8 @@ export function deleteLook(db: DB, id: string) {
   db.comparisons = db.comparisons.filter((c) => db.results.some((r) => r.id === c.resultA) && db.results.some((r) => r.id === c.resultB));
   for (const c of db.capsules) c.lookIds = c.lookIds.filter((l) => l !== id);
   for (const n of db.needs) if (n.coveredLookIds?.includes(id)) n.coveredLookIds = n.coveredLookIds.filter((l) => l !== id);
+  // Its variants stand on their own once it is gone.
+  for (const other of db.looks) if (other.variantOf === id) delete other.variantOf;
   db.looks = db.looks.filter((l) => l.id !== id);
 }
 

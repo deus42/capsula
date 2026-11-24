@@ -307,7 +307,7 @@ export function WardrobePage({ openId }: { openId?: string }) {
               ],
             },
             { label: 'Категорії', items: [
-              { key: 'sport', label: 'Спорт', icon: <Dumbbell size={17} />, n: visible.filter((i) => i.sport).length },
+              ...(visible.some((i) => i.sport) || view === 'sport' ? [{ key: 'sport', label: 'Спорт', icon: <Dumbbell size={17} />, n: visible.filter((i) => i.sport).length }] : []),
               ...CATS.map((c) => ({ key: c, label: CATEGORY_LABEL[c], icon: <CategoryIcon category={c} size={17} />, n: visible.filter((i) => i.category === c).length })),
             ] },
             {

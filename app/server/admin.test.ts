@@ -191,3 +191,18 @@ test('CODEX_ACCESS=accounts: the owner\'s subscription serves invited accounts t
   assert.equal(guest.ctx.admit, undefined, 'an invited account is not refused AI (its monthly allowances apply)');
   guest.runner.stop();
 });
+
+test('new looks get a try-on by themselves only in the owner\'s own wardrobe; invited and test accounts start it themselves', async () => {
+  const { createTenants, emptyDb } = await import('./tenants.ts');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capsula-auto-tryon-'));
+  const tenants = createTenants({ projectRoot: dir, dataDir: dir, seed: emptyDb, codexBin: '/usr/bin/false' });
+  const local = tenants.local();
+  const owner = tenants.forUser('owner-oooooo', true);
+  const guest = tenants.forUser('guest-gggggg');
+  const tester = tenants.forUser('tester-tttttt', false, true);
+  assert.equal(local.ctx.autoTryOn, true, 'the local site');
+  assert.equal(owner.ctx.autoTryOn, true, "the owner's account");
+  assert.equal(guest.ctx.autoTryOn, false, "an invited account's allowance is never spent unnoticed");
+  assert.equal(tester.ctx.autoTryOn, false, 'a test account too');
+  for (const t of [local, owner, guest, tester]) t.runner.stop();
+});

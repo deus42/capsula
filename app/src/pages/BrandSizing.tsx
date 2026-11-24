@@ -13,7 +13,6 @@ import './brand-sizing.css';
 function EditSizes({ brands, defaultBrand, onClose }: { brands: string[]; defaultBrand?: string; onClose: () => void }) {
   const { profile } = useDb();
   const { act } = useApp();
-  const [rev] = useState(profile.rev);
   const [sizes, setSizes] = useState(() => [...(profile.knownSizes ?? [])]);
   const [shoeSizeEu, setShoeSizeEu] = useState(profile.shoeSizeEu ?? '');
   const [saving, setSaving] = useState(false);
@@ -21,7 +20,7 @@ function EditSizes({ brands, defaultBrand, onClose }: { brands: string[]; defaul
     setSizes((rows) => rows.map((row) => row.id === id ? { ...row, ...changes } : row));
   const save = async () => {
     setSaving(true);
-    const result = await act(() => api('PATCH', '/api/profile', { rev, knownSizes: sizes, shoeSizeEu }), t('Збережено'));
+    const result = await act(() => api('PATCH', '/api/profile', { rev: profile.rev, knownSizes: sizes, shoeSizeEu }), t('Збережено'));
     setSaving(false);
     if (result) onClose();
   };

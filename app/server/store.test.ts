@@ -2417,3 +2417,14 @@ test('readCapped stops reading chunked responses once they exceed the byte limit
   const ok = await readCapped(new Response(Buffer.from('hello')), 100);
   assert.equal(ok?.toString('utf8'), 'hello');
 });
+
+test('deleting a look frees its variants: no variantOf points at a look that is gone', async () => {
+  const { deleteLook } = await import('./routes.ts');
+  const db = fixture();
+  const base = db.looks[0];
+  const other = { ...structuredClone(base), id: 'L-2', variantOf: base.id };
+  db.looks.push(other);
+  deleteLook(db, base.id);
+  assert.equal(db.looks.find((l) => l.id === 'L-2')?.variantOf, undefined);
+  assert.equal(validateDb(db), null);
+});
