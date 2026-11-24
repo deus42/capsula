@@ -408,6 +408,8 @@ export const en: Record<string, string> = {
   "Скасувати покупку «{name}»? Річ зникне з гардероба, покупка повернеться.": "Undo the purchase of «{name}»? The piece leaves the wardrobe and the purchase returns.",
   // Wardrobe
   "Редагувати річ": "Edit piece",
+  "Редагувати речі": "Edit pieces",
+  "Спершу заміни річ в образах": "Replace the piece in these looks first",
   "Видалити річ": "Delete piece",
   "Нова річ": "New piece",
   "напр. Біла Oxford-сорочка": "e.g. White oxford shirt",

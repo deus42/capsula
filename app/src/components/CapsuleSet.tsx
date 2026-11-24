@@ -1,10 +1,10 @@
-import { useMemo, useRef, useState } from 'react';
-import { Plus, X } from 'lucide-react';
+import { Fragment, useMemo, useRef, useState } from 'react';
+import { Pencil, Plus, X } from 'lucide-react';
 import type { Capsule, Category, SlotRef } from '../api.ts';
 import { api, thumb } from '../api.ts';
 import { useApp, useDb } from '../store.tsx';
 import { CATEGORY_LABEL, resolveRef } from '../lib.ts';
-import { CAPSULE_LIMITS, MAX_BASE_PIECES, capsuleLimits, capsuleSet, pieceCategory, pieceGroup, pieceKey, type CapsulePiece, type PieceGroup } from '../capsule-pieces.ts';
+import { CAPSULE_LIMITS, MAX_BASE_PIECES, capsuleLimits, capsuleSet, normalizePiece, pieceCategory, pieceGroup, pieceKey, visibleCapsuleLooks, type CapsulePiece, type PieceGroup } from '../capsule-pieces.ts';
 import { Badge, CategoryIcon, Modal } from './ui.tsx';
 import { LOOKS, t, plural as pluralize } from '../i18n.ts';
 
@@ -25,7 +25,7 @@ const pieceHref = (r: SlotRef) => (r.kind === 'item' ? `/wardrobe/${r.id}` : `/s
  */
 export function CapsuleSetSection({ capsule }: { capsule: Capsule }) {
   const db = useDb();
-  const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState(false);
   const set = useMemo(() => capsuleSet(db, capsule), [db, capsule]);
   const garments = set.pieces.filter((p) => p.group === 'garments').sort(byRole);
   const extras = set.pieces.filter((p) => p.group !== 'garments').sort(byRole);
@@ -50,12 +50,14 @@ export function CapsuleSetSection({ capsule }: { capsule: Capsule }) {
         <h2 className="h2">{t('Речі')} <span className={`count${over ? ' over' : ''}`}>{over ? `${set.counts.garments}/${CAPSULE_LIMITS.garments}` : set.counts.garments}</span></h2>
         <div className="row">
           {set.combinations > 0 && <span className="set-combos">{combosText(set.combinations)}</span>}
-          <button type="button" className="btn sm ghost" onClick={() => setAdding(true)}><Plus size={14} /> {t('Додати річ')}</button>
+          <button type="button" className="btn sm" onClick={() => setEditing(true)}>
+            {set.pieces.length ? <><Pencil size={14} /> {t('Редагувати речі')}</> : <><Plus size={14} /> {t('Додати річ')}</>}
+          </button>
         </div>
       </div>
       {garments.length > 0 && <div className="ward-grid">{garments.map(tile)}</div>}
       {extras.length > 0 && <div className="ward-grid small set-extras">{extras.map(tile)}</div>}
-      {adding && <CapsuleSetDialog capsule={capsule} onClose={() => setAdding(false)} />}
+      {editing && <CapsuleSetDialog capsule={capsule} onClose={() => setEditing(false)} />}
     </section>
   );
 }
@@ -72,7 +74,7 @@ function CapsuleSetDialog({ capsule, onClose }: { capsule: Capsule; onClose: () 
     setSaving(false);
     if (result) onClose();
   };
-  return <Modal title={t('Додати річ')} wide onClose={() => { if (!saving) onClose(); }} footer={<>
+  return <Modal title={initial.pieces.length ? t('Редагувати речі') : t('Додати річ')} wide onClose={() => { if (!saving) onClose(); }} footer={<>
     <button type="button" className="btn" disabled={saving} onClick={onClose}>{t('Скасувати')}</button>
     <button type="button" className="btn primary" disabled={saving || Boolean(draft.pending) || sameSetDraft(draft, initial)} onClick={() => void save()}>{t('Зберегти')}</button>
   </>}>
@@ -98,6 +100,7 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
   const db = useDb();
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<PieceFilter>(() => sportCapsule(capsule) ? 'sport' : 'all');
+  const [blocked, setBlocked] = useState<string | null>(null);
   const searchInput = useRef<HTMLInputElement>(null);
   const limits = capsuleLimits(capsule);
   const groupOf = (r: SlotRef): PieceGroup => {
@@ -135,6 +138,9 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
     return c === 'outerwear' ? 'layer' : c === 'trousers' || c === 'shorts' || c === 'skirts' ? 'bottom' : c === 'shoes' || c === 'accessories' ? c : 'top';
   };
   const ordered = [...draft.pieces].sort((a, b) => ROLE_ORDER.indexOf(roleOf(a)) - ROLE_ORDER.indexOf(roleOf(b)));
+  const usedIn = (key: string) => visibleCapsuleLooks(db, capsule).filter((look) =>
+    Object.values(look.slots).some((refs) => refs.some((ref) => pieceKey(normalizePiece(db, ref)) === key)));
+  const blockedLooks = blocked ? usedIn(blocked) : [];
 
   const add = (ref: SlotRef) => {
     const g = groupOf(ref);
@@ -142,11 +148,17 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
     onChange(atLimit ? { ...draft, pending: ref } : { ...draft, pieces: [...draft.pieces, ref], pending: null });
     return !atLimit;
   };
-  const remove = (r: SlotRef) => onChange({ ...draft, pieces: draft.pieces.filter((x) => pieceKey(x) !== pieceKey(r)), base: draft.base.filter((k) => k !== pieceKey(r)) });
-  const replace = (r: SlotRef) => {
-    if (!draft.pending) return;
-    const pending = draft.pending;
-    onChange({ pieces: draft.pieces.map((x) => (pieceKey(x) === pieceKey(r) ? pending : x)), base: draft.base.filter((k) => k !== pieceKey(r)), pending: null });
+  const changePiece = (r: SlotRef, replacement?: SlotRef) => {
+    const key = pieceKey(r);
+    if (usedIn(key).length) {
+      setBlocked(key);
+      return;
+    }
+    setBlocked(null);
+    const pieces = replacement
+      ? draft.pieces.map((ref) => pieceKey(ref) === key ? replacement : ref)
+      : draft.pieces.filter((ref) => pieceKey(ref) !== key);
+    onChange({ ...draft, pieces, base: draft.base.filter((k) => k !== key), pending: replacement ? null : draft.pending });
   };
   const toggleBase = (r: SlotRef) => {
     const k = pieceKey(r);
@@ -182,12 +194,42 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
           <span key={g} className={counts[g] > limits[g] ? 'over' : ''}>{t(GROUP_TEXT[g])} {counts[g]}/{limits[g]}</span>
         ))}
       </p>
-      {draft.pending && pendingGroup ? (
+      {draft.pending && pendingGroup && (
         <p className="set-note" role="status">
           {t('{group} уже {n}/{max}: що замінить «{title}»?', { group: t(GROUP_TEXT[pendingGroup]), n: counts[pendingGroup], max: limits[pendingGroup], title: resolveRef(db, draft.pending).title })}
-          <button type="button" className="quiet-toggle" onClick={() => onChange({ ...draft, pending: null })}>{t('Скасувати')}</button>
+          <button type="button" className="quiet-toggle" onClick={() => { setBlocked(null); onChange({ ...draft, pending: null }); }}>{t('Скасувати')}</button>
         </p>
-      ) : <>
+      )}
+      {ordered.length > 0 && <ul className="set-list">
+        {ordered.map((r) => {
+          const res = resolveRef(db, r);
+          const art = res.art ?? res.photo;
+          const g = groupOf(r);
+          const key = pieceKey(r);
+          const isBase = draft.base.includes(key);
+          return (
+            <Fragment key={key}>
+              <li className={pendingGroup === g ? 'replaceable' : ''}>
+                <span className="set-thumb">{art ? <img src={thumb(art, 160)} alt="" /> : <CategoryIcon category={res.category} size={16} />}</span>
+                <a className="set-name" href={pieceHref(r)}>{res.title}{r.kind === 'need' && <span className="buy"> · {t('докупити')}</span>}</a>
+                {g === 'garments' && (
+                  <button type="button" className={`quiet-toggle${isBase ? ' on' : ''}`} aria-pressed={isBase} disabled={!isBase && draft.base.length >= MAX_BASE_PIECES} onClick={() => toggleBase(r)}>{t('база')}</button>
+                )}
+                {pendingGroup === g && draft.pending
+                  ? <button type="button" className="quiet-toggle" onClick={() => changePiece(r, draft.pending!)}>{t('замінити')}</button>
+                  : <button type="button" className="icon-btn sm" aria-label={t('Прибрати «{title}»', { title: res.title })} onClick={() => changePiece(r)}><X size={13} /></button>}
+              </li>
+              {blocked === key && blockedLooks.length > 0 && (
+                <li><p className="set-note" role="status">
+                  {t('Спершу заміни річ в образах')}
+                  {blockedLooks.map((look) => <a key={look.id} className="quiet-toggle on" href={`/looks/${look.id}`}>{look.name}</a>)}
+                </p></li>
+              )}
+            </Fragment>
+          );
+        })}
+      </ul>}
+      {!draft.pending && <>
         <div className="filters set-filters" role="group" aria-label={t('Категорії')}>
           {filters.filter(({ key, available }) => available !== false || key === filter).map(({ key, label }) => (
             <button key={key} type="button" className={key === filter ? 'on' : undefined} aria-pressed={key === filter} onClick={() => setFilter(key)}>{t(label)}</button>
@@ -201,27 +243,6 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
           </div>
         ) : <p className="muted small" role="status">{t('Нічого відповідного не знайдено')}</p>}
       </>}
-      {ordered.length > 0 && <ul className="set-list">
-        {ordered.map((r) => {
-          const res = resolveRef(db, r);
-          const art = res.art ?? res.photo;
-          const g = groupOf(r);
-          const key = pieceKey(r);
-          const isBase = draft.base.includes(key);
-          return (
-            <li key={key} className={pendingGroup === g ? 'replaceable' : ''}>
-              <span className="set-thumb">{art ? <img src={thumb(art, 160)} alt="" /> : <CategoryIcon category={res.category} size={16} />}</span>
-              <span className="set-name">{res.title}{r.kind === 'need' && <span className="buy"> · {t('докупити')}</span>}</span>
-              {g === 'garments' && (
-                <button type="button" className={`quiet-toggle${isBase ? ' on' : ''}`} aria-pressed={isBase} disabled={!isBase && draft.base.length >= MAX_BASE_PIECES} onClick={() => toggleBase(r)}>{t('база')}</button>
-              )}
-              {pendingGroup === g
-                ? <button type="button" className="quiet-toggle" onClick={() => replace(r)}>{t('замінити')}</button>
-                : <button type="button" className="icon-btn sm" aria-label={t('Прибрати «{title}»', { title: res.title })} onClick={() => remove(r)}><X size={13} /></button>}
-            </li>
-          );
-        })}
-      </ul>}
     </div>
   );
 }
