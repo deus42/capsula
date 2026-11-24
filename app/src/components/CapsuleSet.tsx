@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { Plus, X } from 'lucide-react';
 import type { Capsule, SlotRef } from '../api.ts';
 import { api, thumb } from '../api.ts';
@@ -68,7 +68,7 @@ function CapsuleSetDialog({ capsule, onClose }: { capsule: Capsule; onClose: () 
     setSaving(false);
     if (result) onClose();
   };
-  return <Modal title={t('Речі капсули')} onClose={() => { if (!saving) onClose(); }} footer={<>
+  return <Modal title={t('Додати річ')} wide onClose={() => { if (!saving) onClose(); }} footer={<>
     <button type="button" className="btn" disabled={saving} onClick={onClose}>{t('Скасувати')}</button>
     <button type="button" className="btn primary" disabled={saving || Boolean(draft.pending) || sameSetDraft(draft, initial)} onClick={() => void save()}>{t('Зберегти')}</button>
   </>}>
@@ -92,6 +92,8 @@ export const initialSetDraft = (db: Parameters<typeof capsuleSet>[0], capsule: C
 /** The set inside the capsule's pencil modal: remove, add, replace at the limit, mark the base. */
 export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsule; draft: SetDraft; onChange: (next: SetDraft) => void }) {
   const db = useDb();
+  const [query, setQuery] = useState('');
+  const searchInput = useRef<HTMLInputElement>(null);
   const limits = capsuleLimits(capsule);
   const groupOf = (r: SlotRef): PieceGroup => {
     const c = pieceCategory(db, r);
@@ -101,21 +103,21 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
   for (const r of draft.pieces) counts[groupOf(r)] += 1;
   const inSet = new Set(draft.pieces.map(pieceKey));
   const pendingGroup = draft.pending ? groupOf(draft.pending) : null;
-  const items = db.items.filter((i) => i.status !== 'inactive' && !i.mergedInto && !inSet.has(`item:${i.id}`));
-  const needs = db.needs.filter((n) => n.status === 'open' && !inSet.has(`need:${n.id}`));
+  const search = query.trim().toLocaleLowerCase();
+  const matches = (...values: Array<string | undefined>) => values.join(' ').toLocaleLowerCase().includes(search);
+  const items = db.items.filter((i) => i.status !== 'inactive' && !i.mergedInto && !inSet.has(`item:${i.id}`) && matches(i.title, t(CATEGORY_LABEL[i.category]), i.brand, i.model));
+  const needs = db.needs.filter((n) => n.status === 'open' && !inSet.has(`need:${n.id}`) && matches(n.title, t(CATEGORY_LABEL[n.category])));
   const roleOf = (r: SlotRef) => {
     const c = pieceCategory(db, r);
     return c === 'outerwear' ? 'layer' : c === 'trousers' || c === 'shorts' || c === 'skirts' ? 'bottom' : c === 'shoes' || c === 'accessories' ? c : 'top';
   };
   const ordered = [...draft.pieces].sort((a, b) => ROLE_ORDER.indexOf(roleOf(a)) - ROLE_ORDER.indexOf(roleOf(b)));
 
-  const add = (value: string) => {
-    const [kind, id] = value.split(':') as [SlotRef['kind'], string];
-    if (!id) return;
-    const ref: SlotRef = { kind, id };
+  const add = (ref: SlotRef) => {
     const g = groupOf(ref);
-    if (counts[g] >= limits[g]) onChange({ ...draft, pending: ref });
-    else onChange({ ...draft, pieces: [...draft.pieces, ref], pending: null });
+    const atLimit = counts[g] >= limits[g];
+    onChange(atLimit ? { ...draft, pending: ref } : { ...draft, pieces: [...draft.pieces, ref], pending: null });
+    return !atLimit;
   };
   const remove = (r: SlotRef) => onChange({ ...draft, pieces: draft.pieces.filter((x) => pieceKey(x) !== pieceKey(r)), base: draft.base.filter((k) => k !== pieceKey(r)) });
   const replace = (r: SlotRef) => {
@@ -128,6 +130,26 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
     if (draft.base.includes(k)) onChange({ ...draft, base: draft.base.filter((x) => x !== k) });
     else if (draft.base.length < MAX_BASE_PIECES) onChange({ ...draft, base: [...draft.base, k] });
   };
+  const choices = (label: string, refs: SlotRef[]) => refs.length > 0 && (
+    <div className="set-choice-group" role="group" aria-label={label}>
+      <h3>{label}</h3>
+      <div className="own-picks">
+        {refs.map((ref) => {
+          const piece = resolveRef(db, ref);
+          return (
+            <button className="own-pick" key={pieceKey(ref)} type="button" onClick={(event) => {
+              if (add(ref) && event.detail === 0) searchInput.current?.focus();
+            }}>
+              <span className="img">
+                {piece.art ? <img src={thumb(piece.art, 240)} alt="" loading="lazy" /> : <CategoryIcon category={piece.category} size={22} />}
+              </span>
+              <span>{piece.title}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
 
   return (
     <div className="field full set-edit">
@@ -137,12 +159,21 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
           <span key={g} className={counts[g] > limits[g] ? 'over' : ''}>{t(GROUP_TEXT[g])} {counts[g]}/{limits[g]}</span>
         ))}
       </p>
-      <select className="select" value="" aria-label={t('Додати річ у капсулу')} onChange={(e) => add(e.target.value)}>
-        <option value="">{t('Додати річ…')}</option>
-        {items.length > 0 && <optgroup label={t('Мої речі')}>{items.map((i) => <option key={i.id} value={`item:${i.id}`}>{i.title} — {t(CATEGORY_LABEL[i.category])}</option>)}</optgroup>}
-        {needs.length > 0 && <optgroup label={t('Докупити')}>{needs.map((n) => <option key={n.id} value={`need:${n.id}`}>{n.title} — {t(CATEGORY_LABEL[n.category])}</option>)}</optgroup>}
-      </select>
-      <ul className="set-list">
+      {draft.pending && pendingGroup ? (
+        <p className="set-note" role="status">
+          {t('{group} уже {n}/{max}: що замінить «{title}»?', { group: t(GROUP_TEXT[pendingGroup]), n: counts[pendingGroup], max: limits[pendingGroup], title: resolveRef(db, draft.pending).title })}
+          <button type="button" className="quiet-toggle" onClick={() => onChange({ ...draft, pending: null })}>{t('Скасувати')}</button>
+        </p>
+      ) : <>
+        <input ref={searchInput} type="search" className="input" aria-label={t('Пошук речі')} placeholder={t('Пошук речі')} value={query} onChange={(event) => setQuery(event.target.value)} />
+        {items.length + needs.length > 0 ? (
+          <div className="set-choices">
+            {choices(t('Мої речі'), items.map(({ id }) => ({ kind: 'item', id })))}
+            {choices(t('Докупити'), needs.map(({ id }) => ({ kind: 'need', id })))}
+          </div>
+        ) : <p className="muted small" role="status">{t('Нічого відповідного не знайдено')}</p>}
+      </>}
+      {ordered.length > 0 && <ul className="set-list">
         {ordered.map((r) => {
           const res = resolveRef(db, r);
           const art = res.art ?? res.photo;
@@ -162,13 +193,7 @@ export function CapsuleSetEditor({ capsule, draft, onChange }: { capsule: Capsul
             </li>
           );
         })}
-      </ul>
-      {draft.pending && pendingGroup && (
-        <p className="set-note">
-          {t('{group} уже {n}/{max}: що замінить «{title}»?', { group: t(GROUP_TEXT[pendingGroup]), n: counts[pendingGroup], max: limits[pendingGroup], title: resolveRef(db, draft.pending).title })}
-          <button type="button" className="quiet-toggle" onClick={() => onChange({ ...draft, pending: null })}>{t('Скасувати')}</button>
-        </p>
-      )}
+      </ul>}
     </div>
   );
 }
