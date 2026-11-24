@@ -1,4 +1,4 @@
-import { Fragment, useRef, useState } from 'react';
+import { Fragment, useLayoutEffect, useRef, useState } from 'react';
 import { Pencil, Plus, X } from 'lucide-react';
 import { CATEGORIES } from '../../server/schema.ts';
 import { api, type KnownSize } from '../api.ts';
@@ -56,26 +56,30 @@ function EditSizes({ brands, defaultBrand, onClose }: { brands: string[]; defaul
   );
 }
 
-/** Brands as quiet text toggles; my sizes stand out in the display serif and as marked rows of the original charts. */
+/** My size per brand in a quiet list; the chosen brand's original charts beside it, sizes across, my size marked and in view. */
 export function BrandSizing() {
   const db = useDb();
   const [editing, setEditing] = useState(false);
   const [selected, setSelected] = useState('');
-  const panel = useRef<HTMLDivElement>(null);
+  const detail = useRef<HTMLDivElement>(null);
   const [hold, setHold] = useState(0);
-  // Switching brands keeps the toggles in place: the charts below never end above the screen's bottom edge,
+  // Switching brands keeps the list in place: the charts keep their height down to the screen's bottom edge,
   // so a shorter chart cannot pull the page up (this section is the last one on the page).
   const pick = (key: string) => {
-    const top = panel.current?.getBoundingClientRect().top;
-    if (top !== undefined) setHold(Math.max(0, Math.ceil(window.innerHeight - top)));
+    const box = detail.current?.getBoundingClientRect();
+    if (box) setHold(Math.max(0, Math.ceil(Math.min(box.height, window.innerHeight - box.top))));
     setSelected(key);
   };
   const brands = sizingBrands(db);
   const records = sizeEvidence(db).filter((row) => row.brand);
   const known = (name: string) => brands.find((brand) => brandKey(brand) === brandKey(name));
   const activeBrand = known(selected) ?? records.map((row) => known(row.brand)).find(Boolean) ?? brands[0];
+  const activeKey = brandKey(activeBrand ?? '');
   const activeGuides = activeBrand ? sizeGuides(activeBrand, db.profile.wardrobeFocus ?? 'men') : [];
-  const personal = records.filter((row) => brandKey(row.brand) === brandKey(activeBrand ?? ''));
+  const sizesOf = (brand: string) => [...new Map(records
+    .filter((row) => brandKey(row.brand) === brandKey(brand))
+    .map((row) => [row.size.trim().toUpperCase(), row.size.trim()])).values()].join(' · ');
+  const personal = records.filter((row) => brandKey(row.brand) === activeKey);
   const mine = new Map<string, { size: string; category: SizeEvidence['category']; items: { id: string; title: string }[] }>();
   for (const row of personal) {
     const key = `${row.category}|${row.size.trim().toUpperCase()}`;
@@ -83,58 +87,79 @@ export function BrandSizing() {
     if (row.item) group.items.push(row.item);
     mine.set(key, group);
   }
+  const from = [...mine.values()].filter((group) => group.items.length);
   const marked = activeGuides.map((guide) => {
     const mySizes = personal.filter((row) => guide.categories.includes(row.category)).map((row) => row.size);
     if (guide.categories.includes('shoes') && db.profile.shoeSizeEu) mySizes.push(db.profile.shoeSizeEu);
     return myRows(guide, mySizes);
   });
+  const markKey = marked.map((rows) => [...rows].join(',')).join('|');
+  // Each chart scrolls sideways so my size sits in the middle of what is visible.
+  useLayoutEffect(() => {
+    detail.current?.querySelectorAll<HTMLElement>('.brand-guide-scroll').forEach((scroller) => {
+      const own = scroller.querySelectorAll<HTMLElement>('thead .my-col');
+      if (!own.length) {
+        scroller.scrollLeft = 0;
+        return;
+      }
+      const label = scroller.querySelector<HTMLElement>('thead th')?.offsetWidth ?? 0;
+      const last = own[own.length - 1];
+      const middle = (own[0].offsetLeft + last.offsetLeft + last.offsetWidth) / 2;
+      scroller.scrollLeft = middle - label - (scroller.clientWidth - label) / 2;
+    });
+  }, [activeKey, markKey]);
   return (
     <section className="card lg brand-sizing" aria-labelledby="brand-sizing-title">
       <div className="section-head">
         <h2 className="h2" id="brand-sizing-title">{t('Розміри за брендами')}</h2>
-        <button type="button" className="icon-btn" aria-label={t('Редагувати розміри')} onClick={() => setEditing(true)}><Pencil size={14} /></button>
+        <div className="brand-size-actions">
+          {db.profile.shoeSizeEu && <span>{t('Взуття')} (EU) <strong>{db.profile.shoeSizeEu}</strong></span>}
+          <button type="button" className="icon-btn" aria-label={t('Редагувати розміри')} onClick={() => setEditing(true)}><Pencil size={14} /></button>
+        </div>
       </div>
-      {db.profile.shoeSizeEu && <p className="small muted">{t('Мій розмір взуття (EU)')} <strong>{db.profile.shoeSizeEu}</strong></p>}
       {!activeBrand && !db.profile.shoeSizeEu && <p className="small muted">{t('Додай розмір через олівець.')}</p>}
       {activeBrand && (
-        <>
-          <div className="filters start brand-size-brands" role="group" aria-label={t('Бренд')}>
+        <div className="brand-size-layout">
+          <div className="brand-size-list" role="group" aria-label={t('Бренд')}>
             {brands.map((brand) => {
-              const on = brandKey(brand) === brandKey(activeBrand);
-              return <button type="button" key={brandKey(brand)} className={on ? 'on' : undefined} aria-pressed={on} onClick={() => pick(brandKey(brand))}>{brand}</button>;
+              const on = brandKey(brand) === activeKey;
+              const size = sizesOf(brand);
+              return <button type="button" key={brandKey(brand)} className={on ? 'on' : undefined} aria-pressed={on} onClick={() => pick(brandKey(brand))}>
+                <span>{brand}</span>{size && <strong>{size}</strong>}
+              </button>;
             })}
           </div>
-          <div ref={panel} style={hold ? { minHeight: hold } : undefined}>
-          {mine.size ? <ul className="brand-size-mine">
-            {[...mine.entries()].map(([key, group]) => <li key={key}>
-              <strong>{group.size}</strong>
-              <span>{group.items.length
-                ? group.items.map((item, index) => <Fragment key={item.id}>{index ? ', ' : ''}<a href={`/wardrobe/${item.id}`}>{item.title}</a></Fragment>)
-                : t(CATEGORY_LABEL[group.category])}</span>
-            </li>)}
-          </ul> : !marked.some((rows) => rows.size) && <p className="small muted brand-size-none">{t('Мій розмір ще не записано')}</p>}
-          {activeGuides.length ? activeGuides.map((guide, guideIndex) => (
-            <section className="brand-guide" key={`${guide.focus}:${guide.title}`}>
-              <div className="section-head">
-                <h3>{t(guide.title)}</h3>
-                <a href={guide.url} target="_blank" rel="noreferrer">{t('Оригінал')}</a>
-              </div>
-              {guide.rows.length ? <div className="brand-guide-scroll">
-                <table>
-                  <thead><tr>{guide.columns.map((column) => <th scope="col" key={column}>{t(column)}</th>)}</tr></thead>
-                  <tbody>{guide.rows.map(([size, ...cells]) => {
-                    const own = marked[guideIndex].has(size);
-                    return <tr key={size} className={own ? 'my-row' : undefined}>
-                      <th scope="row" aria-label={own ? t('Мій розмір {size}', { size }) : undefined}>{size}</th>
-                      {cells.map((cell, index) => <td key={guide.columns[index + 1]}>{cell}</td>)}
-                    </tr>;
-                  })}</tbody>
-                </table>
-              </div> : <p className="small muted">{t('Точна сітка залежить від моделі')}</p>}
-            </section>
-          )) : <p className="small muted">{t('Офіційної таблиці ще немає')}</p>}
+          <div className="brand-size-detail" ref={detail} style={hold ? { minHeight: hold } : undefined}>
+            {from.length > 0 && <p className="brand-size-from">{from.map((group, index) => <Fragment key={`${group.category}|${group.size}`}>
+              {index ? ' · ' : ''}{mine.size > 1 && `${group.size} — `}
+              {group.items.map((item, i) => <Fragment key={item.id}>{i ? ', ' : ''}<a href={`/wardrobe/${item.id}`}>{item.title}</a></Fragment>)}
+            </Fragment>)}</p>}
+            {!mine.size && !marked.some((rows) => rows.size) && <p className="small muted">{t('Мій розмір ще не записано')}</p>}
+            {activeGuides.length ? activeGuides.map((guide, guideIndex) => (
+              <section className="brand-guide" key={`${guide.focus}:${guide.title}`}>
+                <div className="brand-guide-head">
+                  <h3>{t(guide.title)}</h3>
+                  <a href={guide.url} target="_blank" rel="noreferrer">{t('Оригінал')}</a>
+                </div>
+                {guide.rows.length ? <div className="brand-guide-scroll">
+                  <table>
+                    <thead><tr>
+                      <th scope="row">{t(guide.columns[0])}</th>
+                      {guide.rows.map(([size]) => {
+                        const own = marked[guideIndex].has(size);
+                        return <th scope="col" key={size} className={own ? 'my-col' : undefined} aria-label={own ? t('Мій розмір {size}', { size }) : undefined}>{size}</th>;
+                      })}
+                    </tr></thead>
+                    <tbody>{guide.columns.slice(1).map((column, index) => <tr key={column}>
+                      <th scope="row">{t(column)}</th>
+                      {guide.rows.map((row) => <td key={row[0]} className={marked[guideIndex].has(row[0]) ? 'my-col' : undefined}>{row[index + 1]}</td>)}
+                    </tr>)}</tbody>
+                  </table>
+                </div> : <p className="small muted">{t('Точна сітка залежить від моделі')}</p>}
+              </section>
+            )) : <p className="small muted">{t('Офіційної таблиці ще немає')}</p>}
           </div>
-        </>
+        </div>
       )}
       {editing && <EditSizes brands={brands} defaultBrand={activeBrand} onClose={() => setEditing(false)} />}
     </section>
