@@ -10,6 +10,8 @@ import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { testAccounts, TEST_EMAIL_DOMAIN } from './test-accounts.ts';
+import { createStore } from './store.ts';
+import { emptyDb } from './tenants.ts';
 
 const APP = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OWNER = 'owner@example.test';
@@ -123,8 +125,37 @@ test('admin over HTTP: test accounts sign in by link, only the owner reaches «�
     assert.ok(agent.lastSignIn);
     assert.equal(users.find((u: { email: string }) => u.email === OWNER).owner, true);
 
+    const logPath = 'jobs/J-log/codex.jsonl';
+    const log = '{"type":"test-event"}\n';
+    for (const id of [agent.id, ownerRow.id]) {
+      const tenantDir = path.join(dir, 'users', id);
+      const logFile = path.join(tenantDir, logPath);
+      fs.mkdirSync(path.dirname(logFile), { recursive: true });
+      fs.writeFileSync(logFile, log);
+      await createStore(tenantDir, emptyDb).mutate((db) => {
+        db.jobs.push({ id: 'J-log', kind: 'advise', logPath, state: 'done', lookVersion: 0, snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', origin: 'site', createdAt: db.updatedAt });
+      });
+    }
+    const forbidden = await get('/api/jobs/J-log/log', tester.cookie);
+    assert.equal(forbidden.status, 403);
+    assert.deepEqual(await forbidden.json(), { error: 'Лише для власника' });
+    const allowed = await get('/api/jobs/J-log/log', owner.cookie);
+    assert.equal(allowed.status, 200);
+    assert.deepEqual(await allowed.json(), { log });
+    assert.equal((await get('/api/jobs/J-missing/log', owner.cookie)).status, 404);
+    assert.equal((await get(`/media/${logPath}`, tester.cookie)).status, 403);
+    for (const pathname of ['/t/%ZZ', '/i/%ZZ', '/api/admin/test-accounts/%ZZ', '/api/jobs/%ZZ/log', '/media/%ZZ', '/thumb/%ZZ']) {
+      const invalid = await get(pathname, owner.cookie);
+      assert.equal(invalid.status, 400, pathname);
+      assert.deepEqual(await invalid.json(), { error: 'Некоректний запит' });
+    }
+
     const send = (method: string, p: string, cookie: string, body?: unknown) =>
       fetch(`${base}${p}`, { method, headers: { cookie, 'x-capsula': '1', 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    assert.equal((await send('DELETE', '/api/invites/%ZZ', owner.cookie)).status, 400);
+    const invalidFilename = await fetch(`${base}/api/upload`, { method: 'POST', headers: { cookie: owner.cookie, 'x-capsula': '1', 'x-filename': '%ZZ' } });
+    assert.equal(invalidFilename.status, 400);
+    assert.deepEqual(await invalidFilename.json(), { error: 'Некоректний запит' });
     assert.equal((await send('POST', '/api/admin/test-accounts', tester.cookie, {})).status, 403);
     const second = await (await send('POST', '/api/admin/test-accounts', owner.cookie, { name: 'Тест 2' })).json();
     assert.equal(second.name, 'Тест 2');

@@ -884,13 +884,13 @@ function StepActivate({ onFinish }: { onFinish: () => void }) {
           </div>
           <div className="look-grid">
             {looks.slice(0, 6).map((l) => {
-              const cover = currentCover(db, l);
+              const cover = currentCover(db, l, true);
               const job = db.jobs.filter((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === l.id).at(-1);
               const busy = job?.state === 'queued' || job?.state === 'running';
               return (
                 <div key={l.id} className="look-card">
                   <a className="cover" style={{ aspectRatio: '2 / 3' }} href={`/looks/${l.id}`}>
-                    <LookArt look={l} busy={busy} label />
+                    <LookArt look={l} busy={busy} label reviewLatest />
                   </a>
                   <a href={`/looks/${l.id}`}><h4>{l.name}</h4></a>
                   {job?.state === 'error' && !busy && <span className="miss">{t(job.stateNote ?? 'Зараз не вийде')}</span>}

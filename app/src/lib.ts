@@ -116,11 +116,14 @@ export function resolveRef(db: DB, ref: SlotRef): ResolvedRef {
   return { ref, title: p ? `${p.brand} ${p.model}`.trim() : ref.id, kind: 'product', category: cat, art: photo, photo, missing: !p };
 }
 
-export function resultsForLook(db: DB, lookId: string) {
+type CoverResult = Omit<Result, 'prompt'>;
+type CoverState<R extends CoverResult = CoverResult> = Pick<DB, 'jobs' | 'photos' | 'profile'> & { results: R[] };
+
+export function resultsForLook<R extends CoverResult>(db: CoverState<R>, lookId: string) {
   return db.results.filter((r) => r.lookId === lookId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
-function pendingForCurrentIdentity(db: DB, result: Result) {
+function pendingForCurrentIdentity(db: CoverState, result: CoverResult) {
   if (result.hiddenAt || result.review !== 'pending') return false;
   const snapshot = db.jobs.find((job) => job.id === result.jobId)?.snapshot;
   if (!snapshot) return false;
@@ -141,9 +144,9 @@ function pendingForCurrentIdentity(db: DB, result: Result) {
  * A rejected try-on (not the owner's face) is never shown; the look shows its
  * pieces instead (owner, 17.11). Rejected attempts stay in the archive.
  */
-export function coverForLook(db: DB, look: Look): Result | undefined {
+export function coverForLook<R extends CoverResult>(db: CoverState<R>, look: Look): R | undefined {
   const rs = resultsForLook(db, look.id).filter((r) => !r.hiddenAt);
-  const best = (results: Result[]) => results.find((r) => r.review === 'accepted') ?? results.find((r) => pendingForCurrentIdentity(db, r));
+  const best = (results: R[]) => results.find((r) => r.review === 'accepted') ?? results.find((r) => pendingForCurrentIdentity(db, r));
   return best(rs.filter((r) => r.lookVersion === look.version)) ?? best(rs);
 }
 
@@ -151,7 +154,7 @@ export function coverForLook(db: DB, look: Look): Result | undefined {
  * The picture shown for a look (owner, 19.11): a try-on of an older composition is not shown — the collage of the
  * current pieces stands in until a new try-on (⟳) — unless the owner answered «Ні» to «Речі змінено» for this version.
  */
-export function currentCover(db: DB, look: Look, reviewLatest = false): Result | undefined {
+export function currentCover<R extends CoverResult>(db: CoverState<R>, look: Look, reviewLatest = false): R | undefined {
   const cover = coverForLook(db, look);
   const saved = cover && (cover.lookVersion === look.version || look.keptVersion === look.version) ? cover : undefined;
   if (!reviewLatest) return saved;

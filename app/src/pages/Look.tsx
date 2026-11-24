@@ -5,7 +5,7 @@ import { api, media, quotaNote, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
 import { Badge, CategoryIcon, Empty, LookArt, Missing, Modal, RateButtons } from '../components/ui.tsx';
 import type { ResolvedRef } from '../lib.ts';
-import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, itemArt, lookRating, lookVariants, resolveRef, scoreLabel } from '../lib.ts';
+import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, isBlockedEyewear, itemArt, lookRating, lookVariants, resolveRef, scoreLabel } from '../lib.ts';
 import { hiddenLookIds } from '../rating.ts';
 import { freePlaces, inSavedSet, normalizePiece, pieceCategory, pieceGroup, pieceKey, visibleCapsuleLooks } from '../capsule-pieces.ts';
 import { rendersPaused } from '../render-need.ts';
@@ -305,11 +305,11 @@ function SwapModal({ look, slot, current, variant, onClose }: { look: Look; slot
     const cats = slot ? SLOT_CATEGORIES[s] : SLOT_CATEGORIES[s].filter((c) => NATURAL[c] === s);
     const own = current?.kind === 'item' ? db.items.find((i) => i.id === current.id)?.category : current?.kind === 'need' ? db.needs.find((n) => n.id === current.id)?.category : undefined;
     return [
-      ...db.items.filter((i) => cats.includes(i.category) && i.status !== 'inactive' && !i.mergedInto && !(eyewearBlocked(db) && accessoryKind(i.title) === 'glasses')).sort((a, b) => Number(b.category === own) - Number(a.category === own)).map((i) => {
+      ...db.items.filter((i) => cats.includes(i.category) && i.status !== 'inactive' && !i.mergedInto && !isBlockedEyewear(db, i.title)).sort((a, b) => Number(b.category === own) - Number(a.category === own)).map((i) => {
         const { art, photo } = itemArt(db, i.id);
         return { ref: { kind: 'item' as const, id: i.id }, title: i.title, photo: art ?? photo };
       }),
-      ...db.needs.filter((n) => n.status === 'open' && cats.includes(n.category)).map((n) => ({ ref: { kind: 'need' as const, id: n.id }, title: `${n.title} · ${t('докупити')}`, photo: art(n.conceptPhotoId) })),
+      ...db.needs.filter((n) => n.status === 'open' && cats.includes(n.category) && !isBlockedEyewear(db, n.title)).map((n) => ({ ref: { kind: 'need' as const, id: n.id }, title: `${n.title} · ${t('докупити')}`, photo: art(n.conceptPhotoId) })),
     ].filter(({ ref }) => (allPieces || inCapsule(ref)) && (!variant || !inLook(ref)));
   };
   const save = async (slots: Look['slots'], include?: NonNullable<typeof pending>, selected = include?.ref) => {

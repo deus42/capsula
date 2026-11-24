@@ -78,6 +78,9 @@ export const en: Record<string, string> = {
   "Запит без заголовка сайту відхилено": "Request without the site header was refused",
   "Лише для власника": "Owner only",
   "Внутрішня помилка": "Internal error",
+  "Некоректний запит": "Invalid request",
+  "Файл не знайдено": "File not found",
+  "Окуляри в образи не беру": "Eyewear is excluded from looks",
   "Запит завеликий": "Request too large",
   "Забагато запитів. Спробуй трохи пізніше": "Too many requests. Please try again a little later",
   // Shared labels

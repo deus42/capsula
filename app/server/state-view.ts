@@ -11,12 +11,13 @@ export function stateView(db: DB) {
     wears: (db.wears ?? []).map((w) => (w.resultId && hidden.has(w.resultId) ? { ...w, resultId: undefined, review: w.review && { ...w.review, resultId: undefined } } : w)),
     jobs: db.jobs.map((j) => {
       const visible = j.resultId && hidden.has(j.resultId) ? { ...j, resultId: undefined } : j;
+      const isTryOn = (j.kind ?? 'tryon') === 'tryon';
       const snapshot = {
         lookName: j.snapshot.lookName,
         slots: [],
-        basePhotoIds: [],
+        basePhotoIds: isTryOn ? j.snapshot.basePhotoIds : [],
         basePhotoPaths: [],
-        ...((j.kind ?? 'tryon') === 'tryon' && j.snapshot.identity ? { identity: j.snapshot.identity } : {}),
+        ...(isTryOn && j.snapshot.identity ? { identity: j.snapshot.identity } : {}),
       };
       return { ...visible, snapshot };
     }),

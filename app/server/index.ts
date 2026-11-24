@@ -11,7 +11,7 @@ import { createOpenAIEngine, openAIConfigFromEnv } from './openai-engine.ts';
 import { createUsage, quotaConfigFromEnv } from './quota.ts';
 import { stateView } from './state-view.ts';
 import { RATE_LIMITED, RATE_RULES, clientAddress, createRateLimiter, type Rule } from './rate-limit.ts';
-import { dispatch, upload } from './routes.ts';
+import { decodeParam, dispatch, upload } from './routes.ts';
 import { CONTENT_TYPES, MAX_UPLOAD_BYTES, prewarm, resolveAllowed, snapWidth, thumbnail } from './media.ts';
 
 const APP_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -121,7 +121,7 @@ function readBody(req: http.IncomingMessage, limit: number): Promise<Buffer> {
 function sendFile(res: http.ServerResponse, file: string, cache = 'no-cache', req?: http.IncomingMessage) {
   const ext = path.extname(file).toLowerCase();
   const type = CONTENT_TYPES[ext] ?? 'application/octet-stream';
-  const headers: http.OutgoingHttpHeaders = { 'content-type': type, 'cache-control': cache, 'x-content-type-options': 'nosniff' };
+  const headers = { 'content-type': type, 'cache-control': cache, 'x-content-type-options': 'nosniff' };
   if (COMPRESSIBLE.has(ext) && acceptsGzip(req)) {
     const mtime = fs.statSync(file).mtimeMs;
     let hit = gzCache.get(file);
@@ -133,8 +133,11 @@ function sendFile(res: http.ServerResponse, file: string, cache = 'no-cache', re
     res.end(hit.buf);
     return;
   }
-  res.writeHead(200, headers);
-  fs.createReadStream(file).pipe(res);
+  for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
+  fs.createReadStream(file).on('error', () => {
+    if (!res.headersSent) send(res, 404, { error: 'Файл не знайдено' });
+    else res.destroy();
+  }).pipe(res);
 }
 
 const secureCookies = Boolean(authConfig?.baseURL.startsWith('https://'));
@@ -143,6 +146,7 @@ const WWW_HOST = authConfig ? `www.${new URL(authConfig.baseURL).host}` : null;
 // Accounts mode only: sign-in and uploads are rate-limited.
 const rateLimiter = ACCOUNTS ? createRateLimiter() : null;
 const TRUST_CLOUDFLARE = process.env.TRUST_PROXY === 'cloudflare';
+const jobLogRequest = (method: string, pathname: string) => method === 'GET' && pathname.startsWith('/api/jobs/') && pathname.endsWith('/log');
 
 /** Counts the request against each key; answers 429 with Retry-After when one is used up. */
 function limited(res: http.ServerResponse, checks: [string, Rule][]): boolean {
@@ -176,7 +180,7 @@ async function accountTenant(req: http.IncomingMessage, res: http.ServerResponse
   if ((url.pathname.startsWith('/api/auth/') || url.pathname.startsWith('/i/') || url.pathname.startsWith('/t/')) && limited(res, [[`sign-in:${address}`, RATE_RULES.signIn]])) return null;
   // A test account's one-time link: better-auth opens the session (auth.ts, test-sign-in).
   if (method === 'GET' && url.pathname.startsWith('/t/')) {
-    req.url = `/api/auth/test-sign-in?code=${encodeURIComponent(decodeURIComponent(url.pathname.slice(3)))}`;
+    req.url = `/api/auth/test-sign-in?code=${encodeURIComponent(decodeParam(url.pathname.slice(3)))}`;
     await auth.handler(req, res);
     return null;
   }
@@ -196,7 +200,7 @@ async function accountTenant(req: http.IncomingMessage, res: http.ServerResponse
   }
   // An invite link sets a short-lived cookie that the Google sign-up checks, then opens the landing page.
   if (method === 'GET' && url.pathname.startsWith('/i/')) {
-    const code = decodeURIComponent(url.pathname.slice(3));
+    const code = decodeParam(url.pathname.slice(3));
     const ok = Boolean(auth.validInvite(code));
     res.writeHead(302, {
       location: ok ? '/?invite=1' : '/?invite=invalid',
@@ -218,6 +222,10 @@ async function accountTenant(req: http.IncomingMessage, res: http.ServerResponse
     send(res, 401, { error: 'Потрібно увійти' });
     return null;
   }
+  if (!user.owner && jobLogRequest(method, url.pathname)) {
+    send(res, 403, { error: 'Лише для власника' });
+    return null;
+  }
   if (url.pathname.startsWith('/api/') && method !== 'GET' && req.headers['x-capsula'] !== '1') {
     send(res, 403, { error: 'Запит без заголовка сайту відхилено' });
     return null;
@@ -228,7 +236,7 @@ async function accountTenant(req: http.IncomingMessage, res: http.ServerResponse
     else if (OWNER_ONLY && method === 'POST') send(res, 403, { error: 'Запрошення вимкнені: AI працює на підписці власника' });
     else if (method === 'GET') send(res, 200, auth.invites.list());
     else if (method === 'POST') send(res, 200, auth.invites.create());
-    else if (method === 'DELETE') send(res, 200, (auth.invites.disable(decodeURIComponent(url.pathname.split('/')[3] ?? '')), { ok: true }));
+    else if (method === 'DELETE') send(res, 200, (auth.invites.disable(decodeParam(url.pathname.split('/')[3] ?? '')), { ok: true }));
     else send(res, 405, { error: 'Метод не підтримується' });
     return null;
   }
@@ -250,7 +258,7 @@ async function accountTenant(req: http.IncomingMessage, res: http.ServerResponse
 /** `/api/admin/…`, the owner only: accounts with what they hold and this month's AI work; test accounts. */
 async function admin(req: http.IncomingMessage, res: http.ServerResponse, url: URL, method: string, owner: boolean) {
   if (!owner) return send(res, 403, { error: 'Лише для власника' });
-  const [, , , what, id, action] = url.pathname.split('/').map((p) => decodeURIComponent(p));
+  const [, , , what, id, action] = url.pathname.split('/').map(decodeParam);
   const tests = auth!.admin.tests;
   const link = (code: string) => `${authConfig!.baseURL}/t/${code}`;
   if (what === 'users' && !id && method === 'GET') {
@@ -304,16 +312,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
       const db = store.read();
       return send(res, 200, { db: stateView(db), runner: runner.state, recovered: store.recovered(), dataDir: path.relative(root, store.dataDir) }, req);
     }
-    if (method === 'GET' && url.pathname.startsWith('/api/jobs/') && url.pathname.endsWith('/log')) {
-      const id = decodeURIComponent(url.pathname.split('/')[3]);
+    if (jobLogRequest(method, url.pathname)) {
+      const id = decodeParam(url.pathname.split('/')[3]);
       const job = store.read().jobs.find((j) => j.id === id);
       if (!job?.logPath) return send(res, 404, { error: 'Журналу немає' });
-      const text = fs.existsSync(path.join(root, job.logPath)) ? fs.readFileSync(path.join(root, job.logPath), 'utf8') : '';
+      const file = resolveAllowed(root, store.dataDir, job.logPath, 'job-log');
+      const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
       return send(res, 200, { log: text.slice(-20000) });
     }
     if (method === 'POST' && url.pathname === '/api/upload') {
+      const name = decodeParam(String(req.headers['x-filename'] ?? 'upload'));
       const buf = await readBody(req, MAX_UPLOAD_BYTES + 1);
-      const name = decodeURIComponent(String(req.headers['x-filename'] ?? 'upload'));
       return send(res, 200, await upload(ctx, url.searchParams, buf, name));
     }
     const raw = method === 'GET' ? Buffer.alloc(0) : await readBody(req, 1024 * 1024);
@@ -331,14 +340,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   if (method !== 'GET' && method !== 'HEAD') return send(res, 405, { error: 'Метод не підтримується' });
 
   if (url.pathname.startsWith('/media/')) {
-    const rel = decodeURIComponent(url.pathname.slice('/media/'.length));
+    const rel = decodeParam(url.pathname.slice('/media/'.length));
     const file = resolveAllowed(root, store.dataDir, rel);
     if (!fs.existsSync(file)) return send(res, 404, { error: 'Файл не знайдено' });
     return sendFile(res, file, 'private, max-age=3600');
   }
 
   if (url.pathname.startsWith('/thumb/')) {
-    const rel = decodeURIComponent(url.pathname.slice('/thumb/'.length));
+    const rel = decodeParam(url.pathname.slice('/thumb/'.length));
     const file = resolveAllowed(root, store.dataDir, rel);
     if (!fs.existsSync(file)) return send(res, 404, { error: 'Файл не знайдено' });
     const size = snapWidth(Number(url.searchParams.get('w')) || 480);

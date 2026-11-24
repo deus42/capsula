@@ -9,15 +9,15 @@ import { HomePage, useIntake } from './pages/Home.tsx';
 import { CapsuleDetail, CapsulesPage } from './pages/Capsules.tsx';
 import { LookPage } from './pages/Look.tsx';
 import { WardrobePage } from './pages/Wardrobe.tsx';
-import { GalleryPage } from './pages/Gallery.tsx';
 import { ShoppingPage } from './pages/Shopping.tsx';
 import { ProfilePage } from './pages/Profile.tsx';
 import { Landing } from './pages/Landing.tsx';
-import { LegalPage } from './pages/Legal.tsx';
 import { Welcome } from './pages/Welcome.tsx';
 import { pickLanguage, setLanguage, t } from './i18n.ts';
 
 const SetupPage = lazy(() => import('./pages/Setup.tsx').then((m) => ({ default: m.SetupPage })));
+const GalleryPage = lazy(() => import('./pages/Gallery.tsx').then((m) => ({ default: m.GalleryPage })));
+const LegalPage = lazy(() => import('./pages/Legal.tsx').then((m) => ({ default: m.LegalPage })));
 
 function RailItem({ to, icon, label, active, dot, desk }: { to: string; icon: ReactNode; label: string; active: boolean; dot?: number; desk?: boolean }) {
   return (
@@ -53,7 +53,7 @@ export default function App() {
   // Language: the profile's choice; accounts fall back to the browser, the owner's local site stays Ukrainian.
   setLanguage(state?.db.profile.language ?? (session?.mode === 'accounts' ? pickLanguage() : 'uk'));
   // The legal pages open for everyone, signed in or not.
-  if (section === 'privacy' || section === 'terms') return <LegalPage kind={section} />;
+  if (section === 'privacy' || section === 'terms') return <Suspense fallback={null}><LegalPage kind={section} /></Suspense>;
   if (signedOut) return <Landing />;
   if (!state) {
     return (
@@ -92,7 +92,7 @@ export default function App() {
   else if (section === 'looks' && parts[1]) page = <LookPage id={parts[1]} />;
   else if (section === 'wardrobe') page = <WardrobePage openId={parts[1]} />;
   else if (section === 'studio') page = <Redirect to={query.get('look') ? `/looks/${query.get('look')}` : '/capsules'} />;
-  else if (section === 'gallery') page = <GalleryPage />;
+  else if (section === 'gallery') page = <Suspense fallback={null}><GalleryPage /></Suspense>;
   else if (section === 'queue') page = <Redirect to="/home" />;
   else if (section === 'shopping') page = <ShoppingPage focus={query.get('need') ?? undefined} />;
   else if (section === 'profile') page = <ProfilePage tab={parts[1]} />;

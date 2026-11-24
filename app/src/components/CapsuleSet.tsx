@@ -4,7 +4,7 @@ import type { Capsule, Category, SlotRef } from '../api.ts';
 import { api, thumb } from '../api.ts';
 import { useApp, useDb } from '../store.tsx';
 import { CATEGORY_LABEL, resolveRef } from '../lib.ts';
-import { CAPSULE_LIMITS, MAX_BASE_PIECES, capsuleLimits, capsuleSet, normalizePiece, pieceCategory, pieceGroup, pieceKey, visibleCapsuleLooks, type CapsulePiece, type PieceGroup } from '../capsule-pieces.ts';
+import { MAX_BASE_PIECES, capsuleLimits, capsuleSet, normalizePiece, pieceCategory, pieceGroup, pieceKey, visibleCapsuleLooks, type CapsulePiece, type PieceGroup } from '../capsule-pieces.ts';
 import { Badge, CategoryIcon, Modal } from './ui.tsx';
 import { LOOKS, t, plural as pluralize } from '../i18n.ts';
 
@@ -29,7 +29,8 @@ export function CapsuleSetSection({ capsule }: { capsule: Capsule }) {
   const set = useMemo(() => capsuleSet(db, capsule), [db, capsule]);
   const garments = set.pieces.filter((p) => p.group === 'garments').sort(byRole);
   const extras = set.pieces.filter((p) => p.group !== 'garments').sort(byRole);
-  const over = set.counts.garments > CAPSULE_LIMITS.garments;
+  const garmentLimit = capsuleLimits(capsule).garments;
+  const over = set.counts.garments > garmentLimit;
   const tile = (p: CapsulePiece) => {
     const r = resolveRef(db, p.ref);
     const art = r.art ?? r.photo;
@@ -47,7 +48,7 @@ export function CapsuleSetSection({ capsule }: { capsule: Capsule }) {
   return (
     <section className="capsule-set" aria-label={t('Речі капсули')}>
       <div className="section-head">
-        <h2 className="h2">{t('Речі')} <span className={`count${over ? ' over' : ''}`}>{over ? `${set.counts.garments}/${CAPSULE_LIMITS.garments}` : set.counts.garments}</span></h2>
+        <h2 className="h2">{t('Речі')} <span className={`count${over ? ' over' : ''}`}>{over ? `${set.counts.garments}/${garmentLimit}` : set.counts.garments}</span></h2>
         <div className="row">
           {set.combinations > 0 && <span className="set-combos">{combosText(set.combinations)}</span>}
           <button type="button" className="btn sm" onClick={() => setEditing(true)}>
@@ -168,7 +169,13 @@ export function CapsuleSetEditor({ capsule, draft, onChange, bare }: { capsule: 
     const pieces = replacement
       ? draft.pieces.map((ref) => pieceKey(ref) === key ? replacement : ref)
       : draft.pieces.filter((ref) => pieceKey(ref) !== key);
-    onChange({ ...draft, pieces, base: draft.base.filter((k) => k !== key), pending: replacement ? null : draft.pending });
+    const base = draft.base.filter((k) => k !== key);
+    const pending = draft.pending;
+    if (!replacement && pending && pendingGroup === groupOf(r) && pieces.filter((ref) => groupOf(ref) === pendingGroup).length < limits[pendingGroup]) {
+      onChange({ pieces: pieces.some((ref) => pieceKey(ref) === pendingKey) ? pieces : [...pieces, pending], base, pending: null });
+      return;
+    }
+    onChange({ pieces, base, pending: replacement ? null : pending });
   };
   const toggle = (ref: SlotRef) => {
     const key = pieceKey(ref);

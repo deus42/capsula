@@ -144,9 +144,10 @@ export function allowedRoots(projectRoot: string, dataDir: string) {
   return [path.join(projectRoot, 'assets', 'photos'), path.join(dataDir, 'media'), path.join(projectRoot, 'output', 'prototypes')].map((p) => path.resolve(p) + path.sep);
 }
 
-export function resolveAllowed(projectRoot: string, dataDir: string, relPath: string) {
+export function resolveAllowed(projectRoot: string, dataDir: string, relPath: string, scope: 'media' | 'job-log' = 'media') {
   const abs = path.resolve(projectRoot, relPath);
-  if (!allowedRoots(projectRoot, dataDir).some((root) => abs.startsWith(root))) throw new HttpError(403, 'Шлях поза дозволеними каталогами');
+  const roots = scope === 'job-log' ? [path.resolve(dataDir, 'jobs') + path.sep] : allowedRoots(projectRoot, dataDir);
+  if (!roots.some((root) => abs.startsWith(root))) throw new HttpError(403, 'Шлях поза дозволеними каталогами');
   return abs;
 }
 

@@ -15,7 +15,8 @@ import { SLOT_CATEGORIES, hasPieces, isBlockedEyewear, isEyewear, lookGroup, loo
 import { productKey, queueStoreFind } from './shop-search.ts';
 import { quotaKind, type QuotaKind } from './quota.ts';
 import { STYLE_CATALOGUE, styleBrief } from '../src/style-catalogue.ts';
-import { sameComposition, tooClose, withBuys } from '../src/look-memory.ts';
+import { onePieceApart, sameComposition, tooClose, withBuys } from '../src/look-memory.ts';
+import { sameVariant } from '../src/look-variation.ts';
 import { queueDiscover } from './discover.ts';
 import { sameIdentity } from './identity.ts';
 import { addLookPieceToSet, assertLookFits, detachLookVariant, linkNewLookVariant, placeLook, replaceInSets, requireParentCapsule, setCapsulePieces, stripFromSets } from './capsule-membership.ts';
@@ -714,7 +715,8 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
     if (sources.some((item) => item.mergedInto)) throw new HttpError(409, 'Ці речі вже обʼєднано');
     const keeper = sources.find((item) => item.id === b.keepId);
     if (b.keepId !== undefined && !keeper) throw new HttpError(400, 'Вибери картку з цих речей');
-    if (keeper) busyJob(db, (job) => job.kind === 'packshot' && Boolean(job.itemId && ids.includes(job.itemId)));
+    const sourcePackshot = (job: Job) => job.kind === 'packshot' && Boolean(job.itemId && ids.includes(job.itemId));
+    busyJob(db, sourcePackshot);
     const donor = keeper ?? sources.find((item) => item.id === b.targetId) ?? sources.find((item) => item.status === 'confirmed') ?? sources[0];
     const donors = [donor, ...sources.filter((item) => item !== donor)];
     const photoIds = mergedPhotoIds(db, sources);
@@ -760,7 +762,7 @@ on('POST', '/api/items/merge', async (ctx, _p, b) => {
     else db.items.push(merged);
     for (const source of retired) markMerged(source, merged);
     repointMergedItems(db, retired.map((item) => item.id), merged);
-    if (keeper) dropJobs(db, (job) => job.kind === 'packshot' && job.state === 'queued' && Boolean(job.itemId && ids.includes(job.itemId)));
+    dropJobs(db, (job) => job.state === 'queued' && sourcePackshot(job));
     queueMissingItemPackshots(db, [merged.id]);
     queueAdvice(db, `Обʼєднано речі: ${merged.title}`);
     return merged;
@@ -970,6 +972,7 @@ on('POST', '/api/looks', async (ctx, _p, b) => {
         || Object.values(source.slots).flat().some((ref) => key(ref) === key(to))) {
         throw new HttpError(400, 'Вибери одну річ для заміни');
       }
+      if (isBlockedEyewear(db, replacement.title)) throw new HttpError(400, 'Окуляри в образи не беру');
       variantOf = lookGroup(db, source)?.primary.id ?? source.id;
       slots = { ...source.slots, [slot]: source.slots[slot].map((ref, index) => index === oldIndex ? to : ref) };
       name = replacement.title.slice(0, 120);
@@ -1021,6 +1024,12 @@ on('PATCH', '/api/looks/:id', async (ctx, [id], b) => {
     if (typeof b.favorite === 'boolean') rate(look, b.favorite ? 'like' : null);
     if (!look.name) throw new HttpError(400, 'Назва не може бути порожньою');
     if (changed) {
+      const parentId = look.variantOf;
+      if (parentId && !db.looks.some((other) => other.id !== id && other.capsuleId === look.capsuleId
+        && (other.id === parentId || other.variantOf === parentId)
+        && (onePieceApart(db, other.slots, look.slots) || sameVariant(db, other, look)))) {
+        delete look.variantOf;
+      }
       const draft = awaitingFirstAssembly(db, look);
       const ready = !draft || assembledDraft(db, look);
       if (draft && ready) {
@@ -1504,7 +1513,10 @@ on('PATCH', '/api/profile', (ctx, _p, b) =>
     }
     if (b.consent === true && !prof.consentAt) prof.consentAt = now();
     if (b.hemisphere === 'north' || b.hemisphere === 'south') prof.hemisphere = b.hemisphere;
-    if (typeof b.allowEyewear === 'boolean') prof.allowEyewear = b.allowEyewear;
+    if (typeof b.allowEyewear === 'boolean') {
+      prof.allowEyewear = b.allowEyewear;
+      if (prof.identity) prof.identity.noGlasses = !b.allowEyewear;
+    }
     return prof;
   }),
 );
@@ -1808,11 +1820,20 @@ on('DELETE', '/api/jobs/:id', (ctx, [id]) =>
   }),
 );
 
+export function decodeParam(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch (error) {
+    if (error instanceof URIError) throw new HttpError(400, 'Некоректний запит');
+    throw error;
+  }
+}
+
 export async function dispatch(ctx: Ctx, method: string, pathname: string, body: Body) {
   for (const [m, re, h] of routes) {
     if (m !== method) continue;
     const match = pathname.match(re);
-    if (match) return h(ctx, match.slice(1).map(decodeURIComponent), body);
+    if (match) return h(ctx, match.slice(1).map(decodeParam), body);
   }
   throw new HttpError(404, 'Маршрут не знайдено');
 }

@@ -8,7 +8,7 @@ import type { DB, Job } from './schema.ts';
 import { SCHEMA_VERSION, emptySlots, validateDb } from './schema.ts';
 import { createStore, HttpError } from './store.ts';
 import { stateView } from './state-view.ts';
-import { createJob, dispatch, queueMissingRenders, snapshotSlots, upload } from './routes.ts';
+import { createJob, dispatch, packshotJob, queueMissingRenders, snapshotSlots, upload } from './routes.ts';
 import { sameIdentity, verifyReferenceFiles } from './identity.ts';
 import { MAX_IMAGE_REFS, buildPackshotPrompt, buildPrompt, createRunner, pickRefs } from './runner.ts';
 import { ANALYZE_SCHEMA, INTAKE_SCHEMA, VISUAL_DEDUP_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakeComparisonCandidates, intakePrompt, type IntakeReply } from './analysis.ts';
@@ -117,6 +117,11 @@ function setup(autoTryOn?: boolean) {
   return { dir, store, call, drained: () => drained };
 }
 
+test('malformed route parameters return a bad request', async () => {
+  const { call } = setup();
+  await assert.rejects(call('PATCH', '/api/items/%ZZ'), { status: 400, message: 'Некоректний запит' });
+});
+
 test('outfit groups count core changes, ignore accessories and avoid similarity chains', () => {
   const a = fixture().looks[0];
   const withRef = (l: typeof a, slot: 'top' | 'shoes' | 'accessories', id: string) => ({ ...l, id: l.id + id, slots: { ...l.slots, [slot]: [{ kind: 'need' as const, id }] } });
@@ -195,11 +200,12 @@ test('one-piece variants are unique, auto-linked and can represent their family'
   await store.mutate((db) => {
     const item = (id: string, category: DB['items'][number]['category']) =>
       ({ ...db.items[0], id, title: id, category });
-    db.items.push(item('W-T1', 'tees'), item('W-T2', 'tees'), item('W-S', 'shoes'), item('W-S2', 'shoes'));
+    db.items.push(item('W-T1', 'tees'), item('W-T2', 'tees'), item('W-S', 'shoes'), item('W-S2', 'shoes'),
+      item('W-T3', 'shirts'), item('W-B3', 'shorts'), item('W-S3', 'shoes'));
     Object.assign(db.looks[0], { slots: baseSlots, versions: [{ version: 1, slots: baseSlots, at }], favorite: true });
     db.profile.basePhotoIds = ['P-1'];
     db.items[1].photoIds = ['P-2'];
-    db.capsules[0].pieces = [ref('W-T1'), ref('W-T2'), ref('W-1'), ref('W-S'), ref('W-S2')];
+    db.capsules[0].pieces = ['W-T1', 'W-T2', 'W-1', 'W-S', 'W-S2', 'W-T3', 'W-B3', 'W-S3'].map(ref);
   });
   const base = store.read().looks[0];
   const capsule = store.read().capsules[0];
@@ -234,6 +240,14 @@ test('one-piece variants are unique, auto-linked and can represent their family'
   assert.deepEqual(after.looks.filter((look) => look.variantOf === primary.id).map((look) => look.id), [base.id, direct.id, draft.id]);
   assert.deepEqual(distinctLooks(after, after.looks).map((look) => look.id), [primary.id, outside.id]);
   assert.deepEqual(new Set(lookVariants(after, primary).map((look) => look.id)), new Set([base.id, direct.id, draft.id]));
+
+  const similarToSibling = await call('PATCH', `/api/looks/${direct.id}`, { slots: { ...direct.slots, shoes: [ref('W-S2')] } });
+  assert.equal(similarToSibling.variantOf, primary.id, 'a match with a sibling keeps the family link');
+  const unrelatedSlots = { ...emptySlots(), top: [ref('W-T3')], bottom: [ref('W-B3')], shoes: [ref('W-S3')] };
+  const unrelated = await call('PATCH', `/api/looks/${direct.id}`, { slots: unrelatedSlots });
+  assert.equal(unrelated.variantOf, undefined);
+  const edited = store.read();
+  assert.ok(distinctLooks(edited, edited.looks).some((look) => look.id === direct.id));
 });
 
 test('sports tagging preserves item categories and a multisport capsule can store four accessories', async () => {
@@ -343,9 +357,22 @@ test('merged items keep an existing catalogue cover and allow safe changes to so
 
 test('a merge without catalogue art queues a packshot from the selected primary source', async () => {
   const { store, call } = setup();
-  const result = await call('POST', '/api/items/merge', { ids: ['W-1', 'W-2'], primaryPhotoId: 'P-2' });
+  const { runningId, untouchedId } = await store.mutate((db) => {
+    const running = packshotJob(db, { itemId: 'W-1' });
+    running.state = 'running';
+    packshotJob(db, { itemId: 'W-2' });
+    return { runningId: running.id, untouchedId: packshotJob(db, { needId: 'N-1' }).id };
+  });
+  const merge = () => call('POST', '/api/items/merge', { ids: ['W-1', 'W-2'], primaryPhotoId: 'P-2' });
+  const before = store.read();
+  await assert.rejects(merge(), { status: 409 });
+  assert.deepEqual(store.read(), before);
+  await store.mutate((db) => { db.jobs.find((job) => job.id === runningId)!.state = 'queued'; });
+  const result = await merge();
   const db = store.read();
   assert.deepEqual(itemArt(db, result.id), { art: undefined, photo: undefined });
+  assert.equal(db.jobs.some((job) => job.kind === 'packshot' && (job.itemId === 'W-1' || job.itemId === 'W-2')), false);
+  assert.equal(db.jobs.find((job) => job.id === untouchedId)?.state, 'queued');
   const job = db.jobs.find((job) => job.kind === 'packshot' && job.itemId === result.id)!;
   assert.equal(job.state, 'queued');
   assert.equal(job.snapshot.slots[0].photoPaths[0], 'assets/photos/b.jpeg');
@@ -2285,12 +2312,25 @@ test('look detail reviews a newer try-on while the capsule keeps the approved pi
     db.results.push({ id, jobId: job.id, lookId: look.id, lookVersion: look.version, imagePath: `${id}.png`, tool: '', model: '', prompt: '', sources: [], usedItemPhotos: true, review, favorite: false, createdAt });
     return db.results.at(-1)!;
   };
-  const approved = make('R-approved', 'accepted', '2026-11-24T12:00:00Z');
   const pending = make('R-refresh', 'pending', '2026-11-24T12:02:00Z');
+  const view = stateView(db);
+  assert.deepEqual(view.jobs[0].snapshot.basePhotoIds, ['P-1']);
+  assert.deepEqual(view.jobs[0].snapshot.basePhotoPaths, []);
+  assert.deepEqual(view.jobs[0].snapshot.slots, []);
+  assert.equal(coverForLook(view, look)?.id, pending.id);
+  assert.equal(currentCover(view, look, true)?.id, pending.id);
+  db.profile.basePhotoIds = ['P-2'];
+  assert.equal(coverForLook(stateView(db), look), undefined);
+  assert.equal(currentCover(stateView(db), look, true), undefined);
+  db.profile.basePhotoIds = ['P-1'];
+  const approved = make('R-approved', 'accepted', '2026-11-24T12:00:00Z');
   assert.equal(currentCover(db, look)?.id, approved.id);
   assert.equal(currentCover(db, look, true)?.id, pending.id);
+  assert.equal(coverForLook(stateView(db), look)?.id, approved.id);
+  assert.equal(currentCover(stateView(db), look, true)?.id, pending.id);
   db.profile.basePhotoIds = ['P-2'];
   assert.equal(currentCover(db, look, true)?.id, approved.id);
+  assert.equal(currentCover(stateView(db), look, true)?.id, approved.id);
   db.profile.basePhotoIds = ['P-1'];
   pending.review = 'rework';
   assert.equal(currentCover(db, look, true)?.id, approved.id);
@@ -3197,19 +3237,42 @@ test('garment cards create missing sheet folder, crops cap resolution, and try-o
 });
 
 test('eyewear preference: blocked by default, allowed when enabled in profile', async () => {
-  const { store, call } = setup();
+  const { store, call } = setup(false);
+  const ref = (id: string) => ({ kind: 'item' as const, id });
   await store.mutate((db) => {
+    const file = (path: string) => ({ path, sha256: 'b'.repeat(64) });
+    db.profile.identity = { sourcePhotoId: 'P-1', original: file(db.photos[0].path), face: file('media/face.png'), body: file('media/body.png'), preserveHeadAngle: false, noGlasses: true, confirmedAt: at };
     db.items.push({ id: 'W-G', rev: 1, category: 'accessories', title: 'Tortoise sunglasses', status: 'confirmed', photoIds: [], origin: 'manual', rating: { score: 8, note: 'Sharp.', rev: 1, at, scale: 2 }, history: [], createdAt: at, updatedAt: at });
+    db.items.push({ ...db.items.at(-1)!, id: 'W-Belt', title: 'Belt' });
+    const look = db.looks[0];
+    look.slots.accessories = [ref('W-Belt')];
+    look.versions[0].slots = look.slots;
   });
+  const look = store.read().looks[0];
+  const variant = { variant: { lookId: look.id, rev: look.rev, slot: 'accessories', from: ref('W-Belt'), to: ref('W-G') } };
+  const blocked = { status: 400, message: 'Окуляри в образи не беру' };
   assert.equal(itemRating(store.read().items.find((i) => i.id === 'W-G')!, store.read()), null);
   await assert.rejects(call('POST', '/api/analyze', { itemIds: ['W-G'] }), /Окуляри/);
+  await assert.rejects(call('POST', '/api/looks', variant), blocked);
   await call('PATCH', '/api/profile', { rev: store.read().profile.rev, allowEyewear: true });
   const db = store.read();
   assert.equal(db.profile.allowEyewear, true);
+  assert.equal(db.profile.identity?.noGlasses, false);
   assert.equal(itemRating(db.items.find((i) => i.id === 'W-G')!, db), 8);
   assert.ok(itemVerdict(db, db.items.find((i) => i.id === 'W-G')!));
   const job = await call('POST', '/api/analyze', { itemIds: ['W-G'] });
   assert.equal(job.kind, 'analyze');
+  const withEyewear = await call('POST', '/api/looks', variant);
+  const tryOn = await call('POST', '/api/jobs', { lookId: withEyewear.id }) as Job;
+  assert.ok(tryOn.snapshot.slots.some((slot) => slot.id === 'W-G'));
+  assert.match(buildPrompt(tryOn, 'result.png'), /No glasses unless explicitly listed/);
+  await call('DELETE', `/api/jobs/${tryOn.id}`);
+  await call('PATCH', '/api/profile', { rev: db.profile.rev, allowEyewear: false });
+  assert.equal(store.read().profile.identity?.noGlasses, true);
+  await assert.rejects(call('POST', '/api/looks', variant), blocked);
+  const withoutEyewear = await call('POST', '/api/jobs', { lookId: withEyewear.id }) as Job;
+  assert.equal(withoutEyewear.snapshot.slots.some((slot) => slot.id === 'W-G'), false);
+  assert.match(buildPrompt(withoutEyewear, 'result.png'), /ABSOLUTELY NO GLASSES/);
 });
 
 test('readCapped stops reading chunked responses once they exceed the byte limit', async () => {
