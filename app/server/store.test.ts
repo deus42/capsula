@@ -108,11 +108,11 @@ test('chat stylist sees current catalogue roles and owner decisions without pers
   assert.equal(JSON.stringify(db), before);
 });
 
-function setup() {
+function setup(autoTryOn?: boolean) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capsula-test-'));
   const store = createStore(dir, fixture);
   let drained = 0;
-  const ctx = { store, projectRoot: dir, drain: () => void drained++ };
+  const ctx = { store, projectRoot: dir, drain: () => void drained++, autoTryOn };
   const call = (method: string, p: string, body: Record<string, unknown> = {}) => dispatch(ctx, method, p, body) as Promise<any>;
   return { dir, store, call, drained: () => drained };
 }
@@ -1630,25 +1630,31 @@ test('a try-on waiting on a pause blocks duplicates only while the pause holds',
   assert.deepEqual(looksNeedingRender(db).map((l) => l.id), [], 'a render of the current composition is enough');
 });
 
-test('changing a look\'s pieces does not re-render by itself; «Оновити» makes one try-on of the newest pieces', async () => {
+test('piece edits automatically request a try-on of the latest composition', async () => {
   const { store, call, drained } = setup();
   await store.mutate((db) => {
     db.profile.basePhotoIds = ['P-1'];
-    db.items.push({ id: 'W-T', rev: 1, category: 'tees', title: 'Tee', status: 'confirmed', photoIds: [], origin: 'manual', history: [], createdAt: at, updatedAt: at });
+    db.items.push({ ...db.items[0], id: 'W-T', category: 'tees', title: 'Tee' }, { ...db.items[0], id: 'W-T2', category: 'tees', title: 'Second tee' });
   });
   let look = store.read().looks[0];
   await call('PATCH', '/api/looks/L-1', { rev: look.rev, slots: { ...look.slots, top: [{ kind: 'item', id: 'W-T' }] } });
   let db = store.read();
-  assert.equal(db.jobs.filter((j) => j.lookId === 'L-1').length, 0, 'the owner decides when to update the picture');
+  const first = db.jobs.find((job) => job.lookId === 'L-1')!;
+  assert.equal(first.lookVersion, 2);
+  assert.equal(first.state, 'queued');
+  assert.equal(first.snapshot.slots.find((slot) => slot.slot === 'top')?.id, 'W-T');
   look = db.looks[0];
-  await call('PATCH', '/api/looks/L-1', { rev: look.rev, slots: { ...look.slots, top: [{ kind: 'need', id: 'N-1' }] } });
+  await call('PATCH', '/api/looks/L-1', { rev: look.rev, slots: { ...look.slots, top: [{ kind: 'item', id: 'W-T2' }] } });
+  const second = store.read().jobs.find((job) => job.lookId === 'L-1')!;
   const job = await call('POST', '/api/jobs', { lookId: 'L-1', run: true });
   db = store.read();
-  assert.equal(job.lookVersion, 3, '«Оновити» renders the newest pieces');
-  assert.ok(drained() > 0);
+  assert.equal(second.lookVersion, 3);
+  assert.equal(second.snapshot.slots.find((slot) => slot.slot === 'top')?.id, 'W-T2');
+  assert.equal(job.id, second.id, 'a manual request reuses the current queued job');
+  assert.ok(!db.jobs.some((job) => job.id === first.id), 'the superseded queued job is dropped');
+  assert.ok(drained() >= 2, 'both composition edits wake the runner');
   await call('PATCH', '/api/looks/L-1', { rev: db.looks[0].rev, name: 'Renamed' });
   assert.equal(store.read().jobs.filter((j) => j.lookId === 'L-1').length, 1, 'renaming does not re-render');
-  // «Речі змінено → Ні» is kept on the look for its current version only; a later change asks again.
   look = store.read().looks[0];
   await call('PATCH', '/api/looks/L-1', { rev: look.rev, keptVersion: look.version });
   look = store.read().looks[0];
@@ -1656,7 +1662,18 @@ test('changing a look\'s pieces does not re-render by itself; «Оновити»
   assert.equal(look.version, 3, 'keeping the picture is not a new version');
   await call('PATCH', '/api/looks/L-1', { rev: look.rev, slots: { ...look.slots, top: [{ kind: 'item', id: 'W-T' }] } });
   look = store.read().looks[0];
-  assert.notEqual(look.keptVersion, look.version, 'new pieces bring the question back');
+  assert.notEqual(look.keptVersion, look.version, 'keeping an old image is scoped to its composition');
+  await call('PATCH', '/api/looks/L-1', { rev: look.rev, slots: emptySlots() });
+  assert.equal(store.read().jobs.filter((j) => j.lookId === 'L-1').length, 0, 'an empty look has nothing to render');
+});
+
+test('a composition save respects an account that starts try-ons explicitly', async () => {
+  const { store, call } = setup(false);
+  await store.mutate((db) => { db.profile.basePhotoIds = ['P-1']; });
+  const look = store.read().looks[0];
+  await call('PATCH', '/api/looks/L-1', { rev: look.rev, slots: { ...look.slots, top: [] } });
+  assert.equal(store.read().jobs.filter((job) => job.lookId === look.id).length, 0);
+  assert.equal((await call('POST', '/api/jobs', { lookId: look.id, run: true })).lookVersion, 2);
 });
 test('complete looks, the quiet missing line and the next-purchase rating follow the wardrobe', async () => {
   const { store, call } = setup();
@@ -1991,6 +2008,8 @@ test('round 6: a found replacement is not proposed again; stale replacements go;
   });
   await call('POST', '/api/looks/L-1/advice', { accept: true });
   assert.equal(store.read().jobs.filter((j) => j.kind === 'advise').length, 1);
+  const afterSwap = store.read();
+  assert.ok(afterSwap.jobs.some((job) => job.lookId === 'L-1' && job.lookVersion === afterSwap.looks[0].version && job.snapshot.slots.some((slot) => slot.id === 'W-2')));
   // «Ні» on «варто замінити» survives a merge; glasses never go into «Ще образ».
   const merged = await call('POST', '/api/items/merge', { ids: ['W-A', 'W-NEW'] });
   assert.equal(store.read().items.find((i) => i.id === merged.id)!.rating!.kept, true);
@@ -2285,6 +2304,7 @@ test('a look can explicitly add its chosen piece to the set in the same revision
   const added = store.read();
   assert.deepEqual(added.looks[0].slots.bottom, slots.bottom);
   assert.deepEqual(added.capsules[0].pieces?.at(-1), ref('W-2'));
+  assert.ok(added.jobs.some((job) => job.lookId === look.id && job.lookVersion === added.looks[0].version && job.snapshot.slots.some((slot) => slot.id === 'W-2')));
   await store.mutate((db) => {
     const fillers = Array.from({ length: CAPSULE_LIMITS.garments - 3 }, (_, index) => ({ ...db.items[0], id: `W-filler-${index}` }));
     db.items.push(...fillers, { ...db.items[0], id: 'W-outside' });

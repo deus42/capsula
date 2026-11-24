@@ -205,13 +205,15 @@ function replaceRefs(db: DB, match: (r: SlotRef) => boolean, replacement: SlotRe
  */
 function renderLooks(db: DB, lookIds?: string[], includeWaiting = false) {
   if (!includeWaiting && !db.profile.basePhotoIds.length) return [] as Job[];
+  const versions = new Map(db.looks.filter((look) => !lookIds || lookIds.includes(look.id)).map((look) => [look.id, look.version]));
+  // Older attempts that never started are obsolete, even when the look was emptied.
+  dropJobs(db, (job) => {
+    const current = job.lookId && versions.get(job.lookId);
+    return Boolean(current && (job.kind ?? 'tryon') === 'tryon' && job.state === 'queued' && job.lookVersion !== current);
+  });
   return looksNeedingRender(db)
-    .filter((l) => !lookIds || lookIds.includes(l.id))
-    .map((l) => {
-      // Only the newest composition is worth making: older attempts that never started are dropped.
-      dropJobs(db, (j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === l.id && j.state === 'queued' && j.lookVersion !== l.version);
-      return createJob(db, l, db.profile.basePhotoIds, '');
-    });
+    .filter((look) => versions.has(look.id))
+    .map((look) => createJob(db, look, db.profile.basePhotoIds, ''));
 }
 
 /** New looks retain a waiting job when their personal or garment references are still missing. */
@@ -231,6 +233,11 @@ function assembledDraft(db: DB, look: Pick<Look, 'slots'>) {
   const { top, layer, bottom, shoes } = look.slots;
   const dress = top.some((ref) => resolveRef(db, ref).category === 'dresses');
   return shoes.length > 0 && (dress || ((top.length > 0 || layer.length > 0) && bottom.length > 0));
+}
+
+function awaitingFirstAssembly(db: DB, look: Look) {
+  const first = look.versions[0];
+  return first && !hasPieces(first) && !look.versions.slice(1, -1).some((version) => assembledDraft(db, version));
 }
 
 /** A changed composition gets a fresh try-on; returns waiting jobs too. */
@@ -911,6 +918,7 @@ on('POST', '/api/looks/:id/advice', async (ctx, [id], b) => {
       // The new composition gets a fresh score (it stays in «Найкращі» once rated again).
       if (setLookSlots(look, next, 'Порада порадника')) {
         assertLookFits(db, look);
+        if (ctx.autoTryOn !== false && (!awaitingFirstAssembly(db, look) || assembledDraft(db, look))) queueNewLookRenders(db, [id]);
         queueAdvice(db, `Порада прийнята: ${look.name}`);
       }
     } else {
@@ -946,7 +954,6 @@ on('PATCH', '/api/looks/:id', async (ctx, [id], b) => {
     const look = findOr404(db.looks, id, 'Образ');
     bump(look, b.rev);
     pick(look, b, ['name', 'note']);
-    // The first complete composition finishes an empty draft. Later edits still offer «Оновити».
     const changed = b.slots ? setLookSlots(look, cleanSlots(b.slots), str(b.versionNote)) : false;
     if ('capsuleId' in b) placeLook(db, look, requireParentCapsule(db, str(b.capsuleId)));
     else if (changed) {
@@ -957,13 +964,13 @@ on('PATCH', '/api/looks/:id', async (ctx, [id], b) => {
     if (typeof b.favorite === 'boolean') rate(look, b.favorite ? 'like' : null);
     if (!look.name) throw new HttpError(400, 'Назва не може бути порожньою');
     if (changed) {
-      const firstDraft = look.versions[0] && !hasPieces(look.versions[0]);
-      const firstAssembly = firstDraft && assembledDraft(db, look) && !look.versions.slice(0, -1).some((v) => assembledDraft(db, v));
-      if (firstAssembly) {
+      const draft = awaitingFirstAssembly(db, look);
+      const ready = !draft || assembledDraft(db, look);
+      if (draft && ready) {
         const duplicate = db.looks.some((other) => other.id !== id && other.capsuleId === look.capsuleId && sameComposition(db, other.slots, look.slots));
         if (duplicate) throw new HttpError(409, 'Такий образ уже є в цій капсулі');
-        if (ctx.autoTryOn !== false) queueNewLookRenders(db, [id]);
       }
+      if (ready && ctx.autoTryOn !== false) queueNewLookRenders(db, [id]);
       queueAdvice(db, `Змінено образ: ${look.name}`);
     }
     return { look, run: changed };
