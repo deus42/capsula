@@ -7,6 +7,7 @@ import { Badge, CategoryIcon, Empty, LookArt, Missing, Modal, RateButtons } from
 import type { ResolvedRef } from '../lib.ts';
 import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, itemArt, lookRating, lookVariants, resolveRef, scoreLabel } from '../lib.ts';
 import { hiddenLookIds } from '../rating.ts';
+import { freePlaces, inSavedSet, normalizePiece, pieceCategory, pieceGroup, pieceKey, visibleCapsuleLooks } from '../capsule-pieces.ts';
 import { rendersPaused } from '../render-need.ts';
 import { EditLook } from './Capsules.tsx';
 import { AddWear, WearPair, WearReview } from '../components/Wear.tsx';
@@ -34,6 +35,7 @@ const COLOURS = ['коричнев', 'чорн', 'бежев', 'сір', 'син
 
 function accessoryOptions(db: DB, look: Look) {
   const noGlasses = eyewearBlocked(db);
+  const capsule = db.capsules.find((c) => c.id === look.capsuleId);
   const inLook = new Set(look.slots.accessories.map((r) => `${r.kind}:${r.id}`));
   return look.slots.accessories
     .map((current) => {
@@ -49,7 +51,8 @@ function accessoryOptions(db: DB, look: Look) {
       const mineColours = colours(title);
       const sameColour = (t: string) => kind !== 'belt' || !mineColours.length || colours(t).some((c) => mineColours.includes(c));
       const options = db.items
-        .filter((i) => i.category === 'accessories' && i.status !== 'inactive' && !i.mergedInto && !inLook.has(`item:${i.id}`) && accessoryKind(i.title) === kind && sameColour(i.title))
+        .filter((i) => i.category === 'accessories' && i.status !== 'inactive' && !i.mergedInto && !inLook.has(`item:${i.id}`) && accessoryKind(i.title) === kind && sameColour(i.title)
+          && (!capsule?.pieces || inSavedSet(db, capsule, { kind: 'item', id: i.id })))
         .sort((a, b) => close(b.title) - close(a.title) || Number(b.status === 'confirmed') - Number(a.status === 'confirmed'))
         .slice(0, 3);
       return options.length ? { current, title, options } : null;
@@ -104,7 +107,8 @@ export function LookPage({ id }: { id: string }) {
   // The advisor's one better owned piece for this version of the look.
   const sw = look.advice?.version === look.version ? look.advice.swap : undefined;
   const active = (id?: string) => db.items.find((i) => i.id === id && i.status !== 'inactive' && !i.mergedInto);
-  const swapAdvice = sw && active(sw.from) && active(sw.to) ? { from: active(sw.from)!, to: active(sw.to)! } : null;
+  const swapAdvice = sw && active(sw.from) && active(sw.to) && (!capsule?.pieces || inSavedSet(db, capsule, { kind: 'item', id: sw.to }))
+    ? { from: active(sw.from)!, to: active(sw.to)! } : null;
 
   const update = async () => {
     // The server uses the pinned identity reference when there is one.
@@ -260,10 +264,16 @@ export function LookPage({ id }: { id: string }) {
   );
 }
 
-/** Swap a piece for another of the same kind, remove it, or add a piece. The look re-renders by itself. */
+/** Swap, remove or add a piece, with an explicit set change for a piece outside the capsule. */
 function SwapModal({ look, slot, current, onClose }: { look: Look; slot?: SlotKey; current?: SlotRef; onClose: () => void }) {
   const db = useDb();
   const { act } = useApp();
+  const capsule = db.capsules.find((c) => c.id === look.capsuleId && c.pieces);
+  const [allPieces, setAllPieces] = useState(false);
+  const [pending, setPending] = useState<{ ref: SlotRef; slots: Look['slots']; lookRev: number; capsuleRev: number } | null>(null);
+  const [replacement, setReplacement] = useState<string>();
+  const [saving, setSaving] = useState(false);
+  const inCapsule = (ref: SlotRef) => !capsule || inSavedSet(db, capsule, ref);
   const art = (id?: string) => (id ? db.photos.find((p) => p.id === id)?.path : undefined);
   // Adding: each piece once, under its natural place (a jumper under «Верх», a jacket under «Шар»).
   const NATURAL: Record<string, SlotKey> = { outerwear: 'layer', knitwear: 'top', shirts: 'top', tees: 'top', dresses: 'top', trousers: 'bottom', shorts: 'bottom', skirts: 'bottom', shoes: 'shoes', accessories: 'accessories' };
@@ -276,43 +286,91 @@ function SwapModal({ look, slot, current, onClose }: { look: Look; slot?: SlotKe
         return { ref: { kind: 'item' as const, id: i.id }, title: i.title, photo: art ?? photo };
       }),
       ...db.needs.filter((n) => n.status === 'open' && cats.includes(n.category)).map((n) => ({ ref: { kind: 'need' as const, id: n.id }, title: `${n.title} · ${t('докупити')}`, photo: art(n.conceptPhotoId) })),
-    ];
+    ].filter(({ ref }) => allPieces || inCapsule(ref));
   };
-  const save = async (s: SlotKey, next: SlotRef[]) => {
-    const ok = await act(() => api('PATCH', `/api/looks/${look.id}`, { rev: look.rev, slots: { ...look.slots, [s]: next } }));
+  const save = async (slots: Look['slots'], include?: NonNullable<typeof pending>) => {
+    if (saving) return;
+    setSaving(true);
+    const ok = await act(() => api('PATCH', `/api/looks/${look.id}`, {
+      rev: include?.lookRev ?? look.rev,
+      slots,
+      ...(include ? { capsuleRev: include.capsuleRev, replaceCapsulePiece: replacement } : {}),
+    }));
+    setSaving(false);
     if (ok) onClose();
   };
   const choose = (s: SlotKey, ref: SlotRef) => {
     const list = look.slots[s];
-    if (current) return save(s, list.map((r) => (same(r, current) ? ref : r)).filter((r, i, a) => a.findIndex((x) => same(x, r)) === i));
-    if (list.some((r) => same(r, ref))) return onClose();
-    return save(s, [...list, ref]);
+    if (!current && list.some((r) => same(r, ref))) return onClose();
+    const next = current ? list.map((r) => same(r, current) ? ref : r).filter((r, i, a) => a.findIndex((x) => same(x, r)) === i) : [...list, ref];
+    const slots = { ...look.slots, [s]: next };
+    if (!capsule || inCapsule(ref)) return save(slots);
+    setReplacement(undefined);
+    setPending({ ref, slots, lookRev: look.rev, capsuleRev: capsule.rev });
   };
+  const category = pending && pieceCategory(db, pending.ref);
+  const group = category && pieceGroup(category);
+  const atLimit = Boolean(capsule && group && (freePlaces(db, capsule)?.[group] ?? 0) <= 0);
+  const replaceable = pending && atLimit && capsule ? (capsule.pieces ?? []).filter((ref) => {
+    const category = pieceCategory(db, ref);
+    if (!category || pieceGroup(category) !== group) return false;
+    const used = (slots: Look['slots']) => Object.values(slots).some((refs) => refs.some((r) => same(normalizePiece(db, r), normalizePiece(db, ref))));
+    return !used(pending.slots) && !visibleCapsuleLooks(db, capsule).some((other) => other.id !== look.id && used(other.slots));
+  }) : [];
   const slots = slot ? [slot] : SLOTS;
   return (
     <Modal
       title={current ? <a href={current.kind === 'item' ? `/wardrobe/${current.id}` : `/shopping?need=${current.kind === 'need' ? current.id : (db.products.find((p) => p.id === current.id)?.needId ?? '')}`} onClick={onClose}>{resolveRef(db, current).title}</a> : t('Додати річ')}
-      onClose={onClose}
+      onClose={() => { if (!saving) onClose(); }}
       wide
+      footer={pending && <>
+        <button type="button" className="btn" disabled={saving} onClick={() => setPending(null)}>{t('Назад')}</button>
+        <button type="button" className="btn primary" disabled={saving || !capsule || (atLimit && !replacement)} onClick={() => void save(pending.slots, pending)}>{t('Додати в капсулу й образ')}</button>
+      </>}
     >
-      {current && slot && (
-        <button className="btn sm ghost danger" style={{ marginBottom: 14 }} onClick={() => void save(slot, look.slots[slot].filter((r) => !same(r, current)))}>
-          <Trash2 size={13} /> {t('Прибрати з образу')}
-        </button>
-      )}
-      {slots.map((s) => (
-        <div key={s} style={{ marginBottom: 18 }}>
-          {!slot && <div className="section-head" style={{ marginTop: 0 }}><h2 className="h2">{SLOT_LABEL[s]}</h2></div>}
-          <div className="own-picks">
-            {optionsFor(s).map((o) => (
-              <button key={`${o.ref.kind}-${o.ref.id}`} className={`own-pick${look.slots[s].some((r) => same(r, o.ref)) ? ' on' : ''}`} onClick={() => void choose(s, o.ref)}>
-                <span className="img">{o.photo ? <img src={thumb(o.photo, 320)} alt={o.title} loading="lazy" /> : null}</span>
-                <span>{o.title}</span>
-              </button>
-            ))}
-          </div>
+      {pending && capsule ? (
+        <div className="stack" style={{ gap: 12 }}>
+          <p><b>{resolveRef(db, pending.ref).title}</b> · {capsule.name}</p>
+          {atLimit && (replaceable.length ? (
+            <>
+              <p>{t('Що замінити в капсулі?')}</p>
+              <div className="own-picks">
+                {replaceable.map((ref) => {
+                  const piece = resolveRef(db, ref);
+                  const key = pieceKey(normalizePiece(db, ref));
+                  return <button key={key} type="button" className={`own-pick${replacement === key ? ' on' : ''}`} aria-pressed={replacement === key} disabled={saving} onClick={() => setReplacement(key)}>
+                    <span className="img">{piece.art ? <img src={thumb(piece.art, 320)} alt="" loading="lazy" /> : <CategoryIcon category={piece.category} size={20} />}</span>
+                    <span>{piece.title}</span>
+                  </button>;
+                })}
+              </div>
+            </>
+          ) : <p>{t('У капсулі немає вільного місця')} · <a href={`/capsules/${capsule.id}`}>{t('Уся капсула')}</a></p>)}
         </div>
-      ))}
+      ) : <>
+        {capsule && <div className="filters start" role="group" aria-label={t('Речі')}>
+          <button type="button" className={!allPieces ? 'on' : undefined} aria-pressed={!allPieces} onClick={() => setAllPieces(false)}>{t('Речі капсули')}</button>
+          <button type="button" className={allPieces ? 'on' : undefined} aria-pressed={allPieces} onClick={() => setAllPieces(true)}>{t('Усі речі')}</button>
+        </div>}
+        {current && slot && (
+          <button className="btn sm ghost danger" disabled={saving} style={{ marginBottom: 14 }} onClick={() => void save({ ...look.slots, [slot]: look.slots[slot].filter((r) => !same(r, current)) })}>
+            <Trash2 size={13} /> {t('Прибрати з образу')}
+          </button>
+        )}
+        {slots.map((s) => (
+          <div key={s} style={{ marginBottom: 18 }}>
+            {!slot && <div className="section-head" style={{ marginTop: 0 }}><h2 className="h2">{SLOT_LABEL[s]}</h2></div>}
+            <div className="own-picks">
+              {optionsFor(s).map((o) => (
+                <button key={`${o.ref.kind}-${o.ref.id}`} className={`own-pick${look.slots[s].some((r) => same(r, o.ref)) ? ' on' : ''}`} disabled={saving} onClick={() => void choose(s, o.ref)}>
+                  <span className="img">{o.photo ? <img src={thumb(o.photo, 320)} alt={o.title} loading="lazy" /> : null}</span>
+                  <span>{o.title}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </>}
     </Modal>
   );
 }

@@ -6,7 +6,7 @@ import type { DB, Job, SnapshotSlot } from './schema.ts';
 import type { Store } from './store.ts';
 import { newId, now } from './store.ts';
 import { detectImageType, prewarm, resolveAllowed, thumbnail } from './media.ts';
-import { ANALYZE_SCHEMA, INTAKE_SCHEMA, VISUAL_DEDUP_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakePrompt, lookPieces, ownedItems, visualDedupPrompt, type IntakeReply } from './analysis.ts';
+import { ANALYZE_SCHEMA, INTAKE_SCHEMA, VISUAL_DEDUP_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakeComparisonCandidates, intakePrompt, lookPieces, ownedItems, visualDedupPrompt, type IntakeReply } from './analysis.ts';
 import { coverNeed, queueMissingItemPackshots, queueNewLookRenders } from './routes.ts';
 import { DISCOVER_SCHEMA, applyDiscover, discoverPrompt } from './discover.ts';
 import { SHOP_SEARCH_SCHEMA, STORE_FIND_SCHEMA, applyShopSearch, applyStoreFind, fetchProductImage, queueStoreFind, shopSearchPrompt, storeFindPrompt } from './shop-search.ts';
@@ -339,19 +339,10 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
 
   async function matchIntakeGarments(db: DB, jobDir: string, upload: string, garments: IntakeReply['garments']) {
     if (!upload || !fs.existsSync(upload)) return;
-    const named = new Set(garments.map((g) => g.duplicateOf).filter(Boolean));
-    const unresolved = garments.filter((g) => !g.duplicateOf);
-    const normalized = (color?: string) => color?.trim().toLowerCase() || undefined;
-    const candidates = ownedItems(db).flatMap((item) => {
-      if (named.has(item.id)) return [];
-      const sameCategory = unresolved.filter((g) => g.category === item.category);
-      if (!sameCategory.length) return [];
-      const color = normalized(item.color);
-      return [{ item, colorMatch: Boolean(color && sameCategory.some((g) => normalized(g.color) === color)) }];
-    }).sort((a, b) => Number(b.colorMatch) - Number(a.colorMatch));
+    const candidates = intakeComparisonCandidates(db, garments);
 
-    const selected: { item: (typeof candidates)[number]['item']; file: string }[] = [];
-    for (const { item } of candidates) {
+    const selected: { item: (typeof candidates)[number]; file: string }[] = [];
+    for (const item of candidates) {
       for (const id of [item.packshotId, ...item.photoIds]) {
         const photo = db.photos.find((p) => p.id === id);
         if (!photo || photo.archivedAt || photo.kind === 'worn' || photo.kind === 'label' || photo.referenceRole || photo.inspiration) continue;

@@ -25,6 +25,23 @@ export function assertLookFits(db: DB, look: Look) {
   if (capsule) assertFitsCapsule(db, look.slots, capsule);
 }
 
+/** Saves the explicitly chosen outside piece in the same mutation as the look. */
+export function addLookPieceToSet(db: DB, look: Look, revision: number, replaceKey?: string) {
+  const capsule = requireParentCapsule(db, look.capsuleId ?? undefined);
+  const outside = piecesOutsideSet(db, capsule, look.slots);
+  if (!capsule.pieces || outside.length !== 1) throw new HttpError(409, 'Вибери одну річ поза набором капсули');
+  const [piece] = outside;
+  const category = pieceCategory(db, piece);
+  if (!category) throw new HttpError(400, 'Річ не знайдено');
+  const replacement = replaceKey ? capsule.pieces.find((ref) => pieceKey(normalizePiece(db, ref)) === replaceKey) : undefined;
+  const replacementCategory = replacement && pieceCategory(db, replacement);
+  if (replaceKey && (!replacementCategory || pieceGroup(replacementCategory) !== pieceGroup(category))) {
+    throw new HttpError(409, 'Вибери заміну з тієї самої групи речей');
+  }
+  bump(capsule, revision);
+  setCapsulePieces(db, capsule, [...capsule.pieces.filter((ref) => ref !== replacement), piece], undefined);
+}
+
 /** Update membership in both directions without changing the look's composition. */
 export function placeLook(db: DB, look: Look, capsule: Capsule) {
   assertFitsCapsule(db, look.slots, capsule);

@@ -70,12 +70,35 @@ export function visualDedupPrompt(garments: IntakeReply['garments'], candidates:
   return [
     'Compare the first attachment (new upload) with the second (numbered wardrobe contact sheet). Find the same physical garment in both. Return JSON only.',
     'Match garments within the same category using distinctive construction, hardware, seams, texture, pattern and logos. Colour and category alone are insufficient. Ignore faces, poses and backgrounds.',
+    'Allow for a mirror photo reversing left and right, and for changes in lighting or logo wear. Check the logo shape and placement after accounting for mirroring.',
     'Return at most one match per garment. Use its zero-based garmentIndex and the exact itemId from the sheet legend. Use high for a distinctive match, possible for a plausible visual match with some details hidden, and omit weak matches. Briefly state the visible evidence in reason.',
     'Garments in the upload:',
     ...garments.map((g, index) => g.duplicateOf ? '' : `${index} | ${g.category} | ${g.title} | ${g.color} | ${g.notes}`).filter(Boolean),
     'Contact sheet legend (cell number | itemId | category | title):',
     ...candidates.map((item, index) => `${index + 1} | ${item.id} | ${item.category} | ${item.title}`),
   ].join('\n');
+}
+
+const garmentWords = (text: string) => new Set(text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word.length >= 3));
+const sharedWords = (a: Set<string>, b: Set<string>) => [...a].filter((word) => b.has(word)).length;
+
+/** Prioritise likely references before making the bounded contact sheet. Vision still decides the match. */
+export function intakeComparisonCandidates(db: DB, garments: IntakeReply['garments']) {
+  const named = new Set(garments.map((garment) => garment.duplicateOf).filter(Boolean));
+  const unresolved = garments.filter((garment) => !garment.duplicateOf).map((garment) => ({
+    category: garment.category,
+    title: garmentWords(garment.title),
+    colour: garmentWords(garment.color),
+  }));
+  return ownedItems(db).flatMap((item) => {
+    if (named.has(item.id)) return [];
+    const matches = unresolved.filter(({ category }) => category === item.category);
+    if (!matches.length) return [];
+    const title = garmentWords([item.title, item.brand, item.model].filter(Boolean).join(' '));
+    const colour = garmentWords(item.color ?? '');
+    const score = Math.max(...matches.map((garment) => 2 * sharedWords(title, garment.title) + sharedWords(colour, garment.colour)));
+    return [{ item, score }];
+  }).sort((a, b) => b.score - a.score).map(({ item }) => item);
 }
 
 export const ANALYZE_SCHEMA = {

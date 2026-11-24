@@ -11,7 +11,7 @@ import { stateView } from './state-view.ts';
 import { createJob, dispatch, queueMissingRenders, snapshotSlots, upload } from './routes.ts';
 import { sameIdentity, verifyReferenceFiles } from './identity.ts';
 import { MAX_IMAGE_REFS, buildPackshotPrompt, buildPrompt, createRunner, pickRefs } from './runner.ts';
-import { ANALYZE_SCHEMA, INTAKE_SCHEMA, VISUAL_DEDUP_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakePrompt, type IntakeReply } from './analysis.ts';
+import { ANALYZE_SCHEMA, INTAKE_SCHEMA, VISUAL_DEDUP_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakeComparisonCandidates, intakePrompt, type IntakeReply } from './analysis.ts';
 import { hiddenLookIds, isCapsuleHidden, sameLook } from '../src/rating.ts';
 import { createHash } from 'node:crypto';
 import { itemArt } from '../src/lib.ts';
@@ -728,6 +728,17 @@ function testPackshot(db: DB, id: string) {
   db.photos.push(photo);
   return photo;
 }
+
+test('visual intake compares a matching branded tee before plain tees in the exact shade', () => {
+  const db = fixture();
+  const source = { ...db.items[0], category: 'tees' as const, status: 'confirmed' as const };
+  db.items.push(
+    ...Array.from({ length: 6 }, (_, index) => ({ ...source, id: `W-plain-${index}`, title: 'Футболка без принту', color: 'темно-синій' })),
+    { ...source, id: 'W-sport', title: 'Синя спортивна футболка', color: 'синій', brand: 'adidas' },
+  );
+  const garment = { title: 'Темно-синя спортивна футболка adidas', color: 'темно-синій', category: 'tees', notes: 'білий логотип', duplicateOf: '' };
+  assert.equal(intakeComparisonCandidates(db, [garment])[0]?.id, 'W-sport');
+});
 
 test('visual intake checks matching wardrobe images, defers packshots and supports lossless absorb', async () => {
   const { dir, store, call } = setup();
@@ -2258,6 +2269,37 @@ test('an unsaved capsule set is read from its visible looks; roles come from the
   const later = structuredClone(db); // hidden looks are cached per looks array, as each store read is a fresh copy
   later.looks[1].disliked = true;
   assert.equal(capsuleSet(later, later.capsules[0]).counts.garments, 2, 'a hidden look is history, not part of the set');
+});
+
+test('a look can explicitly add its chosen piece to the set in the same revision-guarded operation', async () => {
+  const { store, call } = setup();
+  const ref = (id: string) => ({ kind: 'item' as const, id });
+  await call('PATCH', '/api/capsules/C-1', { pieces: [ref('W-1'), { kind: 'need', id: 'N-1' }] });
+  const before = store.read();
+  const look = before.looks[0];
+  const capsule = before.capsules[0];
+  const slots = { ...look.slots, bottom: [...look.slots.bottom, ref('W-2')] };
+  await assert.rejects(call('PATCH', '/api/looks/L-1', { rev: look.rev, slots, capsuleRev: capsule.rev - 1 }), (err: HttpError) => err.status === 409);
+  assert.deepEqual(store.read().looks[0], look);
+  await call('PATCH', '/api/looks/L-1', { rev: look.rev, slots, capsuleRev: capsule.rev });
+  const added = store.read();
+  assert.deepEqual(added.looks[0].slots.bottom, slots.bottom);
+  assert.deepEqual(added.capsules[0].pieces?.at(-1), ref('W-2'));
+  await store.mutate((db) => {
+    const fillers = Array.from({ length: CAPSULE_LIMITS.garments - 3 }, (_, index) => ({ ...db.items[0], id: `W-filler-${index}` }));
+    db.items.push(...fillers, { ...db.items[0], id: 'W-outside' });
+    db.capsules[0].pieces!.push(...fillers.map((item) => ref(item.id)));
+  });
+  const full = store.read();
+  const request = { rev: full.looks[0].rev, capsuleRev: full.capsules[0].rev, slots: { ...slots, bottom: [...slots.bottom, ref('W-outside')] } };
+  await assert.rejects(call('PATCH', '/api/looks/L-1', request), (err: HttpError) => err.status === 422);
+  await assert.rejects(call('PATCH', '/api/looks/L-1', { ...request, replaceCapsulePiece: 'item:W-1' }), (err: HttpError) => err.status === 409);
+  assert.deepEqual(store.read().capsules[0], full.capsules[0]);
+  assert.deepEqual(store.read().looks[0], full.looks[0]);
+  await call('PATCH', '/api/looks/L-1', { ...request, replaceCapsulePiece: 'item:W-filler-0' });
+  assert.deepEqual(store.read().looks[0].slots, request.slots);
+  assert.equal(store.read().capsules[0].pieces?.length, CAPSULE_LIMITS.garments);
+  assert.deepEqual(store.read().capsules[0].pieces?.at(-1), ref('W-outside'));
 });
 
 test('a saved set keeps its limits, its base and its looks: nothing outside the set enters the capsule', async () => {

@@ -18,7 +18,7 @@ import { STYLE_CATALOGUE, styleBrief } from '../src/style-catalogue.ts';
 import { sameComposition, tooClose, withBuys } from '../src/look-memory.ts';
 import { queueDiscover } from './discover.ts';
 import { sameIdentity } from './identity.ts';
-import { assertLookFits, placeLook, replaceInSets, requireParentCapsule, setCapsulePieces, stripFromSets } from './capsule-membership.ts';
+import { addLookPieceToSet, assertLookFits, placeLook, replaceInSets, requireParentCapsule, setCapsulePieces, stripFromSets } from './capsule-membership.ts';
 import { MAX_WEAR_PHOTOS, newWearId, queueWearReview, reviewPending, wearRender } from './wear-review.ts';
 import { approveIdentityDraft, queueIdentityPrep } from './identity-prep.ts';
 import { approveCapsules, approveSets, queueCapsuleMatch, queueCapsulePlan, type ApprovedSetInput } from './onboarding.ts';
@@ -949,7 +949,10 @@ on('PATCH', '/api/looks/:id', async (ctx, [id], b) => {
     // The first complete composition finishes an empty draft. Later edits still offer «Оновити».
     const changed = b.slots ? setLookSlots(look, cleanSlots(b.slots), str(b.versionNote)) : false;
     if ('capsuleId' in b) placeLook(db, look, requireParentCapsule(db, str(b.capsuleId)));
-    else if (changed) assertLookFits(db, look);
+    else if (changed) {
+      if (typeof b.capsuleRev === 'number') addLookPieceToSet(db, look, b.capsuleRev, str(b.replaceCapsulePiece));
+      assertLookFits(db, look);
+    }
     if (b.keptVersion === look.version) look.keptVersion = look.version;
     if (typeof b.favorite === 'boolean') rate(look, b.favorite ? 'like' : null);
     if (!look.name) throw new HttpError(400, 'Назва не може бути порожньою');
