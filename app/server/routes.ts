@@ -11,7 +11,7 @@ import { acceptSuggestion, dropReplacementsFor, keepItem, queueAdvice, rememberD
 import { looksNeedingRender } from '../src/render-need.ts';
 import { normalizePiece, pieceKey, pieceSetError } from '../src/capsule-pieces.ts';
 import { itemCoverOptions, primaryPhotoFirst } from '../src/item-images.ts';
-import { SLOT_CATEGORIES, hasPieces, isBlockedEyewear, lookGroup, lookVariants, resolveRef } from '../src/lib.ts';
+import { SLOT_CATEGORIES, hasPieces, isBlockedEyewear, isEyewear, lookGroup, lookVariants, resolveRef } from '../src/lib.ts';
 import { productKey, queueStoreFind } from './shop-search.ts';
 import { quotaKind, type QuotaKind } from './quota.ts';
 import { STYLE_CATALOGUE, styleBrief } from '../src/style-catalogue.ts';
@@ -114,6 +114,7 @@ export function createJob(db: DB, look: Look, basePhotoIds: string[], instructio
   const selectedIds = identity ? [identity.sourcePhotoId] : basePhotoIds.filter((id) => !db.photos.find((p) => p.id === id)?.archivedAt);
   const basePaths = identity ? [identity.face.path, identity.body.path, ...(identity.hair ? [identity.hair.crop.path] : [])] : selectedIds.map((id) => findOr404(db.photos, id, 'Базове фото').path);
   const snapshot = structuredClone(frozen ?? { lookName: look.name, slots: snapshotSlots(db, look.slots), basePhotoIds: selectedIds, basePhotoPaths: basePaths, identity });
+  if (snapshot.identity?.noGlasses) snapshot.slots = snapshot.slots.filter((slot) => !isEyewear(slot.title));
   const job: Job = { id: newId('J'), lookId: look.id, lookVersion: frozen ? (db.jobs.find((j) => j.id === retryOf)?.lookVersion ?? look.version) : look.version, snapshot, instructions, state: 'queued', origin: 'site', retryOf, createdAt: now() };
   if (identity?.disabledReason || snapshot.identity?.disabledReason) {
     job.state = 'needs_data';

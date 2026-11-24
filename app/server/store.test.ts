@@ -1394,6 +1394,28 @@ test('owner-approved portrait is the sole face and hair source; physique keeps o
   assert.notEqual(validateDb(db), null, 'an approved face never waives original physique provenance');
 });
 
+test('a no-glasses identity omits eyewear from new and retried try-ons', () => {
+  const db = fixture();
+  const file = (path: string) => ({ path, sha256: 'b'.repeat(64) });
+  db.profile.identity = { sourcePhotoId: 'P-1', original: file(db.photos[0].path), face: file('.local/face.png'), body: file('.local/body.png'), preserveHeadAngle: false, noGlasses: true, confirmedAt: at };
+  const eyewear = { ...db.items[0], id: 'W-G', title: 'Велоокуляри', category: 'accessories' as const, photoIds: [] };
+  db.items.push(eyewear);
+  const look = db.looks[0];
+  look.slots.accessories = [{ kind: 'item', id: eyewear.id }];
+  const withoutGlasses = createJob(db, look, ['P-1'], '');
+  assert.equal(withoutGlasses.state, 'queued');
+  assert.ok(!withoutGlasses.snapshot.slots.some((slot) => slot.id === eyewear.id));
+  const previous = { ...withoutGlasses.snapshot, slots: snapshotSlots(db, look.slots) };
+  const retry = createJob(db, look, ['P-1'], '', withoutGlasses.id, previous);
+  assert.deepEqual(retry.snapshot.slots, withoutGlasses.snapshot.slots);
+  assert.ok(previous.slots.some((slot) => slot.id === eyewear.id), 'the previous snapshot is unchanged');
+  assert.deepEqual(look.slots.accessories.map((ref) => ref.id), [eyewear.id], 'the outfit still includes its equipment');
+  const eyewearOnly = { ...look, slots: { ...emptySlots(), accessories: look.slots.accessories } };
+  assert.equal(createJob(db, eyewearOnly, ['P-1'], '').state, 'needs_data');
+  db.profile.identity.noGlasses = false;
+  assert.ok(createJob(db, look, ['P-1'], '').snapshot.slots.some((slot) => slot.id === eyewear.id));
+});
+
 test('superseded face or physique blocks frozen retries and already queued jobs', async () => {
   const { store, call, dir } = setup();
   const file = (p: string) => ({ path: p, sha256: 'b'.repeat(64) });
