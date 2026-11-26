@@ -1,11 +1,12 @@
-import { Fragment, useEffect, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { ArrowLeftRight, ImageOff, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import type { DB, Job, Look, SlotKey, SlotRef } from '../api.ts';
 import { api, media, quotaNote, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
 import { Badge, CategoryIcon, Empty, LookArt, Missing, Modal, RateButtons } from '../components/ui.tsx';
 import type { ResolvedRef } from '../lib.ts';
-import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, isBlockedEyewear, itemArt, lookRating, lookVariants, resolveRef, scoreLabel } from '../lib.ts';
+import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, isBlockedEyewear, itemArt, lookGroup, lookRating, resolveRef, scoreLabel } from '../lib.ts';
 import { hiddenLookIds } from '../rating.ts';
 import { freePlaces, inSavedSet, normalizePiece, pieceCategory, pieceGroup, pieceKey, visibleCapsuleLooks } from '../capsule-pieces.ts';
 import { rendersPaused } from '../render-need.ts';
@@ -90,7 +91,11 @@ export function LookPage({ id }: { id: string }) {
   const shown = currentCover(db, look, true);
   const wear = currentWear(db, look);
   const hidden = hiddenLookIds(db).has(look.id);
-  const variants = lookVariants(db, look);
+  // The look and its variants are one card (owner, 26.11): swipe it, or tap a line above it.
+  const group = lookGroup(db, look);
+  const family = group ? [group.primary, ...group.variants] : [];
+  const deck = family.some((l) => l.id === look.id) ? family : [look];
+  const variants = deck.filter((l) => l.id !== look.id);
   const capsuleMains = capsule ? distinctLooks(db, capsuleLooks(db, capsule.lookIds)) : [];
   const siblings = capsuleMains.filter((l) => l.id !== look.id && !variants.some((v) => v.id === l.id));
   const canMakePrimary = variants.length > 0 && !capsuleMains.some((l) => l.id === look.id);
@@ -178,16 +183,13 @@ export function LookPage({ id }: { id: string }) {
 
       <div className="look-page">
         <div className="look-hero">
-          <div className="hero-pic">
-            <a className="cover" href={shown ? media(shown.imagePath) : undefined} target={shown ? '_blank' : undefined} rel="noreferrer">
-              <LookArt look={look} w={960} busy={busy} label reviewLatest />
-            </a>
+          <LookDeck look={look} deck={deck} busy={busy}>
             {!paused && (
               <button className="refresh-btn" disabled={busy || Boolean(limit)} onClick={() => void update()} aria-label={t('Оновити картинку')} title={limit ?? t('Оновити картинку')}>
                 <RefreshCw size={15} />
               </button>
             )}
-          </div>
+          </LookDeck>
           {shown && shown.review === 'pending' && !busy && (
             <div className="update-ask">
               <span>{t('Це я?')}</span>
@@ -250,14 +252,6 @@ export function LookPage({ id }: { id: string }) {
         </div>
       </div>
 
-      {variants.length > 0 && (
-        <>
-          <div className="section-head"><h2 className="h2">{t('Варіанти')} <span className="count">{variants.length}</span></h2></div>
-          <div className="sib-strip">
-            {variants.map((l) => <SiblingCard key={l.id} look={l} />)}
-          </div>
-        </>
-      )}
       {siblings.length > 0 && (
         <>
           <div className="section-head"><h2 className="h2">{isSelection ? t('Ще в підбірці') : t('Ще в капсулі')} <span className="count">{siblings.length}</span></h2>{capsule && <a href={`/capsules/${capsule.id}`}>{isSelection ? t('Уся підбірка') : t('Уся капсула')}</a>}</div>
@@ -399,6 +393,84 @@ function SwapModal({ look, slot, current, variant, onClose }: { look: Look; slot
         ))}
       </>}
     </Modal>
+  );
+}
+
+/**
+ * The look's picture as one card with its variants side by side: swipe it,
+ * or tap one of the fine lines above it. Each variant keeps its own page, so
+ * switching replaces the address without adding history or jumping the page.
+ */
+function LookDeck({ look, deck, busy, children }: { look: Look; deck: Look[]; busy: boolean; children?: ReactNode }) {
+  const db = useDb();
+  const track = useRef<HTMLDivElement>(null);
+  const timer = useRef(0);
+  const placed = useRef(false);
+  // The slide a tap or the address sent the card to: the page waits until it gets there.
+  const aim = useRef<number | null>(null);
+  const latest = useRef({ deck, id: look.id });
+  latest.current = { deck, id: look.id };
+  const index = Math.max(0, deck.findIndex((l) => l.id === look.id));
+  const open = (l: Look) => go(`/looks/${l.id}`, true, true);
+  useEffect(() => {
+    const el = track.current;
+    if (!el) return;
+    const left = index * el.clientWidth;
+    if (Math.abs(el.scrollLeft - left) > 1) {
+      aim.current = placed.current ? index : null;
+      el.scrollTo({ left, behavior: placed.current ? 'smooth' : 'auto' });
+    }
+    placed.current = true;
+  }, [index, deck.length]);
+  // Once a swipe settles on another variant, that variant becomes the page.
+  useEffect(() => {
+    const el = track.current;
+    if (!el || deck.length < 2) return;
+    const settled = () => {
+      const i = Math.round(el.scrollLeft / el.clientWidth);
+      if (aim.current !== null) {
+        if (i !== aim.current) return;
+        aim.current = null;
+      }
+      const next = latest.current.deck[i];
+      if (next && next.id !== latest.current.id) open(next);
+    };
+    const native = 'onscrollend' in window;
+    const onScroll = () => { window.clearTimeout(timer.current); timer.current = window.setTimeout(settled, 150); };
+    const handOver = () => { aim.current = null; };
+    el.addEventListener(native ? 'scrollend' : 'scroll', native ? settled : onScroll);
+    el.addEventListener('pointerdown', handOver);
+    el.addEventListener('wheel', handOver, { passive: true });
+    return () => {
+      window.clearTimeout(timer.current);
+      el.removeEventListener(native ? 'scrollend' : 'scroll', native ? settled : onScroll);
+      el.removeEventListener('pointerdown', handOver);
+      el.removeEventListener('wheel', handOver);
+    };
+  }, [deck.length]);
+  return (
+    <>
+      {deck.length > 1 && (
+        <div className="deck-lines" role="group" aria-label={t('Варіанти')}>
+          {deck.map((l) => (
+            <button key={l.id} type="button" className={l.id === look.id ? 'on' : undefined} aria-pressed={l.id === look.id} aria-label={l.name} title={l.name} onClick={() => open(l)} />
+          ))}
+        </div>
+      )}
+      <div className="hero-pic">
+        <div className="deck" ref={track}>
+          {deck.map((l) => {
+            const pic = currentCover(db, l, true);
+            return (
+              <a key={l.id} className="cover" href={pic ? media(pic.imagePath) : undefined} target={pic ? '_blank' : undefined} rel="noreferrer" aria-hidden={l.id !== look.id || undefined} tabIndex={l.id === look.id ? undefined : -1}>
+                <LookArt look={l} w={960} busy={l.id === look.id ? busy : undefined} label reviewLatest />
+              </a>
+            );
+          })}
+        </div>
+        {children}
+      </div>
+    </>
   );
 }
 

@@ -170,12 +170,12 @@ export function useRoute() {
   return { parts: pathPart.split('/').filter(Boolean), query: new URLSearchParams(query) };
 }
 
-export function go(path: string, replace = false) {
+export function go(path: string, replace = false, keepScroll = false) {
   const to = path.startsWith('#') ? path.slice(1) : path;
   const from = window.location.pathname;
   if (to === from + window.location.search) return;
   window.history[replace ? 'replaceState' : 'pushState'](null, '', to);
-  if (to.split('?')[0] !== from) window.scrollTo(0, 0);
+  if (!keepScroll && to.split('?')[0] !== from) window.scrollTo(0, 0);
   window.dispatchEvent(new Event(ROUTE_EVENT));
 }
 
