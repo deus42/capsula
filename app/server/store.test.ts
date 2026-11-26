@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
-import type { DB, Job } from './schema.ts';
+import type { DB, Job, Look } from './schema.ts';
 import { SCHEMA_VERSION, emptySlots, validateDb } from './schema.ts';
 import { createStore, HttpError } from './store.ts';
 import { stateView } from './state-view.ts';
@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { distinctLooks, itemArt, lookVariants } from '../src/lib.ts';
 import { changedCoreSlots, groupLookVariations } from '../src/look-variation.ts';
 import { looksNeedingRender } from '../src/render-need.ts';
-import { coverForLook, currentCover, currentPeriod, indoorOnly, purchasePlan, todayLooks, openSuggestions, storeKey, capsuleCount, capsuleRating, isComplete, itemPlacements, itemRating, itemVerdict, lookRating, missingInfo, purchaseRanking, scoreLabel, usageLabel, wardrobeCapsule } from '../src/lib.ts';
+import { coverForLook, currentCover, currentPeriod, indoorOnly, purchasePlan, todayLooks, openSuggestions, storeKey, capsuleCount, capsuleRating, isComplete, itemPlacements, itemRating, itemVerdict, lookRating, missingInfo, sharedAdvice, purchaseRanking, scoreLabel, usageLabel, wardrobeCapsule } from '../src/lib.ts';
 import { applyShopSearch, applyStoreFind, shopSearchPrompt, storeFindPrompt, storesToFind } from './shop-search.ts';
 import { MAX_OPEN_REPLACEMENTS, SCORE_SCALE, sameTitle, adviceDue, advisePrompt, applyAdvice, itemsToRate, looksToScore, seenRevs } from './advisor.ts';
 import { refusedPieces, tooClose } from '../src/look-memory.ts';
@@ -2205,6 +2205,19 @@ test('scores on cards: a look\'s only while current, a capsule\'s is the mean of
   db = store.read();
   assert.equal(lookRating(db.looks[0]), null, 'a stale score is not shown');
   assert.equal(capsuleRating(db, db.capsules[0]), null);
+});
+
+test('a look and its variants share one score: the main look\'s, even when a variant\'s own is stale or missing', () => {
+  const look = (id: string, extra: Partial<Look> = {}): Look => ({ id, rev: 1, capsuleId: 'C-1', name: id, note: '', slots: { layer: [], top: [], bottom: [], shoes: [], accessories: [] }, version: 2, versions: [], favorite: false, origin: 'owner', createdAt: at, updatedAt: at, ...extra });
+  const main = look('L-main', { advice: { score: 7.6, why: 'main', version: 2 } });
+  const stale = look('L-stale', { variantOf: 'L-main', advice: { score: 5, why: 'old', version: 1 } });
+  const bare = look('L-bare', { variantOf: 'L-main' });
+  const other = look('L-other', { advice: { score: 9, why: 'other', version: 2 } });
+  const db = { looks: [main, stale, bare, other] } as unknown as DB;
+  for (const l of [main, stale, bare]) assert.equal(sharedAdvice(db, l)?.score, 7.6);
+  assert.equal(sharedAdvice(db, other)?.score, 9, 'an unrelated look keeps its own');
+  const unrated = { looks: [{ ...main, advice: undefined }, { ...bare, advice: { score: 6.5, why: 'v', version: 2 } }] } as unknown as DB;
+  assert.equal(sharedAdvice(unrated, unrated.looks[0])?.score, 6.5, 'without a main score the first current variant score is shared');
 });
 
 test('round 7: look memory keeps deleted and refused compositions, closeness catches near-copies and twins; honest scale scores only what changed', async () => {

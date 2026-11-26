@@ -6,7 +6,7 @@ import { api, media, quotaNote, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
 import { Badge, CategoryIcon, Empty, LookArt, Missing, Modal, RateButtons } from '../components/ui.tsx';
 import type { ResolvedRef } from '../lib.ts';
-import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, isBlockedEyewear, itemArt, lookGroup, lookRating, resolveRef, scoreLabel } from '../lib.ts';
+import { SLOT_CATEGORIES, SLOT_LABEL, capsuleLooks, coverForLook, currentCover, currentWear, distinctLooks, eyewearBlocked, indoorOnly, isBlockedEyewear, itemArt, lookGroup, resolveRef, scoreLabel, sharedAdvice } from '../lib.ts';
 import { hiddenLookIds } from '../rating.ts';
 import { freePlaces, inSavedSet, normalizePiece, pieceCategory, pieceGroup, pieceKey, visibleCapsuleLooks } from '../capsule-pieces.ts';
 import { rendersPaused } from '../render-need.ts';
@@ -73,7 +73,6 @@ export function LookPage({ id }: { id: string }) {
   const { act, toast, session } = useApp();
   const [editing, setEditing] = useState(false);
   const [swap, setSwap] = useState<{ slot?: SlotKey; current?: SlotRef; variant?: boolean } | null>(null);
-  const [keptNow, setKeptNow] = useState('');
   const [asked, setAsked] = useState<string | null>(null);
   // The picture the owner asked for: one quiet word if it could not be made (the slider simply stops otherwise).
   const askedJob = asked ? db.jobs.find((j) => j.id === asked) : undefined;
@@ -86,8 +85,6 @@ export function LookPage({ id }: { id: string }) {
   if (!look) return <div className="page"><Empty icon={<ImageOff />} title={t('Образ не знайдено')} /></div>;
   const capsule = db.capsules.find((c) => c.id === look.capsuleId);
   const isSelection = capsule?.kind === 'selection';
-  const cover = coverForLook(db, look);
-  const stale = cover && cover.lookVersion !== look.version;
   const shown = currentCover(db, look, true);
   const wear = currentWear(db, look);
   const hidden = hiddenLookIds(db).has(look.id);
@@ -98,8 +95,9 @@ export function LookPage({ id }: { id: string }) {
   const root = members.find((l) => l.id === (look.variantOf && members.some((m) => m.id === look.variantOf) ? look.variantOf : look.id));
   const family = root ? [root, ...members.filter((l) => l.variantOf === root.id)] : [];
   const deck = family.length > 1 && family.some((l) => l.id === look.id) ? family : [look];
-  // Switching variants must not move anything: the heading is the look's own name and the verdict line keeps its place.
-  const rating = lookRating(look);
+  // Switching variants must not move anything: one heading, one shared score, a verdict line that keeps its place.
+  const advice = sharedAdvice(db, look);
+  const rating = advice?.score ?? null;
   const indoor = indoorOnly(db, look);
   const capsuleMains = capsule ? distinctLooks(db, capsuleLooks(db, capsule.lookIds)) : [];
   // Similar looks of the group join «Ще в капсулі»; another look's variants stay folded under it.
@@ -107,40 +105,18 @@ export function LookPage({ id }: { id: string }) {
   const siblings = [...capsuleMains, ...similar].filter((l, i, all) => l.id !== look.id && !deck.some((d) => d.id === l.id) && all.findIndex((x) => x.id === l.id) === i);
   const canMakePrimary = members.length > 1 && !capsuleMains.some((l) => l.id === look.id);
   // The owner asked for a new picture: the slider runs until it arrives (queued or being made).
-  const lookJobs = db.jobs.filter((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === look.id);
-  const busy = lookJobs.some((j) => j.state === 'queued' || j.state === 'running');
-  const latest = lookJobs.filter((j) => j.lookVersion === look.version).at(-1);
-  const renderIssue = latest?.state === 'needs_data' ? t(latest.stateNote ?? 'Потрібні дані')
-    : latest?.state === 'error' ? t('Не вдалося оновити картинку') : undefined;
+  const busy = rendering(db, look);
   const paused = rendersPaused(db);
   // Accounts: the month's try-ons are used up (or the budget paused generation).
   const limit = quotaNote(session, 'tryon');
-  const kept = look.keptVersion === look.version;
-  // Manual fallback when an automatic update is unavailable.
-  const askUpdate = Boolean(stale) && !busy && !paused && !limit && !kept && keptNow !== `${look.id}:${look.version}`;
   const options = accessoryOptions(db, look);
-  // The advisor's one better owned piece for this version of the look.
-  const sw = look.advice?.version === look.version ? look.advice.swap : undefined;
-  const active = (id?: string) => db.items.find((i) => i.id === id && i.status !== 'inactive' && !i.mergedInto);
-  const swapAdvice = sw && active(sw.from) && active(sw.to) && (!capsule?.pieces || inSavedSet(db, capsule, { kind: 'item', id: sw.to }))
-    ? { from: active(sw.from)!, to: active(sw.to)! } : null;
 
-  const update = async () => {
+  const update = async (target: Look = look) => {
     // The server uses the pinned identity reference when there is one.
-    const job = await act(() => api<Job>('POST', '/api/jobs', { lookId: look.id, basePhotoIds: db.profile.basePhotoIds, instructions: '', run: true }));
+    const job = await act(() => api<Job>('POST', '/api/jobs', { lookId: target.id, basePhotoIds: db.profile.basePhotoIds, instructions: '', run: true }));
     if (job?.state === 'needs_data') toast(t(job.stateNote ?? 'Зараз не вийде'), true);
     else if (job) setAsked(job.id);
   };
-  const keep = () => {
-    setKeptNow(`${look.id}:${look.version}`);
-    void act(() => api('PATCH', `/api/looks/${look.id}`, { rev: look.rev, keptVersion: look.version }));
-  };
-  const itsMe = (yes: boolean) =>
-    shown &&
-    act(
-      () => api('POST', `/api/results/${shown.id}/review`, yes ? { decision: 'accepted' } : { decision: 'rework', reason: 'face' }),
-      yes ? t('Прийнято') : t('Прибрано'),
-    );
   const swapAccessory = (current: SlotRef, id: string) =>
     act(() => api('PATCH', `/api/looks/${look.id}`, { rev: look.rev, slots: { ...look.slots, accessories: look.slots.accessories.map((r) => (same(r, current) ? { kind: 'item', id } : r)) } }));
 
@@ -172,7 +148,7 @@ export function LookPage({ id }: { id: string }) {
         <div>
           <h1>{deck[0].name}</h1>
           {(rating !== null || indoor || deck.length > 1) && <p className="item-verdict">
-            {rating !== null && <>{scoreLabel(rating)}{look.advice!.why && <InfoMark title={scoreLabel(rating)} text={look.advice!.why} />}</>}
+            {rating !== null && <>{scoreLabel(rating)}{advice!.why && <InfoMark title={scoreLabel(rating)} text={advice!.why} />}</>}
             {indoor && <>{rating !== null ? ' · ' : ''}{t('у приміщенні')}</>}
             {rating === null && !indoor && ' '}
           </p>}
@@ -198,29 +174,11 @@ export function LookPage({ id }: { id: string }) {
               </button>
             )}
           </LookDeck>
-          {shown && shown.review === 'pending' && !busy && (
-            <div className="update-ask">
-              <span>{t('Це я?')}</span>
-              <button className="btn sm" onClick={() => void itsMe(false)}>{t('Ні')}</button>
-              <button className="btn sm primary" onClick={() => void itsMe(true)}>{t('Так')}</button>
-            </div>
-          )}
-          {!busy && renderIssue && <p className="miss" role="status" style={{ marginTop: 8 }}>{renderIssue}</p>}
+          {/* Each variant's questions share one place under the card, as tall as the tallest, so switching moves nothing. */}
+          {deck.length > 1
+            ? <div className="deck-asks">{deck.map((l) => <div key={l.id} inert={l.id !== look.id || undefined}><LookAsks look={l} onUpdate={(target) => void update(target)} /></div>)}</div>
+            : <LookAsks look={look} onUpdate={(target) => void update(target)} />}
           {limit && <p className="miss" role="status" style={{ marginTop: 8 }}>{limit}{session?.support && <> · <a href={session.support} target="_blank" rel="noreferrer">{t('Підтримати')}</a></>}</p>}
-          {askUpdate && (
-            <div className="update-ask">
-              <span>{t('Речі змінено')}</span>
-              <button className="btn sm" onClick={keep}>{t('Ні')}</button>
-              <button className="btn sm primary" onClick={() => void update()}>{t('Оновити')}</button>
-            </div>
-          )}
-          {swapAdvice && (
-            <div className="update-ask">
-              <span>{t('Порада:')} {swapAdvice.from.title} → {swapAdvice.to.title}</span>
-              <button className="btn sm" onClick={() => void act(() => api('POST', `/api/looks/${look.id}/advice`, { accept: false }))}>{t('Ні')}</button>
-              <button className="btn sm primary" onClick={() => void act(() => api('POST', `/api/looks/${look.id}/advice`, { accept: true }))}>{t('Так')}</button>
-            </div>
-          )}
           {wear && <>
             <div className="section-head"><h2 className="h2">{t('Реальне фото')}</h2></div>
             <WearPair wear={wear} coverId={shown?.id} />
@@ -286,6 +244,68 @@ export function LookPage({ id }: { id: string }) {
         </Modal>
       ) : swap && <SwapModal look={look} slot={swap.slot} current={swap.current} variant={swap.variant} onClose={() => setSwap(null)} />}
     </div>
+  );
+}
+
+/** Try-on jobs of a look that are still queued or being made. */
+const rendering = (db: DB, look: Look) => db.jobs.some((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === look.id && (j.state === 'queued' || j.state === 'running'));
+
+/** The questions under a look's picture: «Це я?», a failed render, changed pieces, the advisor's swap. */
+function LookAsks({ look, onUpdate }: { look: Look; onUpdate: (look: Look) => void }) {
+  const db = useDb();
+  const { act, session } = useApp();
+  const [keptNow, setKeptNow] = useState('');
+  const capsule = db.capsules.find((c) => c.id === look.capsuleId);
+  const cover = coverForLook(db, look);
+  const stale = cover && cover.lookVersion !== look.version;
+  const shown = currentCover(db, look, true);
+  const busy = rendering(db, look);
+  const latest = db.jobs.filter((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === look.id && j.lookVersion === look.version).at(-1);
+  const renderIssue = latest?.state === 'needs_data' ? t(latest.stateNote ?? 'Потрібні дані')
+    : latest?.state === 'error' ? t('Не вдалося оновити картинку') : undefined;
+  const kept = look.keptVersion === look.version;
+  // Manual fallback when an automatic update is unavailable.
+  const askUpdate = Boolean(stale) && !busy && !rendersPaused(db) && !quotaNote(session, 'tryon') && !kept && keptNow !== `${look.id}:${look.version}`;
+  // The advisor's one better owned piece for this version of the look.
+  const sw = look.advice?.version === look.version ? look.advice.swap : undefined;
+  const active = (id?: string) => db.items.find((i) => i.id === id && i.status !== 'inactive' && !i.mergedInto);
+  const swapAdvice = sw && active(sw.from) && active(sw.to) && (!capsule?.pieces || inSavedSet(db, capsule, { kind: 'item', id: sw.to }))
+    ? { from: active(sw.from)!, to: active(sw.to)! } : null;
+  const keep = () => {
+    setKeptNow(`${look.id}:${look.version}`);
+    void act(() => api('PATCH', `/api/looks/${look.id}`, { rev: look.rev, keptVersion: look.version }));
+  };
+  const itsMe = (yes: boolean) =>
+    shown &&
+    act(
+      () => api('POST', `/api/results/${shown.id}/review`, yes ? { decision: 'accepted' } : { decision: 'rework', reason: 'face' }),
+      yes ? t('Прийнято') : t('Прибрано'),
+    );
+  return (
+    <>
+      {shown && shown.review === 'pending' && !busy && (
+        <div className="update-ask">
+          <span>{t('Це я?')}</span>
+          <button className="btn sm" onClick={() => void itsMe(false)}>{t('Ні')}</button>
+          <button className="btn sm primary" onClick={() => void itsMe(true)}>{t('Так')}</button>
+        </div>
+      )}
+      {!busy && renderIssue && <p className="miss" role="status" style={{ marginTop: 8 }}>{renderIssue}</p>}
+      {askUpdate && (
+        <div className="update-ask">
+          <span>{t('Речі змінено')}</span>
+          <button className="btn sm" onClick={keep}>{t('Ні')}</button>
+          <button className="btn sm primary" onClick={() => onUpdate(look)}>{t('Оновити')}</button>
+        </div>
+      )}
+      {swapAdvice && (
+        <div className="update-ask">
+          <span>{t('Порада:')} {swapAdvice.from.title} → {swapAdvice.to.title}</span>
+          <button className="btn sm" onClick={() => void act(() => api('POST', `/api/looks/${look.id}/advice`, { accept: false }))}>{t('Ні')}</button>
+          <button className="btn sm primary" onClick={() => void act(() => api('POST', `/api/looks/${look.id}/advice`, { accept: true }))}>{t('Так')}</button>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -420,7 +440,8 @@ function LookDeck({ look, deck, busy, children }: { look: Look; deck: Look[]; bu
   // A tapped name (or the address) shows its slide at once, so the card never disagrees with the selector.
   useEffect(() => {
     const el = track.current;
-    if (el && Math.abs(el.scrollLeft - index * el.clientWidth) > 1) el.scrollLeft = index * el.clientWidth;
+    // Only a tapped name moves the card; a swipe already rests on its slide, so its snap is never interrupted.
+    if (el && Math.round(el.scrollLeft / el.clientWidth) !== index) el.scrollLeft = index * el.clientWidth;
   }, [index, deck.length]);
   // Once a swipe settles on another variant, that variant becomes the page.
   useEffect(() => {

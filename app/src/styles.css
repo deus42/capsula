@@ -366,6 +366,11 @@ h1, h2, h3, h4, h5, p { margin: 0; }
 .look-hero .deck > .cover { flex: 0 0 100%; scroll-snap-align: start; scroll-snap-stop: always; border: 0; border-radius: 0; box-shadow: none; }
 .look-hero .deck-names { margin: -10px 0 -6px; }
 .look-hero .deck-names button { text-align: left; }
+/* Every variant's questions stacked in one cell: the tallest sets the height, only the shown variant's are visible. */
+.deck-asks { display: grid; }
+.deck-asks > * { grid-area: 1 / 1; display: flex; flex-direction: column; gap: 12px; }
+.deck-asks > [inert] { visibility: hidden; }
+.deck-asks:not(:has(> * > *)) { display: none; }
 .look-hero .corner { position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; flex-wrap: wrap; z-index: 2; }
 .look-side .section-head:first-child { margin-top: 0; }
 .sib-strip { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }

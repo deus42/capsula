@@ -345,6 +345,12 @@ const scoreFormats = {
 export const scoreLabel = (n: number) => `${scoreFormats[currentLanguage()].format(n)}/10`;
 /** A look's score counts only while it belongs to the pieces the look has now. */
 export const lookRating = (l: Look) => (l.advice && l.advice.version === l.version ? l.advice.score : null);
+/** A look and the variants made from it share one score (owner, 26.11): the main look's, else the first variant's that is current. */
+export function sharedAdvice(db: DB, look: Look) {
+  const main = (look.variantOf && db.looks.find((l) => l.id === look.variantOf)) || look;
+  const rated = [main, ...db.looks.filter((l) => l.variantOf === main.id)].find((l) => lookRating(l) !== null);
+  return rated?.advice ?? null;
+}
 /** A capsule's score: the mean of its shown looks' current scores (owner, 19.11). */
 export function capsuleRating(db: DB, c: Pick<Capsule, 'lookIds'>) {
   const scores = distinctLooks(db, capsuleLooks(db, c.lookIds)).filter(hasPieces).map(lookRating).filter((s): s is number => s !== null);

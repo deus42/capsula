@@ -4,7 +4,7 @@ import type { Capsule, Look, Season, SlotRef, SlotKey } from '../api.ts';
 import { api } from '../api.ts';
 import { go, useApp, useDb, useRoute } from '../store.tsx';
 import { Badge, ConfirmButton, Empty, LookArt, Missing, Modal, PieceBlocks, RateButtons } from '../components/ui.tsx';
-import { SEASON_LABEL, SLOT_CATEGORIES, SLOT_LABEL, isBlockedEyewear, openSuggestions, periodLine, bestLooks, capsuleLooks, capsuleRating, distinctLooks, hasPieces, isBestLook, lookRating, resolveRef, scoreLabel, isComplete, piecesOf, rankCapsules, rankLooks, readyLine, wardrobeCapsule, BEST_CAPSULE_NAME, WARDROBE_CAPSULE_NAME } from '../lib.ts';
+import { SEASON_LABEL, SLOT_CATEGORIES, SLOT_LABEL, isBlockedEyewear, openSuggestions, periodLine, bestLooks, capsuleLooks, capsuleRating, distinctLooks, hasPieces, isBestLook, resolveRef, scoreLabel, isComplete, piecesOf, rankCapsules, rankLooks, readyLine, sharedAdvice, wardrobeCapsule, BEST_CAPSULE_NAME, WARDROBE_CAPSULE_NAME } from '../lib.ts';
 import { capsulePieceRefs, pieceKey } from '../capsule-pieces.ts';
 import { hiddenLookIds, isCapsuleArchived, isCapsuleHidden } from '../rating.ts';
 import { CapsuleTile, tileCovers } from './Home.tsx';
@@ -211,6 +211,7 @@ function CreateLook({ capsule, onClose }: { capsule: Capsule; onClose: () => voi
 function LookCard({ look, mark = false }: { look: Look; mark?: boolean }) {
   const db = useDb();
   const best = mark && isBestLook(db, look.id);
+  const advice = sharedAdvice(db, look);
   return (
     <div className="look-card">
       <a className="cover" style={{ aspectRatio: '2 / 3' }} href={`/looks/${look.id}`}>
@@ -220,7 +221,7 @@ function LookCard({ look, mark = false }: { look: Look; mark?: boolean }) {
       <a href={`/looks/${look.id}`}>{mark && <span className={`eyebrow-sm best-mark${best ? '' : ' ghost'}`} aria-hidden={!best}>{t('Найкращий')}</span>}<h4 title={look.note}>{look.name}</h4><Missing look={look} /></a>
       <div className="card-foot">
         <RateButtons kind="look" target={look} size="sm" />
-        {lookRating(look) !== null && <span className="score">{scoreLabel(lookRating(look)!)}</span>}
+        {advice && <span className="score">{scoreLabel(advice.score)}</span>}
       </div>
     </div>
   );
