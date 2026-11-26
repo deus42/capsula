@@ -91,14 +91,21 @@ export function LookPage({ id }: { id: string }) {
   const shown = currentCover(db, look, true);
   const wear = currentWear(db, look);
   const hidden = hiddenLookIds(db).has(look.id);
-  // The look and its variants are one card (owner, 26.11): swipe it, or tap a line above it.
+  // The look and the variants made from it are one card (owner, 26.11): swipe it, or tap a name above it.
+  // Similar looks folded into the same group are looks of their own, so they stay out of the swipe.
   const group = lookGroup(db, look);
-  const family = group ? [group.primary, ...group.variants] : [];
-  const deck = family.some((l) => l.id === look.id) ? family : [look];
-  const variants = deck.filter((l) => l.id !== look.id);
+  const members = group ? [group.primary, ...group.variants] : [];
+  const root = members.find((l) => l.id === (look.variantOf && members.some((m) => m.id === look.variantOf) ? look.variantOf : look.id));
+  const family = root ? [root, ...members.filter((l) => l.variantOf === root.id)] : [];
+  const deck = family.length > 1 && family.some((l) => l.id === look.id) ? family : [look];
+  // Switching variants must not move anything: the heading is the look's own name and the verdict line keeps its place.
+  const rating = lookRating(look);
+  const indoor = indoorOnly(db, look);
   const capsuleMains = capsule ? distinctLooks(db, capsuleLooks(db, capsule.lookIds)) : [];
-  const siblings = capsuleMains.filter((l) => l.id !== look.id && !variants.some((v) => v.id === l.id));
-  const canMakePrimary = variants.length > 0 && !capsuleMains.some((l) => l.id === look.id);
+  // Similar looks of the group join «Ще в капсулі»; another look's variants stay folded under it.
+  const similar = members.filter((l) => !(l.variantOf && members.some((m) => m.id === l.variantOf)));
+  const siblings = [...capsuleMains, ...similar].filter((l, i, all) => l.id !== look.id && !deck.some((d) => d.id === l.id) && all.findIndex((x) => x.id === l.id) === i);
+  const canMakePrimary = members.length > 1 && !capsuleMains.some((l) => l.id === look.id);
   // The owner asked for a new picture: the slider runs until it arrives (queued or being made).
   const lookJobs = db.jobs.filter((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === look.id);
   const busy = lookJobs.some((j) => j.state === 'queued' || j.state === 'running');
@@ -163,10 +170,11 @@ export function LookPage({ id }: { id: string }) {
       </div>
       <div className="page-head">
         <div>
-          <h1>{look.name}</h1>
-          {(lookRating(look) !== null || indoorOnly(db, look)) && <p className="item-verdict">
-            {lookRating(look) !== null && <>{scoreLabel(lookRating(look)!)}{look.advice!.why && <InfoMark title={scoreLabel(lookRating(look)!)} text={look.advice!.why} />}</>}
-            {indoorOnly(db, look) && <>{lookRating(look) !== null ? ' · ' : ''}{t('у приміщенні')}</>}
+          <h1>{deck[0].name}</h1>
+          {(rating !== null || indoor || deck.length > 1) && <p className="item-verdict">
+            {rating !== null && <>{scoreLabel(rating)}{look.advice!.why && <InfoMark title={scoreLabel(rating)} text={look.advice!.why} />}</>}
+            {indoor && <>{rating !== null ? ' · ' : ''}{t('у приміщенні')}</>}
+            {rating === null && !indoor && ' '}
           </p>}
           {hidden && <div className="row wrap" style={{ marginTop: 12 }}><Badge>{look.disliked ? t('приховано') : capsule?.disliked ? t('капсулу приховано') : t('схожий на прихований')}</Badge></div>}
         </div>
@@ -398,62 +406,41 @@ function SwapModal({ look, slot, current, variant, onClose }: { look: Look; slot
 
 /**
  * The look's picture as one card with its variants side by side: swipe it,
- * or tap one of the fine lines above it. Each variant keeps its own page, so
+ * or tap a variant's name above it. Each variant keeps its own page, so
  * switching replaces the address without adding history or jumping the page.
  */
 function LookDeck({ look, deck, busy, children }: { look: Look; deck: Look[]; busy: boolean; children?: ReactNode }) {
   const db = useDb();
   const track = useRef<HTMLDivElement>(null);
   const timer = useRef(0);
-  const placed = useRef(false);
-  // The slide a tap or the address sent the card to: the page waits until it gets there.
-  const aim = useRef<number | null>(null);
   const latest = useRef({ deck, id: look.id });
   latest.current = { deck, id: look.id };
   const index = Math.max(0, deck.findIndex((l) => l.id === look.id));
   const open = (l: Look) => go(`/looks/${l.id}`, true, true);
+  // A tapped name (or the address) shows its slide at once, so the card never disagrees with the selector.
   useEffect(() => {
     const el = track.current;
-    if (!el) return;
-    const left = index * el.clientWidth;
-    if (Math.abs(el.scrollLeft - left) > 1) {
-      aim.current = placed.current ? index : null;
-      el.scrollTo({ left, behavior: placed.current ? 'smooth' : 'auto' });
-    }
-    placed.current = true;
+    if (el && Math.abs(el.scrollLeft - index * el.clientWidth) > 1) el.scrollLeft = index * el.clientWidth;
   }, [index, deck.length]);
   // Once a swipe settles on another variant, that variant becomes the page.
   useEffect(() => {
     const el = track.current;
     if (!el || deck.length < 2) return;
     const settled = () => {
-      const i = Math.round(el.scrollLeft / el.clientWidth);
-      if (aim.current !== null) {
-        if (i !== aim.current) return;
-        aim.current = null;
-      }
-      const next = latest.current.deck[i];
+      const next = latest.current.deck[Math.round(el.scrollLeft / el.clientWidth)];
       if (next && next.id !== latest.current.id) open(next);
     };
-    const native = 'onscrollend' in window;
-    const onScroll = () => { window.clearTimeout(timer.current); timer.current = window.setTimeout(settled, 150); };
-    const handOver = () => { aim.current = null; };
-    el.addEventListener(native ? 'scrollend' : 'scroll', native ? settled : onScroll);
-    el.addEventListener('pointerdown', handOver);
-    el.addEventListener('wheel', handOver, { passive: true });
-    return () => {
-      window.clearTimeout(timer.current);
-      el.removeEventListener(native ? 'scrollend' : 'scroll', native ? settled : onScroll);
-      el.removeEventListener('pointerdown', handOver);
-      el.removeEventListener('wheel', handOver);
-    };
+    const event = 'onscrollend' in window ? 'scrollend' : 'scroll';
+    const onEvent = event === 'scrollend' ? settled : () => { window.clearTimeout(timer.current); timer.current = window.setTimeout(settled, 150); };
+    el.addEventListener(event, onEvent);
+    return () => { window.clearTimeout(timer.current); el.removeEventListener(event, onEvent); };
   }, [deck.length]);
   return (
     <>
       {deck.length > 1 && (
-        <div className="deck-lines" role="group" aria-label={t('Варіанти')}>
-          {deck.map((l) => (
-            <button key={l.id} type="button" className={l.id === look.id ? 'on' : undefined} aria-pressed={l.id === look.id} aria-label={l.name} title={l.name} onClick={() => open(l)} />
+        <div className="filters start deck-names" role="group" aria-label={t('Варіанти')}>
+          {deck.map((l, i) => (
+            <button key={l.id} type="button" className={l.id === look.id ? 'on' : undefined} aria-pressed={l.id === look.id} onClick={() => open(l)}>{i === 0 ? t('Основний') : l.name}</button>
           ))}
         </div>
       )}
@@ -463,7 +450,7 @@ function LookDeck({ look, deck, busy, children }: { look: Look; deck: Look[]; bu
             const pic = currentCover(db, l, true);
             return (
               <a key={l.id} className="cover" href={pic ? media(pic.imagePath) : undefined} target={pic ? '_blank' : undefined} rel="noreferrer" aria-hidden={l.id !== look.id || undefined} tabIndex={l.id === look.id ? undefined : -1}>
-                <LookArt look={l} w={960} busy={l.id === look.id ? busy : undefined} label reviewLatest />
+                <LookArt look={l} w={960} busy={l.id === look.id ? busy : undefined} label reviewLatest eager={deck.length > 1} />
               </a>
             );
           })}

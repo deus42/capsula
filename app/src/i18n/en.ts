@@ -233,6 +233,7 @@ export const en: Record<string, string> = {
   "Додати річ": "Add a piece",
   "Або замість «": "Or instead of «",
   "Варіанти": "Variants",
+  "Основний": "Main",
   "Створити варіант": "Create variant",
   "Яку річ замінити?": "Which piece to swap?",
   "Зробити головним": "Make primary",

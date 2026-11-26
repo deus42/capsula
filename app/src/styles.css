@@ -360,15 +360,12 @@ h1, h2, h3, h4, h5, p { margin: 0; }
 .look-hero { display: flex; flex-direction: column; gap: 12px; position: sticky; top: 16px; }
 .look-hero .cover { position: relative; display: block; aspect-ratio: 2 / 3; border-radius: 20px; overflow: hidden; background: #fff; border: 1px solid var(--line); box-shadow: var(--shadow-sm); }
 .look-hero .cover img { width: 100%; height: 100%; object-fit: contain; }
-/* The look and its variants: one card that swipes, fine lines above it. */
+/* The look and its variants: one card that swipes, their names above it. */
 .look-hero .deck { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; overscroll-behavior-x: contain; scrollbar-width: none; border-radius: 20px; border: 1px solid var(--line); background: #fff; box-shadow: var(--shadow-sm); }
 .look-hero .deck::-webkit-scrollbar { display: none; }
 .look-hero .deck > .cover { flex: 0 0 100%; scroll-snap-align: start; scroll-snap-stop: always; border: 0; border-radius: 0; box-shadow: none; }
-.deck-lines { display: flex; gap: 6px; margin: -6px 0 -4px; }
-.deck-lines button { flex: 1; min-height: 22px; padding: 0; display: flex; align-items: center; }
-.deck-lines button::before { content: ''; flex: 1; height: 2px; border-radius: 2px; background: var(--line); transition: background .2s; }
-.deck-lines button:hover::before { background: var(--muted); }
-.deck-lines button.on::before { background: var(--ink); }
+.look-hero .deck-names { margin: -10px 0 -6px; }
+.look-hero .deck-names button { text-align: left; }
 .look-hero .corner { position: absolute; top: 12px; left: 12px; display: flex; gap: 6px; flex-wrap: wrap; z-index: 2; }
 .look-side .section-head:first-child { margin-top: 0; }
 .sib-strip { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }

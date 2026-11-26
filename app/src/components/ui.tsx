@@ -347,14 +347,14 @@ export function JobEta({ job }: { job: Job }) {
   return <>{jobProgress(db, job, now).label}</>;
 }
 
-export function LookArt({ look, w = 700, max, busy, label = false, reviewLatest = false }: { look: Look; w?: number; max?: number; busy?: boolean; label?: boolean; reviewLatest?: boolean }) {
+export function LookArt({ look, w = 700, max, busy, label = false, reviewLatest = false, eager = false }: { look: Look; w?: number; max?: number; busy?: boolean; label?: boolean; reviewLatest?: boolean; eager?: boolean }) {
   const db = useDb();
   const cover = currentCover(db, look, reviewLatest);
   // `busy` = the owner asked on this page: waiting counts too; elsewhere only running work shows.
   const job = busy === false ? undefined : lookJob(db, look.id, busy === true);
   return (
     <span className="look-art">
-      {cover ? <img src={thumb(cover.imagePath, w)} alt={look.name} loading="lazy" /> : <LookCollage slots={look.slots} max={max} />}
+      {cover ? <img src={thumb(cover.imagePath, w)} alt={look.name} loading={eager ? 'eager' : 'lazy'} /> : <LookCollage slots={look.slots} max={max} />}
       {job && <JobBar job={job} label={label} />}
     </span>
   );
