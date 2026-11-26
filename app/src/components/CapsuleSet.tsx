@@ -41,7 +41,10 @@ export function CapsuleSetSection({ capsule }: { capsule: Capsule }) {
           {r.inactive && <span className="tl"><Badge tone="glass">{t('неактуальна')}</Badge></span>}
         </div>
         <span className="nm">{r.title}</span>
-        <span className="sub">{[p.base && t('база'), !p.owned && t('докупити'), looksText(p.looks)].filter(Boolean).join(' · ')}</span>
+        <span className="set-meta">
+          {!p.owned && <span className="buy-label">{t('докупити')}</span>}
+          <span>{[p.base && t('база'), looksText(p.looks)].filter(Boolean).join(' · ')}</span>
+        </span>
       </a>
     );
   };
