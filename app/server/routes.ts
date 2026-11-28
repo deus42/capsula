@@ -1,14 +1,14 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
-import type { Capsule, DB, Item, Job, Look, Need, Photo, PhotoKind, ReworkReason, SlotKey, SlotRef, Slots, SnapshotSlot, Language, WardrobeFocus, Wear } from './schema.ts';
-import { CATEGORIES, ITEM_STATUSES, LANGUAGES, MEASURE_KEYS, PERIODS, PHOTO_KINDS, REWORK_REASONS, SEASONS, SLOT_KEYS, WARDROBE_FOCUS } from './schema.ts';
+import type { Capsule, DB, FitType, Item, Job, Look, Need, Photo, PhotoKind, ReworkReason, SlotKey, SlotRef, Slots, SnapshotSlot, Language, WardrobeFocus, Wear } from './schema.ts';
+import { CATEGORIES, FIT_TYPES, ITEM_STATUSES, LANGUAGES, MEASURE_KEYS, PERIODS, PHOTO_KINDS, REWORK_REASONS, SEASONS, SLOT_KEYS, WARDROBE_FOCUS } from './schema.ts';
 import type { Store } from './store.ts';
 import { HttpError, bump, findOr404, newId, now } from './store.ts';
-import { folderBytesAsync, prewarm, saveUpload, type StorageLimits } from './media.ts';
+import { computeDhash, dhashDistance, folderBytesAsync, prewarm, resolveAllowed, sameVisualPhoto, saveUpload, type StorageLimits } from './media.ts';
 import { pickTheme } from './analysis.ts';
 import { acceptSuggestion, dropReplacementsFor, keepItem, queueAdvice, rememberDeclined } from './advisor.ts';
-import { looksNeedingRender } from '../src/render-need.ts';
+import { looksNeedingRender, rendersPaused } from '../src/render-need.ts';
 import { normalizePiece, pieceKey, pieceSetError } from '../src/capsule-pieces.ts';
 import { itemCoverOptions, primaryPhotoFirst } from '../src/item-images.ts';
 import { SLOT_CATEGORIES, hasPieces, isBlockedEyewear, isEyewear, lookGroup, lookVariants, resolveRef } from '../src/lib.ts';
@@ -23,6 +23,7 @@ import { addLookPieceToSet, assertLookFits, detachLookVariant, linkNewLookVarian
 import { MAX_WEAR_PHOTOS, newWearId, queueWearReview, reviewPending, wearRender } from './wear-review.ts';
 import { approveIdentityDraft, queueIdentityPrep } from './identity-prep.ts';
 import { approveCapsules, approveSets, queueCapsuleMatch, queueCapsulePlan, type ApprovedSetInput } from './onboarding.ts';
+import { cleanFit, fitPhotoPath, queueFitAnalysis, suggestFitFromMeasurements } from './fit.ts';
 
 type Body = Record<string, unknown>;
 export interface Ctx {
@@ -78,6 +79,25 @@ function setLookSlots(look: Look, slots: Slots, note?: string) {
   return true;
 }
 
+/**
+ * The pictures a planned purchase can be rendered from, best first: its concept packshot, the chosen shop photo,
+ * then the best-scored shop photos (at most 4, each once). An unreadable first picture falls back to the next.
+ */
+export function needGarmentPhotos(db: DB, need: Need): Photo[] {
+  const usable = (id?: string) => {
+    const p = id ? db.photos.find((x) => x.id === id) : undefined;
+    return p && !p.archivedAt && !p.inspiration && !p.referenceRole && p.kind !== 'worn' && p.kind !== 'label' && p.kind !== 'base' ? p : undefined;
+  };
+  const shopPhoto = (p?: Photo) => (p && (p.kind === 'product' || (p.source === 'upload' && (p.kind === 'item' || p.kind === 'detail'))) ? p : undefined);
+  const shop = db.products
+    .filter((p) => p.needId === need.id && p.photoId)
+    .sort((a, b) => Number(b.status === 'chosen') - Number(a.status === 'chosen') || (b.matchScore ?? -1) - (a.matchScore ?? -1))
+    .map((p) => shopPhoto(usable(p.photoId)));
+  const out: Photo[] = [];
+  for (const p of [usable(need.conceptPhotoId), ...shop]) if (p && !out.some((x) => x.path === p.path)) out.push(p);
+  return out.slice(0, 4);
+}
+
 /** Freezes the exact selection, photos and texts at queue time. */
 export function snapshotSlots(db: DB, slots: Slots): SnapshotSlot[] {
   const out: SnapshotSlot[] = [];
@@ -97,7 +117,8 @@ export function snapshotSlots(db: DB, slots: Slots): SnapshotSlot[] {
         out.push({ slot, kind: 'item', id: item.id, title: item.title, description: details, owned: item.status !== 'inactive', photoPaths, originalPhotoPaths: photos, photoHashes: crop ? [crop, crop.source] : undefined });
       } else if (ref.kind === 'need') {
         const need = findOr404(db.needs, ref.id, 'Потреба');
-        out.push({ slot, kind: 'need', id: need.id, title: need.title, description: need.description, owned: false, photoPaths: [] });
+        // A planned purchase is drawn from its concept picture, else its best shop photo; a crop is made and face-checked before use.
+        out.push({ slot, kind: 'need', id: need.id, title: need.title, description: need.description ?? '', owned: false, photoPaths: [], originalPhotoPaths: needGarmentPhotos(db, need).map((photo) => photo.path) });
       } else {
         const p = findOr404(db.products, ref.id, 'Товар');
         const photo = p.photoId ? findOr404(db.photos, p.photoId, 'Фото') : undefined;
@@ -152,7 +173,7 @@ export function packshotJob(db: DB, target: { itemId?: string; needId?: string }
     snapshot = { lookName: item.title, slots: [{ slot: ITEM_SLOT[item.category], kind: 'item', id: item.id, title: item.title, description, owned: true, photoPaths: photos }], basePhotoIds: [], basePhotoPaths: [] };
   } else if (!snapshot && target.needId) {
     const need = findOr404(db.needs, target.needId, 'Потреба');
-    snapshot = { lookName: need.title, slots: [{ slot: ITEM_SLOT[need.category], kind: 'need', id: need.id, title: need.title, description: need.description, owned: false, photoPaths: [] }], basePhotoIds: [], basePhotoPaths: [] };
+    snapshot = { lookName: need.title, slots: [{ slot: ITEM_SLOT[need.category], kind: 'need', id: need.id, title: need.title, description: need.description ?? '', owned: false, photoPaths: [] }], basePhotoIds: [], basePhotoPaths: [] };
   }
   if (!snapshot) throw new HttpError(400, 'Не вказано річ для packshot');
   const job: Job = { id: newId('J'), kind: 'packshot', itemId: target.itemId, needId: target.needId, lookVersion: 0, snapshot, instructions, state: 'queued', origin: 'site', retryOf, createdAt: now() };
@@ -173,7 +194,50 @@ export function queueMissingItemPackshots(db: DB, itemIds: string[]): number {
   return queued;
 }
 
-function replaceRefs(db: DB, match: (r: SlotRef) => boolean, replacement: SlotRef, note: string, onlyLooks?: Set<string>) {
+/** A planned purchase gets its concept picture once, so Shopping and its looks are never left without an image. */
+export function queueMissingNeedPackshots(db: DB, needIds: string[]): number {
+  const active = new Set(db.jobs.filter((job) => job.kind === 'packshot' && (job.state === 'queued' || job.state === 'running')).map((job) => job.needId));
+  let queued = 0;
+  for (const id of new Set(needIds)) {
+    const need = db.needs.find((candidate) => candidate.id === id);
+    if (!need || need.status !== 'open' || need.conceptPhotoId || active.has(id)) continue;
+    packshotJob(db, { needId: id });
+    queued += 1;
+  }
+  return queued;
+}
+
+/**
+ * Looks whose pieces changed get a fresh try-on by themselves (unless try-ons start by hand or cannot run at all).
+ * A look still missing a garment picture keeps a waiting job that resumes when the picture arrives.
+ */
+export function queueChangedLookRenders(db: DB, lookIds: string[], autoTryOn?: boolean): Job[] {
+  const ids = [...new Set(lookIds)].filter((id) => db.looks.some((look) => look.id === id));
+  if (autoTryOn === false || !ids.length || rendersPaused(db)) return [];
+  return queueNewLookRenders(db, ids);
+}
+
+/** A piece got its picture (a concept packshot, a real photo): try-ons of the current version waiting for it start again. */
+export function resumeWaitingTryonsForRef(db: DB, kind: SlotRef['kind'], id: string, autoTryOn?: boolean): Job[] {
+  if (autoTryOn === false || rendersPaused(db)) return [];
+  const uses = (look: Look) => Object.values(look.slots).some((refs) => refs.some((r) => r.kind === kind && r.id === id));
+  const waiting = (look: Look) => db.jobs.some((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === look.id && j.lookVersion === look.version && j.state === 'needs_data');
+  const busy = (look: Look) => db.jobs.some((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === look.id && j.lookVersion === look.version && (j.state === 'queued' || j.state === 'running'));
+  const looks = db.looks.filter((look) => uses(look) && waiting(look) && !busy(look));
+  if (!looks.length) return [];
+  const created = queueNewLookRenders(db, looks.map((look) => look.id));
+  const started = new Set(created.filter((j) => j.state === 'queued').map((j) => j.lookId));
+  const fresh = new Set(created.map((j) => j.id));
+  // The waiting job goes only once a queued replacement exists; a replacement that would still wait is not kept.
+  dropJobs(db, (j) => fresh.has(j.id) ? j.state !== 'queued' : (j.kind ?? 'tryon') === 'tryon' && j.state === 'needs_data' && Boolean(j.lookId && started.has(j.lookId)) && j.lookVersion === db.looks.find((look) => look.id === j.lookId)?.version);
+  return created.filter((j) => j.state === 'queued');
+}
+
+/**
+ * Replaces a piece in looks and capsule sets. `onlyLooks` limits the looks; the sets touched are then those of the
+ * changed looks plus `alsoCapsules`. Changed capsule ids are added to `capsulesOut`.
+ */
+function replaceRefs(db: DB, match: (r: SlotRef) => boolean, replacement: SlotRef, note: string, onlyLooks?: Set<string>, alsoCapsules?: Set<string>, capsulesOut?: string[]) {
   const changedLooks: string[] = [];
   for (const look of db.looks) {
     if (onlyLooks && !onlyLooks.has(look.id)) continue;
@@ -195,7 +259,8 @@ function replaceRefs(db: DB, match: (r: SlotRef) => boolean, replacement: SlotRe
     }
   }
   // Capsule sets follow the same replacement; a limited replacement touches only the capsules of the changed looks.
-  replaceInSets(db, match, replacement, onlyLooks ? new Set(db.capsules.filter((c) => c.lookIds.some((id) => changedLooks.includes(id))).map((c) => c.id)) : undefined);
+  const capsules = replaceInSets(db, match, replacement, onlyLooks ? new Set([...db.capsules.filter((c) => c.lookIds.some((id) => changedLooks.includes(id))).map((c) => c.id), ...(alsoCapsules ?? [])]) : undefined);
+  capsulesOut?.push(...capsules);
   return changedLooks;
 }
 
@@ -250,7 +315,7 @@ export const queueRerenders = (db: DB, lookIds: string[]) => renderLooks(db, loo
  * shopping list, its stand-ins in looks become the owner's item, and those
  * looks get fresh try-ons. Undone with uncoverNeed.
  */
-export function coverNeed(db: DB, needId: string, itemId: string) {
+export function coverNeed(db: DB, needId: string, itemId: string, autoTryOn?: boolean) {
   const need = findOr404(db.needs, needId, 'Потреба');
   const item = findOr404(db.items, itemId, 'Річ');
   if (need.status !== 'open') throw new HttpError(409, `«${need.title}» уже закрито`);
@@ -258,19 +323,22 @@ export function coverNeed(db: DB, needId: string, itemId: string) {
   if (item.status === 'inactive' || item.mergedInto) throw new HttpError(400, 'Неактуальна річ не закриває покупку');
   if (item.id === need.replaces) throw new HttpError(409, 'Це та сама річ, яку покупка має замінити');
   const options = new Set(db.products.filter((p) => p.needId === need.id && p.status !== 'purchased').map((p) => p.id));
-  const looks = replaceRefs(db, (r) => (r.kind === 'need' && r.id === need.id) || (r.kind === 'product' && options.has(r.id)) || (r.kind === 'item' && r.id === need.replaces), { kind: 'item', id: item.id }, `Своя річ замість «${need.title}»`);
+  const capsules: string[] = [];
+  const looks = replaceRefs(db, (r) => (r.kind === 'need' && r.id === need.id) || (r.kind === 'product' && options.has(r.id)) || (r.kind === 'item' && r.id === need.replaces), { kind: 'item', id: item.id }, `Своя річ замість «${need.title}»`, undefined, undefined, capsules);
   need.status = 'covered';
   need.coveredByItem = item.id;
   need.coveredLookIds = looks;
+  // Capsule sets that took the item in its place are restored on undo too, even with no look changed.
+  if (capsules.length) need.coveredCapsuleIds = [...new Set(capsules)];
+  else delete need.coveredCapsuleIds;
   bump(need, undefined);
   history(item, 'covers_need', `${need.id} · ${need.title}`);
   bump(item, undefined);
-  // The picture is updated only when the owner asks (look page: «Оновити»).
-  return { need, looks, renders: [] as Job[] };
+  return { need, looks, renders: queueChangedLookRenders(db, looks, autoTryOn) };
 }
 
 /** Puts a recommendation back on the shopping list and its stand-in back into the looks it was replaced in. */
-export function uncoverNeed(db: DB, needId: string) {
+export function uncoverNeed(db: DB, needId: string, autoTryOn?: boolean) {
   const need = findOr404(db.needs, needId, 'Потреба');
   if (need.status !== 'covered') throw new HttpError(409, `«${need.title}» і так у покупках`);
   if (db.products.some((p) => p.needId === need.id && p.status === 'purchased')) throw new HttpError(409, 'Закрито покупкою — це запис покупки, не збіг із фото');
@@ -278,17 +346,18 @@ export function uncoverNeed(db: DB, needId: string) {
   restoreRetired(db, need);
   // A replacement purchase gives its looks the old item back; any other gets its stand-in back.
   const old = need.replaces ? db.items.find((i) => i.id === need.replaces && i.status !== 'inactive' && !i.mergedInto) : undefined;
-  const looks = itemId ? replaceRefs(db, (r) => r.kind === 'item' && r.id === itemId, old ? { kind: 'item', id: old.id } : { kind: 'need', id: need.id }, `Повернуто в покупки: «${need.title}»`, new Set(need.coveredLookIds ?? [])) : [];
+  const looks = itemId ? replaceRefs(db, (r) => r.kind === 'item' && r.id === itemId, old ? { kind: 'item', id: old.id } : { kind: 'need', id: need.id }, `Повернуто в покупки: «${need.title}»`, new Set(need.coveredLookIds ?? []), new Set(need.coveredCapsuleIds ?? [])) : [];
   need.status = 'open';
   delete need.coveredByItem;
   delete need.coveredLookIds;
+  delete need.coveredCapsuleIds;
   bump(need, undefined);
   const item = itemId ? db.items.find((i) => i.id === itemId) : undefined;
   if (item) {
     history(item, 'uncovers_need', `${need.id} · ${need.title}`);
     bump(item, undefined);
   }
-  return { need, looks, renders: [] as Job[] };
+  return { need, looks, renders: queueChangedLookRenders(db, looks, autoTryOn) };
 }
 
 /** «Прибрати стару річ»: after a replacement is bought or found, the old item may leave the wardrobe; undo brings it back. */
@@ -338,6 +407,74 @@ function intakeJob(db: DB, photo: Photo, intakeIntent: NonNullable<Job['intakeIn
 
 // Serialize identical uploads from the same wardrobe, including asynchronous HEIC conversion.
 const pendingUploads = new Map<string, Promise<Photo>>();
+/** Perceptual candidates: at most this many of 64 dHash bits differ; sameVisualPhoto then decides. */
+export const DHASH_MAX_DISTANCE = 6;
+/** Older photos hashed per upload at most, so one upload never reads the whole archive. */
+const DHASH_BACKFILL_CAP = 40;
+/** A photo whose file could not be hashed is retried after this long (or as soon as its path changes). */
+const DHASH_MISS_TTL_MS = 10 * 60 * 1000;
+const dhashMisses = new Map<string, number>();
+
+/** The same upload class: a worn look's photos among themselves, every other own photo among the rest. */
+const sameUploadClass = (p: Photo, worn: boolean) => (worn ? p.kind === 'worn' : p.kind !== 'worn' && p.source !== 'generated');
+/** Photos a re-encoded upload may resolve to: own, visible uploads of the same class. */
+const visualPool = (db: DB, worn: boolean) => db.photos.filter((p) => p.source === 'upload' && !p.inspiration && !p.archivedAt && sameUploadClass(p, worn));
+
+/**
+ * Fills in the dHash of earlier visible uploads of the class (photos uploaded before hashing existed). A hash is
+ * saved only while the photo still points at the file that was read.
+ */
+async function backfillDhashes(ctx: Ctx, worn: boolean) {
+  const at = Date.now();
+  const missKey = (p: Photo) => `${ctx.store.dataDir}:${p.id}:${p.path}`;
+  const todo = visualPool(ctx.store.read(), worn).filter((p) => !p.dhash && !((dhashMisses.get(missKey(p)) ?? 0) > at)).slice(0, DHASH_BACKFILL_CAP);
+  if (!todo.length) return;
+  const found = new Map<string, { path: string; hash: string }>();
+  for (const p of todo) {
+    let hash: string | undefined;
+    try {
+      const file = resolveAllowed(ctx.projectRoot, ctx.store.dataDir, p.path);
+      hash = fs.existsSync(file) ? await computeDhash(file) : undefined;
+    } catch {
+      hash = undefined;
+    }
+    if (hash) found.set(p.id, { path: p.path, hash });
+    else dhashMisses.set(missKey(p), at + DHASH_MISS_TTL_MS);
+  }
+  if (!found.size) return;
+  await ctx.store.mutate((db) => {
+    for (const p of db.photos) {
+      const f = found.get(p.id);
+      if (!f || p.dhash || p.path !== f.path) continue;
+      try {
+        if (fs.existsSync(resolveAllowed(ctx.projectRoot, ctx.store.dataDir, p.path))) p.dhash = f.hash;
+      } catch {
+        /* a file outside the data folder is never hashed */
+      }
+    }
+  });
+}
+
+/**
+ * The visible own upload that is the same photograph as the incoming one: a near dHash proposes it, the tight
+ * visual check (aspect ratio + 16×16 RGB difference) confirms it. Undefined keeps the upload a new photo.
+ */
+async function visualDuplicate(ctx: Ctx, worn: boolean, dhash: string, incoming: string | Buffer): Promise<string | undefined> {
+  await backfillDhashes(ctx, worn);
+  const near = visualPool(ctx.store.read(), worn)
+    .filter((p) => p.dhash && dhashDistance(p.dhash, dhash) <= DHASH_MAX_DISTANCE)
+    .sort((a, b) => dhashDistance(a.dhash!, dhash) - dhashDistance(b.dhash!, dhash))
+    .slice(0, 3);
+  for (const p of near) {
+    try {
+      const file = resolveAllowed(ctx.projectRoot, ctx.store.dataDir, p.path);
+      if (fs.existsSync(file) && (await sameVisualPhoto(incoming, file))) return p.id;
+    } catch {
+      /* an unreadable candidate is not a match */
+    }
+  }
+  return undefined;
+}
 
 export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, filename: string): Promise<Photo> {
   const intake = query.get('kind') === 'intake';
@@ -345,21 +482,29 @@ export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, file
   if (!PHOTO_KINDS.includes(kind) || kind === 'source' || kind === 'packshot') throw new HttpError(400, 'Невідомий тип фото');
   const intent = intake ? parseIntakeIntent(query.get('intent')) : 'auto';
   const sha256 = createHash('sha256').update(buf).digest('hex');
-  const key = `${ctx.store.dataDir}:${kind === 'worn'}:${sha256}`;
+  const key = `${ctx.store.dataDir}:${kind === 'worn'}`;
   const previous = pendingUploads.get(key);
   const run = (async () => {
     await previous?.catch(() => undefined);
     const worn = kind === 'worn';
-    const known = (db: DB) => db.photos.find((p) => p.sha256 === sha256 && (worn ? p.kind === 'worn' : p.kind !== 'worn' && p.source !== 'generated'));
+    // The same bytes first (no hashing at all), then the same picture re-encoded, confirmed visually.
+    const bySha = (db: DB) => db.photos.find((p) => p.sha256 === sha256 && sameUploadClass(p, worn));
+    let dhash: string | undefined;
+    let visualId: string | undefined;
+    if (!bySha(ctx.store.read())) {
+      dhash = await computeDhash(buf);
+      if (dhash) visualId = await visualDuplicate(ctx, worn, dhash, buf);
+    }
+    const known = (db: DB) => bySha(db) ?? (visualId ? visualPool(db, worn).find((p) => p.id === visualId) : undefined);
     const id = newId('P');
     let queued = false;
     const apply = (db: DB, saved?: Awaited<ReturnType<typeof saveUpload>>) => {
       let photo = known(db);
       if (!photo) {
         if (!saved) return;
-        photo = { id, kind, ...saved, originalName: path.basename(filename || 'upload').slice(0, 200), source: 'upload', preserveAsReference: true, meetsStandard: kind === 'base' ? null : undefined, sha256, createdAt: now() };
+        photo = { id, kind, ...saved, originalName: path.basename(filename || 'upload').slice(0, 200), source: 'upload', preserveAsReference: true, meetsStandard: kind === 'base' ? null : undefined, sha256, ...(dhash ? { dhash } : {}), createdAt: now() };
         db.photos.push(photo);
-      }
+      } else if (dhash && !photo.dhash && photo.source === 'upload') photo.dhash = dhash;
       delete photo.archivedAt;
       if (worn) return photo;
       if (kind === 'base') {
@@ -373,6 +518,7 @@ export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, file
         if (attachItemPhoto(item, photo) && !intake && kind === 'item') {
           clearStaleCrop(item, photo);
           queued = queueMissingItemPackshots(db, [itemId]) > 0;
+          queued = resumeWaitingTryonsForRef(db, 'item', itemId, ctx.autoTryOn).length > 0 || queued;
         }
       }
       const productId = query.get('product');
@@ -381,6 +527,9 @@ export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, file
         if (product.photoId !== photo.id) {
           product.photoId = photo.id;
           bump(product, undefined);
+          // Try-ons waiting for this purchase's picture can start now.
+          queued = resumeWaitingTryonsForRef(db, 'need', product.needId, ctx.autoTryOn).length > 0 || queued;
+          queued = resumeWaitingTryonsForRef(db, 'product', product.id, ctx.autoTryOn).length > 0 || queued;
         }
       }
       if (intake && (query.get('reanalyze') === '1' || !db.jobs.some((j) =>
@@ -399,9 +548,15 @@ export async function upload(ctx: Ctx, query: URLSearchParams, buf: Buffer, file
       if (ctx.limits) await checkStorage(ctx, ctx.limits, buf.length);
       const saved = await saveUpload(ctx.projectRoot, ctx.store.dataDir, id, buf);
       try {
+        // A HEIC original sharp cannot read is hashed from its JPEG display copy.
+        if (!dhash && saved.originalPath && !bySha(ctx.store.read())) {
+          const display = path.join(ctx.projectRoot, saved.path);
+          dhash = await computeDhash(display);
+          if (dhash) visualId = await visualDuplicate(ctx, worn, dhash, display);
+        }
         photo = (await ctx.store.mutate((db) => apply(db, saved)))!;
       } finally {
-        // Another process may have registered the same bytes while this request saved them.
+        // Another process may have registered the same picture while this request saved it.
         if (photo?.id !== id) for (const rel of [saved.path, saved.originalPath]) if (rel) fs.rmSync(path.join(ctx.projectRoot, rel), { force: true });
       }
       if (photo.id === id) prewarm(ctx.projectRoot, ctx.store.dataDir, [saved.path]);
@@ -475,29 +630,39 @@ export function deleteCapsule(db: DB, id: string) {
     if (other.redirectCapsuleIds?.includes(id)) other.redirectCapsuleIds = other.redirectCapsuleIds.filter((target) => target !== id);
   }
   for (const j of db.jobs) if (j.capsuleId === id) delete j.capsuleId;
+  for (const n of db.needs) {
+    if (!n.coveredCapsuleIds?.includes(id)) continue;
+    n.coveredCapsuleIds = n.coveredCapsuleIds.filter((c) => c !== id);
+    if (!n.coveredCapsuleIds.length) delete n.coveredCapsuleIds;
+  }
   if (db.onboarding?.matchDrafts) db.onboarding.matchDrafts = db.onboarding.matchDrafts.filter((m) => m.capsuleId !== id);
   db.capsules = db.capsules.filter((x) => x.id !== id);
 }
 
 function stripRefs(db: DB, kind: SlotRef['kind'], id: string) {
   stripFromSets(db, kind, id);
+  const changed: string[] = [];
   for (const look of db.looks) {
     const next = cleanSlots(look.slots);
     for (const k of SLOT_KEYS) next[k] = next[k].filter((r) => !(r.kind === kind && r.id === id));
     if (setLookSlots(look, next, 'Видалено річ зі складу')) {
       look.rev += 1;
       look.updatedAt = now();
+      changed.push(look.id);
     }
   }
+  return changed;
 }
 
-export function deleteItem(db: DB, id: string) {
+/** Removes an item everywhere; returns the looks whose pieces changed (the caller queues their try-ons). */
+export function deleteItem(db: DB, id: string): string[] {
   const item = findOr404(db.items, id, 'Річ');
   if (db.products.some((p) => p.purchasedItemId === id)) throw new HttpError(409, 'Річ створена покупкою — скасуй покупку в «Покупках» (✎ → «Скасувати покупку»)');
   busyJob(db, (j) => j.itemId === id);
+  const changed: string[] = [];
   // A deleted item no longer covers a recommendation: its looks get the stand-in back.
-  for (const n of db.needs) if (n.coveredByItem === id && n.status === 'covered') uncoverNeed(db, n.id);
-  stripRefs(db, 'item', id);
+  for (const n of db.needs) if (n.coveredByItem === id && n.status === 'covered') changed.push(...uncoverNeed(db, n.id, false).looks);
+  changed.push(...stripRefs(db, 'item', id));
   dropJobs(db, (j) => j.kind === 'packshot' && j.itemId === id);
   if (item.packshotId && !db.items.some((other) => other.id !== id && (other.packshotId === item.packshotId || other.photoIds.includes(item.packshotId!)))
     && !db.products.some((product) => product.photoId === item.packshotId)
@@ -523,6 +688,7 @@ export function deleteItem(db: DB, id: string) {
   if (db.onboarding?.unmatchedItemIds) db.onboarding.unmatchedItemIds = db.onboarding.unmatchedItemIds.filter((x) => x !== id);
   for (const other of db.items) if (other.possibleDuplicateOf === id) delete other.possibleDuplicateOf;
   db.items = db.items.filter((i) => i.id !== id);
+  return [...new Set(changed)];
 }
 
 const MEASURE_UK: Record<(typeof MEASURE_KEYS)[number], string> = { height: 'зріст', chest: 'груди', waist: 'талія', hips: 'стегна', shoulders: 'плечі', sleeve: 'довжина рукава', inseam: 'внутрішній шов', foot: 'довжина стопи' };
@@ -592,7 +758,7 @@ on('PATCH', '/api/items/:id', async (ctx, [id], b) => {
     if (b.category && CATEGORIES.includes(b.category as never)) item.category = b.category as Item['category'];
     if (b.status && ITEM_STATUSES.includes(b.status as never)) item.status = b.status as Item['status'];
     // «Це моя річ? — Ні»: a rejected item no longer covers a recommendation; its looks get the stand-in back.
-    if (item.status === 'inactive' && before !== 'inactive') for (const n of db.needs) if (n.coveredByItem === item.id && n.status === 'covered' && !db.products.some((p) => p.needId === n.id && p.status === 'purchased')) uncoverNeed(db, n.id);
+    if (item.status === 'inactive' && before !== 'inactive') for (const n of db.needs) if (n.coveredByItem === item.id && n.status === 'covered' && !db.products.some((p) => p.needId === n.id && p.status === 'purchased')) uncoverNeed(db, n.id, ctx.autoTryOn);
     if (Array.isArray(b.photoIds)) item.photoIds = (b.photoIds as string[]).filter((pid) => db.photos.some((p) => p.id === pid && p.kind !== 'worn' && !p.archivedAt));
     if (b.packshotId !== undefined) {
       const cover = itemCoverOptions(db, [item]).find((photo) => photo.id === b.packshotId);
@@ -602,7 +768,7 @@ on('PATCH', '/api/items/:id', async (ctx, [id], b) => {
     clearDetachedCrop(db, item);
     if (!item.title) throw new HttpError(400, 'Назва не може бути порожньою');
     history(item, before !== item.status ? `status:${item.status}` : 'edited');
-    if (item.status === 'inactive') dropReplacementsFor(db, item.id);
+    if (item.status === 'inactive') queueChangedLookRenders(db, dropReplacementsFor(db, item.id), ctx.autoTryOn);
     if (b.clearDuplicate === true) {
       delete item.possibleDuplicateOf;
       queueMissingItemPackshots(db, [item.id]);
@@ -788,13 +954,14 @@ on('POST', '/api/items/:id/split', (ctx, [id], b) =>
 );
 
 // Batch confirmation/removal during Step 3 wardrobe triage (without opening every item page one by one).
-on('POST', '/api/items/batch-status', (ctx, _p, b) =>
-  ctx.store.mutate((db) => {
+on('POST', '/api/items/batch-status', async (ctx, _p, b) => {
+  const out = await ctx.store.mutate((db) => {
     const status = str(b.status) as Item['status'];
     if (status !== 'confirmed' && status !== 'inactive') throw new HttpError(400, 'Невідомий статус');
     const ids = [...new Set((Array.isArray(b.ids) ? b.ids : []).filter((x): x is string => typeof x === 'string'))];
     if (!ids.length) return { updated: 0 };
     let updated = 0;
+    const changed: string[] = [];
     for (const id of ids) {
       const item = db.items.find((i) => i.id === id && !i.mergedInto);
       if (!item || item.status === status) continue;
@@ -802,12 +969,22 @@ on('POST', '/api/items/batch-status', (ctx, _p, b) =>
       item.rev += 1;
       item.updatedAt = now();
       history(item, `status:${status}`);
-      if (status === 'inactive') dropReplacementsFor(db, item.id);
+      if (status === 'inactive') {
+        // Like «Це моя річ? — Ні» on one item: it no longer covers a recommendation, and its replacement purchase goes.
+        for (const n of db.needs) if (n.coveredByItem === item.id && n.status === 'covered' && !db.products.some((p) => p.needId === n.id && p.status === 'purchased')) changed.push(...uncoverNeed(db, n.id, false).looks);
+        changed.push(...dropReplacementsFor(db, item.id));
+      }
       updated += 1;
     }
+    if (updated) {
+      queueChangedLookRenders(db, changed, ctx.autoTryOn);
+      queueAdvice(db, status === 'confirmed' ? `Підтверджено речей: ${updated}` : `Прибрано речей: ${updated}`);
+    }
     return { updated };
-  }),
-);
+  });
+  ctx.drain();
+  return out;
+});
 
 // ── Capsules & looks ───────────────────────────────────────────────────────
 function setAccessoryLimit(capsule: Capsule, limit: unknown) {
@@ -904,11 +1081,13 @@ on('POST', '/api/suggestions/:id/accept', async (ctx, [id]) => {
     if (s.status !== 'open') throw new HttpError(409, 'Пропозицію вже розглянуто');
     // A look made meanwhile may already be this one (look memory, owner 19.11).
     if (s.looks.some((l) => db.looks.some((x) => tooClose(db, withBuys(l.slots, l.buy), x.slots)))) throw new HttpError(409, 'Вже є схожий образ');
-    const firstNew = db.looks.length;
-    const href = acceptSuggestion(db, s);
-    if (ctx.autoTryOn !== false) queueNewLookRenders(db, db.looks.slice(firstNew).map((look) => look.id));
+    const accepted = acceptSuggestion(db, s);
+    // New looks and the capsule's looks a purchase took a place in get their try-ons; new purchases get their picture.
+    if (ctx.autoTryOn !== false) queueNewLookRenders(db, accepted.lookIds);
+    queueChangedLookRenders(db, accepted.modifiedLookIds, ctx.autoTryOn);
+    queueMissingNeedPackshots(db, accepted.needIds);
     queueAdvice(db, `Додано пропозицію: ${s.name}`);
-    return { href };
+    return { href: accepted.href };
   });
   ctx.drain();
   return out;
@@ -1289,8 +1468,8 @@ on('PATCH', '/api/comparisons/:id', (ctx, [id], b) =>
 );
 
 // ── Shopping ───────────────────────────────────────────────────────────────
-on('POST', '/api/needs', (ctx, _p, b) =>
-  ctx.store.mutate((db) => {
+on('POST', '/api/needs', async (ctx, _p, b) => {
+  const out = await ctx.store.mutate((db) => {
     const category = str(b.category) as Item['category'];
     if (!CATEGORIES.includes(category)) throw new HttpError(400, 'Вибери категорію');
     const at = now();
@@ -1299,15 +1478,21 @@ on('POST', '/api/needs', (ctx, _p, b) =>
     const forCapsule = str(b.forCapsule);
     if (forCapsule) need.forCapsule = requireParentCapsule(db, forCapsule).id;
     db.needs.push(need);
+    queueMissingNeedPackshots(db, [need.id]);
     return need;
-  }),
-);
+  });
+  ctx.drain();
+  return out;
+});
 
 on('PATCH', '/api/needs/:id', (ctx, [id], b) =>
   ctx.store.mutate((db) => {
     const need = findOr404(db.needs, id, 'Потреба');
     bump(need, b.rev);
     pick(need, b, ['title', 'description', 'why', 'fitCheck']);
+    // Cleared texts stay empty strings: prompts and the shopping list read them as text.
+    for (const f of ['description', 'why', 'fitCheck'] as const) need[f] ??= '';
+    if (!need.title) throw new HttpError(400, 'Назва не може бути порожньою');
     if (b.priority === 'core' || b.priority === 'optional') need.priority = b.priority;
     if (b.status === 'open' || b.status === 'covered') need.status = b.status;
     return need;
@@ -1348,7 +1533,7 @@ on('POST', '/api/needs/:id/cover', async (ctx, [id], b) => {
       db.items.push(item);
       itemId = item.id;
     }
-    const res = coverNeed(db, id, itemId);
+    const res = coverNeed(db, id, itemId, ctx.autoTryOn);
     if (b.newItem) queueMissingItemPackshots(db, [itemId]);
     retireReplaced(db, res.need, b.retire);
     queueAdvice(db, `Вже маю: ${res.need.title}`);
@@ -1360,7 +1545,7 @@ on('POST', '/api/needs/:id/cover', async (ctx, [id], b) => {
 
 on('POST', '/api/needs/:id/uncover', async (ctx, [id]) => {
   const out = await ctx.store.mutate((db) => {
-    const res = uncoverNeed(db, id);
+    const res = uncoverNeed(db, id, ctx.autoTryOn);
     queueAdvice(db, `Повернуто в покупки: ${res.need.title}`);
     return res;
   });
@@ -1437,14 +1622,17 @@ on('POST', '/api/products/:id/purchase', async (ctx, [id], b) => {
     need.coveredByItem = item.id;
     // Every shop option of the bought need leaves the looks too, not only the one bought.
     const options = new Set(db.products.filter((x) => x.needId === need.id && (x.status !== 'purchased' || x.id === p.id)).map((x) => x.id));
-    const looks = replaceRefs(db, (r) => (r.kind === 'need' && r.id === need.id) || (r.kind === 'product' && options.has(r.id)) || (r.kind === 'item' && r.id === need.replaces), { kind: 'item', id: item.id }, `Куплено: ${item.title}`);
+    const capsules: string[] = [];
+    const looks = replaceRefs(db, (r) => (r.kind === 'need' && r.id === need.id) || (r.kind === 'product' && options.has(r.id)) || (r.kind === 'item' && r.id === need.replaces), { kind: 'item', id: item.id }, `Куплено: ${item.title}`, undefined, undefined, capsules);
     need.coveredLookIds = looks;
+    if (capsules.length) need.coveredCapsuleIds = [...new Set(capsules)];
+    else delete need.coveredCapsuleIds;
     bump(need, undefined);
     retireReplaced(db, need, b.retire);
     queueMissingItemPackshots(db, [item.id]);
+    const renders = queueChangedLookRenders(db, looks, ctx.autoTryOn);
     queueAdvice(db, `Куплено: ${item.title}`);
-    // The look pages offer «Оновити» for the changed pictures.
-    return { item, renders: [] as Job[] };
+    return { item, renders };
   });
   ctx.drain();
   return out.item;
@@ -1517,9 +1705,39 @@ on('PATCH', '/api/profile', (ctx, _p, b) =>
       prof.allowEyewear = b.allowEyewear;
       if (prof.identity) prof.identity.noGlasses = !b.allowEyewear;
     }
+    // «Крій» / «Уникати крою»: the owner's own choice; null forgets it.
+    if (b.fitProfile === null) delete prof.fitProfile;
+    else if (b.fitProfile !== undefined) {
+      if (typeof b.fitProfile !== 'object' || Array.isArray(b.fitProfile)) throw new HttpError(400, 'Невідомий крій');
+      const raw = b.fitProfile as Body;
+      // A malformed list is refused, never silently read as «no cuts».
+      const cuts = (v: unknown) => v === undefined || (Array.isArray(v) && v.every((x) => typeof x === 'string' && FIT_TYPES.includes(x as FitType)));
+      if (!cuts(raw.preferred) || !cuts(raw.avoid) || (raw.bodySummary !== undefined && typeof raw.bodySummary !== 'string')) throw new HttpError(400, 'Некоректний формат крою');
+      const fit = cleanFit(raw.preferred ?? prof.fitProfile?.preferred, raw.avoid ?? prof.fitProfile?.avoid);
+      const bodySummary = raw.bodySummary !== undefined ? String(raw.bodySummary).trim().slice(0, 240) : prof.fitProfile?.bodySummary;
+      prof.fitProfile = { ...fit, ...(bodySummary ? { bodySummary } : {}), source: 'owner', updatedAt: now() };
+    }
     return prof;
   }),
 );
+
+// «Визначити по фігурі»: the figure on a full-length photo (or the body crop) decides the cuts; without one, the measurements do.
+on('POST', '/api/profile/analyze-fit', async (ctx) => {
+  if (fitPhotoPath(ctx.store.read())) {
+    ctx.admit?.('styling');
+    const job = await ctx.store.mutate((db) => queueFitAnalysis(db));
+    ctx.drain();
+    return { job };
+  }
+  const profile = await ctx.store.mutate((db) => {
+    const fit = suggestFitFromMeasurements(db.profile);
+    if (!fit) throw new HttpError(400, 'Додай фото на повний зріст або мірки грудей і талії');
+    db.profile.fitProfile = fit;
+    db.profile.rev += 1;
+    return db.profile;
+  });
+  return { profile };
+});
 
 function isProtectedIdentityPhoto(db: DB, photo: Photo) {
   const identity = db.profile.identity;
@@ -1565,8 +1783,10 @@ on('PATCH', '/api/photos/:id', async (ctx, [id], b) => {
       assertEditablePhoto(p);
       const item = findOr404(db.items, b.attachItemId, 'Річ');
       delete p.archivedAt;
-      if (attachItemPhoto(item, p)) clearStaleCrop(item, p);
+      const attached = attachItemPhoto(item, p);
+      if (attached) clearStaleCrop(item, p);
       queued = queueMissingItemPackshots(db, [item.id]) > 0;
+      if (attached && p.source !== 'generated') queued = resumeWaitingTryonsForRef(db, 'item', item.id, ctx.autoTryOn).length > 0 || queued;
     }
     if (b.archived === true) {
       if (isProtectedIdentityPhoto(db, p)) throw new HttpError(409, 'Фото використовується як опора зовнішності');
@@ -1632,8 +1852,9 @@ on('POST', '/api/capsules/from-style', (ctx, _p, b) =>
 on('DELETE', '/api/looks/:id', (ctx, [id]) => ctx.store.mutate((db) => deleteLook(db, id)));
 on('DELETE', '/api/items/:id', async (ctx, [id]) => {
   await ctx.store.mutate((db) => {
-    dropReplacementsFor(db, id);
-    deleteItem(db, id);
+    const changed = dropReplacementsFor(db, id);
+    changed.push(...deleteItem(db, id));
+    queueChangedLookRenders(db, changed, ctx.autoTryOn);
     queueAdvice(db, 'Видалено річ');
   });
   ctx.drain();
@@ -1643,7 +1864,7 @@ on('DELETE', '/api/items/:id', async (ctx, [id]) => {
 on('POST', '/api/items/:id/keep', async (ctx, [id]) => {
   const out = await ctx.store.mutate((db) => {
     const item = findOr404(db.items, id, 'Річ');
-    keepItem(db, item);
+    queueChangedLookRenders(db, keepItem(db, item), ctx.autoTryOn);
     queueAdvice(db, `Власник залишає річ: ${item.title}`);
     return item;
   });
@@ -1689,17 +1910,19 @@ on('POST', '/api/products/:id/unpurchase', async (ctx, [id]) => {
     p.status = 'option';
     delete p.purchasedItemId;
     bump(p, undefined);
+    const changed: string[] = [];
     if (item?.mergedFrom?.length) {
       // A merged item can also represent an independently owned piece or another purchase.
       const need = db.needs.find((n) => n.id === p.needId && n.coveredByItem === item.id && n.status === 'covered');
-      if (need && !db.products.some((other) => other.needId === need.id && other.status === 'purchased')) uncoverNeed(db, need.id);
+      if (need && !db.products.some((other) => other.needId === need.id && other.status === 'purchased')) changed.push(...uncoverNeed(db, need.id, false).looks);
       if (item.purchasedFromProduct === p.id) {
         const remaining = db.products.find((other) => other.purchasedItemId === item.id && other.status === 'purchased');
         if (remaining) item.purchasedFromProduct = remaining.id;
         else delete item.purchasedFromProduct;
         bump(item, undefined);
       }
-    } else if (item) deleteItem(db, item.id);
+    } else if (item) changed.push(...deleteItem(db, item.id));
+    queueChangedLookRenders(db, changed, ctx.autoTryOn);
     queueAdvice(db, `Скасовано покупку: ${p.model}`);
     return p;
   });
@@ -1753,9 +1976,15 @@ on('POST', '/api/onboarding/match-capsules', async (ctx, _p, b) => {
   return job;
 });
 
-on('POST', '/api/onboarding/approve-sets', (ctx, _p, b) =>
-  ctx.store.mutate((db) => approveSets(db, Array.isArray(b.sets) ? (b.sets as ApprovedSetInput[]) : [])),
-);
+on('POST', '/api/onboarding/approve-sets', async (ctx, _p, b) => {
+  const out = await ctx.store.mutate((db) => {
+    const res = approveSets(db, Array.isArray(b.sets) ? (b.sets as ApprovedSetInput[]) : []);
+    queueMissingNeedPackshots(db, res.needIds);
+    return res;
+  });
+  ctx.drain();
+  return out;
+});
 
 on('PATCH', '/api/onboarding', (ctx, _p, b) =>
   ctx.store.mutate((db) => {

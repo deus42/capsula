@@ -125,16 +125,19 @@ export function setCapsulePieces(db: DB, capsule: Capsule, rawPieces: unknown, r
   else delete capsule.base;
 }
 
-/** A piece replaced across looks (merge, purchase, undo) is replaced in capsule sets too. */
-export function replaceInSets(db: DB, match: (r: SlotRef) => boolean, replacement: SlotRef, capsuleIds?: Set<string>) {
+/** A piece replaced across looks (merge, purchase, undo) is replaced in capsule sets too. Returns the changed capsules. */
+export function replaceInSets(db: DB, match: (r: SlotRef) => boolean, replacement: SlotRef, capsuleIds?: Set<string>): string[] {
   const next = normalizePiece(db, replacement);
+  const changed: string[] = [];
   for (const c of db.capsules) {
     if (!c.pieces || (capsuleIds && !capsuleIds.has(c.id))) continue;
     if (!c.pieces.some(match) && !(c.base ?? []).some(match)) continue;
     c.pieces = unique(db, c.pieces.map((r) => (match(r) ? next : r)));
     if (c.base) c.base = unique(db, c.base.map((r) => (match(r) ? next : r)));
     bump(c, undefined);
+    changed.push(c.id);
   }
+  return changed;
 }
 
 /** A deleted item or purchase leaves every capsule set. */
@@ -154,9 +157,11 @@ export function stripFromSets(db: DB, kind: SlotRef['kind'], id: string) {
 /**
  * A purchase accepted with a proposed look (owner, 20.11): it fills a free place of the capsule's set, or takes the
  * place of the set piece it replaces — in the set, its base and the capsule's visible looks (each gets a new version).
+ * Returns the looks whose pieces changed.
  */
-export function placePurchaseInSet(db: DB, capsule: Capsule, purchase: SlotRef, replaces?: string) {
-  if (!capsule.pieces || inSavedSet(db, capsule, purchase)) return;
+export function placePurchaseInSet(db: DB, capsule: Capsule, purchase: SlotRef, replaces?: string): string[] {
+  const changed: string[] = [];
+  if (!capsule.pieces || inSavedSet(db, capsule, purchase)) return changed;
   if (replaces) {
     const from = capsule.pieces.find((r) => pieceKey(r) === replaces);
     if (!from) throw new HttpError(409, 'Річ, яку замінює покупка, уже не в наборі капсули');
@@ -173,6 +178,7 @@ export function placePurchaseInSet(db: DB, capsule: Capsule, purchase: SlotRef, 
       look.versions.push({ version: look.version, slots, at, note: `Набір капсули: покупка замість «${title}»` });
       look.rev += 1;
       look.updatedAt = at;
+      changed.push(look.id);
     }
   } else {
     const category = pieceCategory(db, purchase);
@@ -181,4 +187,5 @@ export function placePurchaseInSet(db: DB, capsule: Capsule, purchase: SlotRef, 
     capsule.pieces = [...capsule.pieces, normalizePiece(db, purchase)];
   }
   bump(capsule, undefined);
+  return changed;
 }

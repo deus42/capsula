@@ -448,7 +448,17 @@ function StepWardrobe({ onNext }: { onNext: () => void }) {
     if (!list.length) return;
     setUploading(true);
     await act(async () => {
-      for (const f of list) await uploadFile(f, { kind: 'intake', batch: '1', intent: 'garments' });
+      // Every photo of a batch is queued before the runner starts, so the burst ends with one advisor run.
+      let sent = 0;
+      try {
+        for (const [i, f] of list.entries()) {
+          await uploadFile(f, { kind: 'intake', batch: '1', intent: 'garments', ...(i < list.length - 1 ? { run: '0' } : {}) });
+          sent += 1;
+        }
+      } finally {
+        // A failed upload partway: the photos already queued still get processed.
+        if (sent > 0 && sent < list.length) await api('POST', '/api/runner/run').catch(() => undefined);
+      }
     }, list.length > 1 ? t('Додано фото: {n}', { n: list.length }) : t('Фото додано'));
     setUploading(false);
     if (input.current) input.current.value = '';

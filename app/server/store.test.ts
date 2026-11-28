@@ -25,6 +25,19 @@ import { applyDiscover, discoverPrompt } from './discover.ts';
 import { stylistContext } from './stylist-context.ts';
 import { CAPSULE_LIMITS, capsuleCombinations, capsuleSet, combinationGains } from '../src/capsule-pieces.ts';
 import { capsuleSetsReport } from './capsule-sets.ts';
+import { computeDhash, dhashDistance } from './media.ts';
+import { DHASH_MAX_DISTANCE, queueMissingNeedPackshots, queueNewLookRenders, resumeWaitingTryonsForRef } from './routes.ts';
+import { colourFamilies, intakeComparisonGroups, stem } from './analysis.ts';
+import { FIT_ANALYSIS_SCHEMA, cleanFit, fitPromptBlock, suggestFitFromMeasurements, violatesAvoidedFit } from './fit.ts';
+import { SHOP_SEARCH_SCHEMA, pageImage } from './shop-search.ts';
+import { Readable } from 'node:stream';
+import { fetchProductImage, normalizeProductImage, pinnedLookup, privateAddress, publicAddress, publicGet, type PublicResponse } from './shop-search.ts';
+import { sameVisualPhoto, saveUpload } from './media.ts';
+import { finishIntakeBurst, fullerSnapshot, slotPhotoPaths } from './runner.ts';
+import { keepItem, replacementHeld } from './advisor.ts';
+import { coverNeed, deleteCapsule, needGarmentPhotos, uncoverNeed } from './routes.ts';
+import { applyFitAnalysis, fitPhotoPath, queueFitAnalysis } from './fit.ts';
+import { visualDedupPrompt } from './analysis.ts';
 
 const at = '2026-11-17T00:00:00.000Z';
 const SAMPLE_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6FuoAAAAASUVORK5CYII=', 'base64');
@@ -1665,13 +1678,13 @@ test('an upload that is an open recommendation leaves the shopping list, replace
   const tee = store.read().items.find((i) => i.title === 'Молочна футболка з емблемою')!;
   const r = await call('POST', '/api/needs/N-1/cover', { itemId: tee.id });
   let db = store.read();
-  assert.deepEqual(r, { looks: 1, queued: 0, waiting: 0 }, 'pictures update only when the owner asks');
+  assert.deepEqual(r, { looks: 1, queued: 1, waiting: 0 }, 'the changed look gets a fresh try-on by itself');
   assert.equal(db.needs[0].status, 'covered');
   assert.equal(db.needs[0].coveredByItem, tee.id);
   assert.deepEqual(db.needs[0].coveredLookIds, ['L-1']);
   assert.deepEqual(db.looks[0].slots.top, [{ kind: 'item', id: tee.id }]);
   assert.equal(db.looks[0].version, 2);
-  assert.ok(!db.jobs.some((j) => j.lookId === 'L-1'), 'no automatic try-on');
+  assert.ok(db.jobs.some((j) => j.lookId === 'L-1' && j.lookVersion === 2 && j.state === 'queued'), 'try-on of the new composition queued');
   await assert.rejects(call('POST', '/api/needs/N-1/cover', { itemId: tee.id }), /уже закрито/);
   assert.equal(validateDb(db), null);
 
@@ -1886,6 +1899,8 @@ test('the advisor rates items and looks, proposes looks only on «Додати»
     add('W-T', 'tees', 'White tee');
     add('W-T2', 'tees', 'Milk tee');
     add('W-LOGO', 'tees', 'Big logo tee');
+    // A piece worth replacing is one that is worn somewhere: here, in a fashion capsule's saved set.
+    db.capsules.push({ id: 'C-2', rev: 1, name: 'Logo street', season: 'all', description: '', situations: [], favorite: false, lookIds: [], pieces: [{ kind: 'item', id: 'W-LOGO' }], origin: 'owner', createdAt: at, updatedAt: at });
     db.items.push({ id: 'W-G', rev: 1, category: 'accessories', title: 'Окуляри в черепаховій оправі', status: 'confirmed', photoIds: [], origin: 'manual', history: [], createdAt: at, updatedAt: at });
     db.looks[0].slots = { ...emptySlots(), top: [{ kind: 'item', id: 'W-T' }], bottom: [{ kind: 'item', id: 'W-1' }], shoes: [{ kind: 'item', id: 'W-S' }] };
   });
@@ -1964,6 +1979,8 @@ test('round 5: eyewear stays out of «Підібрати»; advice is stamped wi
   await store.mutate((db) => {
     db.items.push(item('W-S', 'shoes', 'White sneakers'), item('W-G', 'accessories', 'Окуляри в черепаховій оправі'), item('W-POLO', 'shirts', 'Червоне поло', 'manual'));
     db.items.push(item('W-A', 'tees', 'Logo tee A'), item('W-B', 'tees', 'Logo tee B'), item('W-C', 'tees', 'Logo tee C'), item('W-D', 'tees', 'Logo tee D'), item('W-NEW', 'tees', 'Plain tee'));
+    // Only pieces worn somewhere get replacement purchases: these four are in a fashion capsule's saved set.
+    db.capsules.push({ id: 'C-SET', rev: 1, name: 'Logo street', season: 'all', description: '', situations: [], favorite: false, lookIds: [], pieces: ['W-A', 'W-B', 'W-C', 'W-D'].map((id) => ({ kind: 'item' as const, id })), origin: 'owner', createdAt: at, updatedAt: at });
   });
   // «Підібрати» never lists or uses glasses.
   let db = store.read();
@@ -2078,6 +2095,8 @@ test('round 6: a found replacement is not proposed again; stale replacements go;
     ({ id, rev: 1, category, title, status: 'confirmed' as const, photoIds: [], origin, history: [], createdAt: at, updatedAt: at });
   await store.mutate((d) => {
     d.items.push(item('W-S', 'shoes', 'Sneakers'), item('W-A', 'tees', 'Logo tee A'), item('W-NEW', 'tees', 'Plain tee'), item('W-J', 'outerwear', 'Jacket'), item('W-G', 'accessories', 'Окуляри'));
+    // W-A is worn in a look, so it may get a replacement purchase.
+    d.looks[0].slots.top = [{ kind: 'item', id: 'W-A' }];
   });
   const advise = { id: 'J-adv', kind: 'advise' as const, lookVersion: 0, snapshot: { lookName: 'Порадник', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'running' as const, origin: 'site' as const, createdAt: at };
   const empty = { status: 'done', reason: '', items: [], looks: [], newLooks: [], newCapsules: [], newNeeds: [] };
@@ -3318,4 +3337,893 @@ test('deleting a look frees its variants: no variantOf points at a look that is 
   deleteLook(db, base.id);
   assert.equal(db.looks.find((l) => l.id === 'L-2')?.variantOf, undefined);
   assert.equal(validateDb(db), null);
+});
+
+// ── Workflow audit (28.11): dedup, colour, shopping sync, auto re-render, fit ─────────────────────────
+
+/** A photo with real structure (a flat or tiny image has no usable dHash). */
+async function texturedPng(width = 160, height = 120, phase = 0) {
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const v = Math.round(128 + 100 * Math.sin((x + phase) / 23 + y / 37) * Math.cos(y / 29 - x / 41));
+    raw.set([v, v, 255 - v], (y * width + x) * 3);
+  }
+  return sharp(raw, { raw: { width, height, channels: 3 } }).png().toBuffer();
+}
+
+const currentTryon = (db: DB, lookId: string) => {
+  const look = db.looks.find((l) => l.id === lookId)!;
+  return db.jobs.filter((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === lookId && j.lookVersion === look.version).at(-1);
+};
+
+test('dHash: a re-encoded upload is the same photo (older uploads hashed lazily); tiny or flat images never match by accident', async () => {
+  const { dir, store } = setup();
+  const ctx = { store, projectRoot: dir, drain: () => {} };
+  const png = await texturedPng();
+  const jpeg = await sharp(png).resize(120, 90).jpeg({ quality: 70 }).toBuffer();
+  const [a, b] = await Promise.all([computeDhash(png), computeDhash(jpeg)]);
+  assert.match(a!, /^[0-9a-f]{16}$/);
+  assert.ok(dhashDistance(a!, b!) <= DHASH_MAX_DISTANCE, 'resizing and JPEG re-encoding keep the hash');
+  assert.equal(dhashDistance(a!, 'zz'), 64);
+  assert.equal(await computeDhash(Buffer.from('not an image')), undefined);
+  assert.equal(await computeDhash(await sharp({ create: { width: 80, height: 80, channels: 3, background: '#123456' } }).png().toBuffer()), undefined, 'a flat image has a degenerate hash');
+
+  const first = await upload(ctx, new URLSearchParams({ kind: 'intake', intent: 'garments' }), png, 'IMG_1.png');
+  // An upload made before hashing existed has no dHash yet: comparing fills it in.
+  await store.mutate((db) => void delete db.photos.find((p) => p.id === first.id)!.dhash);
+  const again = await upload(ctx, new URLSearchParams({ kind: 'intake', intent: 'garments' }), jpeg, 'IMG_1.jpg');
+  let db = store.read();
+  assert.equal(again.id, first.id, 'the re-encoded copy resolves to the existing photo');
+  assert.equal(db.photos.filter((p) => p.source === 'upload').length, 1, 'no duplicate Photo record');
+  assert.match(db.photos.find((p) => p.id === first.id)!.dhash ?? '', /^[0-9a-f]{16}$/, 'lazily backfilled');
+  assert.equal(fs.readdirSync(path.join(dir, 'media/uploads')).length, 1, 'no duplicate file');
+  assert.equal(db.jobs.filter((j) => j.kind === 'intake').length, 1, 'the duplicate does not queue a second intake');
+  await upload(ctx, new URLSearchParams({ kind: 'intake', intent: 'garments', reanalyze: '1' }), jpeg, 'IMG_1.jpg');
+  assert.equal(store.read().jobs.filter((j) => j.kind === 'intake').length, 2, 'reanalyze=1 asks again');
+
+  // A different picture, and tiny images (no hash), stay separate photos.
+  const other = await upload(ctx, new URLSearchParams({ kind: 'item' }), await texturedPng(160, 120, 400), 'other.png');
+  assert.notEqual(other.id, first.id);
+  const tinyA = await upload(ctx, new URLSearchParams({ kind: 'item' }), await sharp({ create: { width: 16, height: 16, channels: 3, background: '#ff0000' } }).png().toBuffer(), 'a.png');
+  const tinyB = await upload(ctx, new URLSearchParams({ kind: 'item' }), await sharp({ create: { width: 16, height: 16, channels: 3, background: '#00ff00' } }).png().toBuffer(), 'b.png');
+  assert.notEqual(tinyA.id, tinyB.id);
+  assert.equal(tinyA.dhash, undefined);
+  // A worn look photo is its own class: the same picture uploaded as a worn photo is a new record.
+  const worn = await upload(ctx, new URLSearchParams({ kind: 'worn' }), jpeg, 'worn.jpg');
+  assert.notEqual(worn.id, first.id);
+  db = store.read();
+  assert.equal(validateDb(db), null);
+});
+
+test('intake candidates: Ukrainian stems and colour families rank the right tee first; groups stay per category', () => {
+  const db = fixture();
+  assert.equal(stem('біла'), stem('білий'));
+  assert.equal(stem('молочна'), stem('молочний'));
+  assert.equal(stem('футболки'), stem('футболка'));
+  assert.ok(colourFamilies('молочний').has('white') && colourFamilies('біла футболка').has('white'));
+  assert.ok(colourFamilies('блакитна').has('blue') && colourFamilies('темно-синій').has('blue'));
+  assert.ok(colourFamilies('кемел').has('brown') && colourFamilies('пісочні').has('brown'));
+  const tee = (id: string, title: string, color: string, status: 'confirmed' | 'needs_confirmation' = 'confirmed') =>
+    ({ id, rev: 1, category: 'tees' as const, title, color, status, photoIds: [], origin: 'candidate' as const, history: [], createdAt: at, updatedAt: at });
+  db.items.push(
+    tee('W-dark', 'Темна футболка', 'чорний'), tee('W-pink', 'Рожева футболка', 'рожевий'), tee('W-navy', 'Темно-синя футболка', 'темно-синій'),
+    tee('W-milk', 'Молочна футболка з маленькою емблемою', 'молочний'),
+    { ...tee('W-shoe', 'Білі кеди', 'білий'), category: 'shoes' as const },
+  );
+  const garments = [
+    { title: 'Біла футболка', category: 'tees', color: 'біла', notes: 'під розстебнутою курткою', duplicateOf: '' },
+    { title: 'Білі кросівки', category: 'shoes', color: 'білий', notes: '', duplicateOf: '' },
+  ];
+  const groups = intakeComparisonGroups(db, garments);
+  assert.deepEqual([...groups.keys()], ['tees', 'shoes']);
+  assert.equal(groups.get('tees')![0].id, 'W-milk', 'stem + colour family beat other tees');
+  assert.deepEqual(groups.get('shoes')!.map((i) => i.id), ['W-shoe']);
+  // A text match on a confirmed item is checked by the picture too and leads its category.
+  const named = intakeComparisonGroups(db, [{ ...garments[0], duplicateOf: 'W-pink' }]);
+  assert.equal(named.get('tees')![0].id, 'W-pink');
+  assert.equal(intakeComparisonCandidates(db, garments).length, groups.get('tees')!.length + 1);
+});
+
+test('visual dedup: one sheet per category when candidates exceed nine; a high match attaches the photo to a confirmed item', async () => {
+  const { dir, store } = setup();
+  const png = await sharp({ create: { width: 24, height: 24, channels: 3, background: '#ddd' } }).png().toBuffer();
+  await store.mutate((db) => {
+    const add = (id: string, category: 'tees' | 'outerwear' | 'shoes', title: string, color: string) => {
+      const cover = testPackshot(db, `P-${id}`);
+      fs.mkdirSync(path.join(dir, 'media'), { recursive: true });
+      fs.writeFileSync(path.join(dir, cover.path), png);
+      db.items.push({ id, rev: 1, category, title, color, status: 'confirmed', photoIds: [], packshotId: cover.id, origin: 'candidate', history: [], createdAt: at, updatedAt: at });
+    };
+    for (let i = 0; i < 9; i++) add(`W-t${i}`, 'tees', i % 2 ? 'Рожева футболка' : 'Темна футболка', i % 2 ? 'рожевий' : 'чорний');
+    add('W-milk', 'tees', 'Молочна футболка з маленькою емблемою', 'молочний');
+    for (let i = 0; i < 3; i++) add(`W-o${i}`, 'outerwear', 'Темна куртка', 'чорний');
+    for (let i = 0; i < 3; i++) add(`W-s${i}`, 'shoes', 'Білі кеди', 'білий');
+  });
+  const uploaded = await upload({ store, projectRoot: dir, drain: () => {} }, new URLSearchParams({ kind: 'intake', intent: 'garments' }), png, 'mirror.png');
+  const sheets: string[] = [];
+  const engine = {
+    label: 'test', imageLabel: 'test',
+    json: async ({ schema, prompt }: { schema: object; prompt: string }) => {
+      if (schema === INTAKE_SCHEMA) return { reply: { status: 'done', photoType: 'person_partial', garments: [
+        { title: 'Темна куртка', category: 'outerwear', color: 'чорний', notes: 'розстебнута', duplicateOf: '', coversNeed: '' },
+        { title: 'Біла футболка', category: 'tees', color: 'біла', notes: 'видно лише виріз', duplicateOf: '', coversNeed: '' },
+        { title: 'Білі кеди', category: 'shoes', color: 'білий', notes: '', duplicateOf: '', coversNeed: '' },
+      ] } };
+      assert.equal(schema, VISUAL_DEDUP_SCHEMA);
+      sheets.push(prompt);
+      assert.match(prompt, /plain tee under an open jacket/);
+      if (/\| tees \|/.test(prompt.split('Contact sheet legend')[1])) {
+        assert.match(prompt, /1 \| W-milk \| tees/, 'the colour-family match leads the tees sheet');
+        assert.doesNotMatch(prompt, /\n0 \| outerwear/);
+        return { reply: { matches: [{ garmentIndex: 1, itemId: 'W-milk', confidence: 'high', reason: 'Той самий виріз і молочний колір' }] } };
+      }
+      return { reply: { matches: [] } };
+    },
+    image: async () => { throw new Error('No image generation expected'); },
+  };
+  await createRunner(store, dir, '/usr/bin/false', { engine: engine as never, canStart: (j) => j.kind === 'intake' }).drain();
+  const db = store.read();
+  assert.equal(sheets.length, 3, '9 tees + 3 jackets + 3 shoes → one sheet per category');
+  assert.ok(sheets.every((p) => (p.split('Contact sheet legend')[1].match(/\n\d+ \|/g) ?? []).length <= 9));
+  const milk = db.items.find((i) => i.id === 'W-milk')!;
+  assert.ok(milk.photoIds.includes(uploaded.id), 'the visually confirmed duplicate takes the photo');
+  assert.equal(milk.status, 'confirmed');
+  assert.ok(!db.items.some((i) => i.title === 'Біла футболка'), 'no duplicate card');
+  const job = db.jobs.find((j) => j.kind === 'intake')!;
+  assert.ok(job.attachedItemIds?.includes('W-milk'));
+  assert.equal(job.createdItemIds?.length, 2);
+  assert.equal(validateDb(db), null);
+});
+
+test('applyIntake: high visual match attaches to a confirmed item; text-only or possible matches stay a marked candidate', () => {
+  const db = fixture();
+  db.items[0].status = 'confirmed';
+  db.photos.push({ id: 'P-up', kind: 'item', path: 'media/uploads/up.png', originalName: 'up.png', source: 'upload', createdAt: at });
+  const job = { id: 'J-i', kind: 'intake' as const, inputPhotoIds: ['P-up'], lookVersion: 0, snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'running' as const, origin: 'site' as const, createdAt: at };
+  const garment = { title: 'Сині чіноси', category: 'trousers', color: 'синій', notes: '', duplicateOf: 'W-1' };
+  const text = applyIntake(db, job, { status: 'done', reason: '', photoType: 'garments_only', garments: [garment] });
+  assert.equal(db.items.find((i) => i.id === text.created[0])!.possibleDuplicateOf, 'W-1');
+  const possible = applyIntake(db, job, { status: 'done', reason: '', photoType: 'garments_only', garments: [{ ...garment, title: 'Інші чіноси', duplicateConfidence: 'possible' }] });
+  assert.equal(possible.created.length, 1);
+  const high = applyIntake(db, job, { status: 'done', reason: '', photoType: 'garments_only', garments: [{ ...garment, title: 'Ще чіноси', duplicateConfidence: 'high' }] });
+  assert.deepEqual(high, { ...high, created: [], attachedTo: ['W-1'] });
+  assert.ok(db.items[0].photoIds.includes('P-up'));
+  assert.match(db.items[0].history.at(-1)!.note ?? '', /підтверджено за фото/);
+});
+
+test('intake prompt calibrates pale colours and lets a newly bought piece with its tag cover a purchase; packshots keep the photo colour', () => {
+  const db = fixture();
+  const job = { id: 'J', kind: 'intake' as const, inputPhotoIds: ['P-1'], lookVersion: 0, snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'queued' as const, origin: 'site' as const, createdAt: at };
+  db.needs[0].why = 'база під піджак';
+  const prompt = intakePrompt(db, job, ['a.jpeg']);
+  assert.match(prompt, /Light blue \/ sky blue is NOT white/);
+  assert.match(prompt, /Cream, ivory, milk and ecru are NOT pure white/);
+  assert.match(prompt, /store tag or label still attached/);
+  assert.match(prompt, /Skip only web-store screenshots and catalogue listings/);
+  assert.match(prompt, /N-1 \| футболки \| Молочна футболка \| однотонна \| база під піджак/);
+  const packshot = packshotJob(db, { itemId: 'W-1' });
+  assert.match(buildPackshotPrompt(packshot, '/tmp/r.png'), /never bleach a pale blue or cream garment to pure white/);
+});
+
+test('a burst of batch uploads queues one advisor run after the last intake', async () => {
+  const { dir, store } = setup();
+  await store.mutate((db) => {
+    for (const id of ['J-b1', 'J-b2']) db.jobs.push({ id, kind: 'intake', batch: true, inputPhotoIds: ['P-1'], lookVersion: 0, snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'queued', origin: 'site', createdAt: at });
+  });
+  const advisedWhile: string[][] = [];
+  const engine = {
+    label: 'test', imageLabel: 'test',
+    json: async () => {
+      advisedWhile.push(store.read().jobs.filter((j) => j.kind === 'advise').map((j) => j.id));
+      return { reply: { status: 'done', photoType: 'garments_only', garments: [{ title: `Футболка ${advisedWhile.length}`, category: 'tees', color: 'синій', notes: '', duplicateOf: '', coversNeed: '' }] } };
+    },
+    image: async () => { throw new Error('No image generation expected'); },
+  };
+  await createRunner(store, dir, '/usr/bin/false', { engine: engine as never, canStart: (j) => j.kind === 'intake' }).drain();
+  const db = store.read();
+  assert.deepEqual(advisedWhile, [[], []], 'no advisor run while the burst is still being read');
+  const advise = db.jobs.filter((j) => j.kind === 'advise');
+  assert.equal(advise.length, 1, 'one consolidated run');
+  assert.equal(advise[0].state, 'queued');
+});
+
+test('advisor coveredNeeds close matching purchases, re-render their looks and picture new purchases', async () => {
+  const { dir, store } = setup();
+  await store.mutate((db) => {
+    db.profile.basePhotoIds = ['P-1'];
+    db.items.push({ id: 'W-TEE', rev: 1, category: 'tees', title: 'Молочна футболка', color: 'молочний', status: 'confirmed', photoIds: ['P-2'], origin: 'intake', history: [], createdAt: at, updatedAt: at });
+    db.needs.push({ id: 'N-R', rev: 1, title: 'Однотонне поло', category: 'tees', priority: 'optional', description: '', why: '', fitCheck: '', status: 'open', origin: 'owner', replaces: 'W-TEE', createdAt: at, updatedAt: at });
+    db.jobs.push({ id: 'J-adv', kind: 'advise', lookVersion: 0, snapshot: { lookName: 'Порадник', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: 'Підтверджено речей: 1', state: 'queued', origin: 'site', createdAt: at });
+  });
+  let prompt = '';
+  const engine = {
+    label: 'test', imageLabel: 'test',
+    json: async (req: { schema: object; prompt: string }) => {
+      assert.ok((req.schema as { required: string[] }).required.includes('coveredNeeds'));
+      prompt = req.prompt;
+      return { reply: { status: 'done', reason: '', items: [], looks: [], newLooks: [], newCapsules: [],
+        newNeeds: [{ capsuleId: 'C-1', title: 'Тепла куртка', category: 'outerwear', why: 'Бракує теплого шару.' }],
+        coveredNeeds: [
+          { itemId: 'W-TEE', needId: 'N-R', reason: 'та сама річ, яку замінює' },
+          { itemId: 'W-1', needId: 'N-1', reason: 'інша категорія' },
+          { itemId: 'W-TEE', needId: 'N-1', reason: 'Та сама молочна футболка.' },
+        ] } };
+    },
+    image: async () => { throw new Error('No image generation expected'); },
+  };
+  await createRunner(store, dir, '/usr/bin/false', { engine: engine as never, canStart: (j) => j.kind === 'advise' }).drain();
+  assert.match(prompt, /6\. coveredNeeds/);
+  assert.match(prompt, /N-1 \| tees \| Молочна футболка \| однотонна/);
+  const db = store.read();
+  const n1 = db.needs.find((n) => n.id === 'N-1')!;
+  assert.equal(n1.status, 'covered');
+  assert.equal(n1.coveredByItem, 'W-TEE');
+  assert.equal(db.needs.find((n) => n.id === 'N-R')!.status, 'open', 'never covered by the item it replaces');
+  assert.deepEqual(db.looks[0].slots.top, [{ kind: 'item', id: 'W-TEE' }]);
+  assert.ok(currentTryon(db, 'L-1'), 'the changed look gets a try-on by itself');
+  const jacket = db.needs.find((n) => n.title === 'Тепла куртка')!;
+  assert.ok(db.jobs.some((j) => j.kind === 'packshot' && j.needId === jacket.id && j.state === 'queued'), 'a new purchase gets its concept picture');
+  assert.match(db.jobs.find((j) => j.id === 'J-adv')!.stateNote ?? '', /закрито покупок: 1/);
+  assert.equal(validateDb(db), null);
+});
+
+test('every slot change re-renders its looks by itself: cover, uncover, purchase, unpurchase, delete, batch-status, inactive, accept, withdraw', async () => {
+  const { store, call, drained } = setup();
+  await store.mutate((db) => {
+    db.profile.basePhotoIds = ['P-1'];
+    const add = (id: string, category: 'tees' | 'shoes' | 'outerwear', title: string) => db.items.push({ id, rev: 1, category, title, status: 'confirmed', photoIds: ['P-2'], origin: 'candidate', history: [], createdAt: at, updatedAt: at });
+    add('W-TEE', 'tees', 'Молочна футболка');
+    add('W-S', 'shoes', 'Кеди');
+    add('W-J', 'outerwear', 'Куртка');
+  });
+  const version = () => store.read().looks[0].version;
+  const rendered = () => currentTryon(store.read(), 'L-1');
+
+  await call('POST', '/api/needs/N-1/cover', { itemId: 'W-TEE' });
+  assert.equal(rendered()?.state, 'queued', 'cover');
+  await call('POST', '/api/needs/N-1/uncover');
+  assert.ok(rendered(), 'uncover');
+  const product = await call('POST', '/api/products', { needId: 'N-1', store: 'Shop', model: 'Milk tee' });
+  const bought = await call('POST', `/api/products/${product.id}/purchase`, {});
+  assert.deepEqual(store.read().looks[0].slots.top, [{ kind: 'item', id: bought.id }]);
+  assert.ok(rendered(), 'purchase');
+  let v = version();
+  await call('POST', `/api/products/${product.id}/unpurchase`);
+  assert.ok(version() > v && rendered(), 'unpurchase');
+
+  await call('POST', '/api/needs/N-1/cover', { itemId: 'W-TEE' });
+  v = version();
+  await call('POST', '/api/items/batch-status', { ids: ['W-TEE'], status: 'inactive' });
+  let db = store.read();
+  assert.equal(db.needs[0].status, 'open', 'a batch «not mine» uncovers the purchase');
+  assert.ok(version() > v && rendered(), 'batch-status');
+  assert.ok(db.jobs.some((j) => j.kind === 'advise' && j.state === 'queued'), 'and asks the advisor');
+  const before = drained();
+  await call('POST', '/api/items/batch-status', { ids: ['W-TEE'], status: 'confirmed' });
+  assert.ok(drained() > before);
+
+  await call('POST', '/api/needs/N-1/cover', { itemId: 'W-TEE' });
+  v = version();
+  await call('PATCH', '/api/items/W-TEE', { rev: store.read().items.find((i) => i.id === 'W-TEE')!.rev, status: 'inactive' });
+  assert.ok(version() > v && rendered(), 'PATCH inactive');
+
+  v = version();
+  await call('DELETE', '/api/items/W-1');
+  assert.ok(version() > v && rendered(), 'delete');
+
+  // «Додати» a search look whose purchase takes a set piece's place: the existing capsule look changes too.
+  await store.mutate((d) => {
+    d.looks[0].slots = { ...emptySlots(), top: [{ kind: 'need', id: 'N-1' }], bottom: [{ kind: 'item', id: 'W-2' }] };
+    d.looks[0].versions.push({ version: ++d.looks[0].version, slots: d.looks[0].slots, at });
+    d.items.find((i) => i.id === 'W-TEE')!.status = 'confirmed';
+    d.capsules[0].pieces = [{ kind: 'item', id: 'W-2' }, { kind: 'need', id: 'N-1' }, { kind: 'item', id: 'W-S' }, { kind: 'item', id: 'W-J' }];
+    d.suggestions = [{ id: 'A-buy', kind: 'look', status: 'open', name: 'Сорочка', why: '', capsuleId: 'C-1', source: 'search', jobId: 'J-0', createdAt: at,
+      looks: [{ name: 'Сорочка', why: '', slots: { ...emptySlots(), layer: [{ kind: 'item', id: 'W-J' }], bottom: [{ kind: 'item', id: 'W-2' }], shoes: [{ kind: 'item', id: 'W-S' }] }, buy: [{ slot: 'top', title: 'Блакитна оксфорд-сорочка', category: 'shirts', replaces: 'need:N-1' }] }] }];
+  });
+  v = version();
+  const { href } = await call('POST', '/api/suggestions/A-buy/accept');
+  db = store.read();
+  const added = db.looks.find((l) => `/looks/${l.id}` === href)!;
+  const shirt = db.needs.find((n) => n.title === 'Блакитна оксфорд-сорочка')!;
+  assert.ok(version() > v, 'placePurchaseInSet changed the existing look');
+  assert.ok(currentTryon(db, 'L-1') && currentTryon(db, added.id), 'both the new and the changed look get try-ons');
+  assert.ok(db.jobs.some((j) => j.kind === 'packshot' && j.needId === shirt.id), 'the accepted purchase gets its picture');
+
+  // «Ні» on «варто замінити» withdraws the advisor's purchase from the look that used it.
+  await store.mutate((d) => {
+    d.needs.push({ id: 'N-REP', rev: 1, title: 'Чорна куртка', category: 'outerwear', priority: 'optional', description: '', why: '', fitCheck: '', status: 'open', origin: 'agent', replaces: 'W-J', createdAt: at, updatedAt: at });
+    d.looks[0].slots.layer = [{ kind: 'need', id: 'N-REP' }];
+    d.looks[0].versions.push({ version: ++d.looks[0].version, slots: d.looks[0].slots, at });
+  });
+  v = version();
+  await call('POST', '/api/items/W-J/keep');
+  assert.ok(version() > v && rendered(), 'withdrawReplacement');
+  assert.equal(validateDb(store.read()), null);
+});
+
+test('try-ons that start by hand stay by hand: autoTryOn=false queues no re-render', async () => {
+  const { store, call } = setup(false);
+  await store.mutate((db) => {
+    db.profile.basePhotoIds = ['P-1'];
+    db.items.push({ id: 'W-TEE', rev: 1, category: 'tees', title: 'Молочна футболка', status: 'confirmed', photoIds: [], origin: 'candidate', history: [], createdAt: at, updatedAt: at });
+  });
+  const r = await call('POST', '/api/needs/N-1/cover', { itemId: 'W-TEE' });
+  assert.deepEqual(r, { looks: 1, queued: 0, waiting: 0 });
+  await call('POST', '/api/needs/N-1/uncover');
+  await call('DELETE', '/api/items/W-1');
+  assert.ok(!store.read().jobs.some((j) => (j.kind ?? 'tryon') === 'tryon'));
+});
+
+test('planned purchases render from their concept or shop photo; description-only ones wait, and wake when the picture arrives', async () => {
+  const { dir, store, call } = setup();
+  const db0 = fixture();
+  assert.deepEqual(snapshotSlots(db0, db0.looks[0].slots).find((s) => s.kind === 'need')!.originalPhotoPaths, [], 'description only');
+  db0.photos.push(
+    { id: 'P-prod-low', kind: 'product', path: 'media/products/low.jpg', originalName: 'low.jpg', source: 'generated', createdAt: at },
+    { id: 'P-prod-best', kind: 'product', path: 'media/products/best.jpg', originalName: 'best.jpg', source: 'generated', createdAt: at },
+    { id: 'P-prod-old', kind: 'product', path: 'media/products/old.jpg', originalName: 'old.jpg', source: 'generated', archivedAt: at, createdAt: at },
+  );
+  const product = (id: string, photoId: string, matchScore: number) => ({ id, rev: 1, needId: 'N-1', store: 'S', brand: '', model: id, photoId, matchScore, onlineAvailability: 'unknown' as const, towerAvailability: 'unknown' as const, status: 'option' as const, createdAt: at, updatedAt: at });
+  db0.products.push(product('S-low', 'P-prod-low', 5), product('S-best', 'P-prod-best', 9), product('S-old', 'P-prod-old', 10));
+  assert.deepEqual(snapshotSlots(db0, db0.looks[0].slots).find((s) => s.kind === 'need')!.originalPhotoPaths, ['media/products/best.jpg', 'media/products/low.jpg'], 'shop photos best first, archived skipped');
+  testPackshot(db0, 'P-concept');
+  db0.needs[0].conceptPhotoId = 'P-concept';
+  assert.deepEqual(snapshotSlots(db0, db0.looks[0].slots).find((s) => s.kind === 'need')!.originalPhotoPaths, ['media/P-concept.png', 'media/products/best.jpg', 'media/products/low.jpg'], 'the concept comes first, shop photos stay as fallbacks');
+
+  // A look with a description-only purchase waits; the concept packshot wakes it.
+  await store.mutate((db) => void (db.profile.basePhotoIds = ['P-1']));
+  await call('POST', '/api/jobs', { lookId: 'L-1' });
+  const first = currentTryon(store.read(), 'L-1')!;
+  assert.equal(first.state, 'queued');
+  await store.mutate((db) => {
+    const job = db.jobs.find((j) => j.id === first.id)!;
+    job.state = 'needs_data';
+    job.stateNote = 'Потрібні окремі фото речей: Молочна футболка.';
+  });
+  const fake = path.join(dir, 'fake-codex.sh');
+  fs.writeFileSync(path.join(dir, 'fixture.png'), SAMPLE_PNG);
+  fs.writeFileSync(fake, '#!/bin/sh\nwhile [ $# -gt 0 ]; do case "$1" in -C) d="$2"; shift;; -o) o="$2"; shift;; esac; shift; done\ncat >/dev/null\ncp "$d/../../fixture.png" "$d/result.png"\necho \'{"status":"done"}\' > "$o"\n', { mode: 0o755 });
+  await call('POST', '/api/packshots', { needIds: ['N-1'] });
+  await createRunner(store, dir, fake, { canStart: (j) => j.kind === 'packshot' }).drain();
+  let db = store.read();
+  const resumed = currentTryon(db, 'L-1')!;
+  assert.ok(db.needs[0].conceptPhotoId);
+  assert.notEqual(resumed.id, first.id, 'a fresh try-on replaced the waiting one');
+  assert.equal(resumed.state, 'queued');
+  assert.ok(!db.jobs.some((j) => j.id === first.id), 'the stale waiting job is dropped');
+  assert.deepEqual(resumed.snapshot.slots.find((s) => s.kind === 'need')!.originalPhotoPaths, [db.photos.find((p) => p.id === db.needs[0].conceptPhotoId)!.path]);
+
+  // An item without photos waits; attaching an own photo wakes its look.
+  await store.mutate((d) => {
+    const slots = { ...emptySlots(), bottom: [{ kind: 'item' as const, id: 'W-2' }] };
+    d.looks.push({ id: 'L-2', rev: 1, capsuleId: 'C-1', name: 'Дубль', slots, version: 1, versions: [{ version: 1, slots, at }], favorite: false, origin: 'owner', createdAt: at, updatedAt: at });
+    d.capsules[0].lookIds.push('L-2');
+    d.photos.push({ id: 'P-own', kind: 'item', path: 'assets/photos/own.jpeg', originalName: 'own.jpeg', source: 'upload', createdAt: at });
+  });
+  await store.mutate((d) => void queueNewLookRenders(d, ['L-2']));
+  assert.equal(currentTryon(store.read(), 'L-2')!.state, 'needs_data');
+  await call('PATCH', '/api/photos/P-own', { attachItemId: 'W-2' });
+  db = store.read();
+  assert.equal(currentTryon(db, 'L-2')!.state, 'queued', 'the new real photo resumed the waiting try-on');
+  assert.equal(resumeWaitingTryonsForRef(db, 'item', 'W-2', false).length, 0, 'autoTryOn=false never resumes');
+  assert.equal(validateDb(db), null);
+});
+
+test('a purchase added by hand gets its concept picture once (accepted, approved and advisor purchases are checked in their own tests)', async () => {
+  const { store, call, drained } = setup();
+  const before = drained();
+  const need = await call('POST', '/api/needs', { title: 'Бежевий тренч', category: 'outerwear' });
+  let db = store.read();
+  assert.ok(db.jobs.some((j) => j.kind === 'packshot' && j.needId === need.id && j.state === 'queued'));
+  assert.ok(drained() > before);
+  assert.equal(queueMissingNeedPackshots(db, [need.id]), 0, 'never twice while one is on the way');
+  db.needs.find((n) => n.id === 'N-1')!.conceptPhotoId = testPackshot(db, 'P-c').id;
+  assert.equal(queueMissingNeedPackshots(db, ['N-1', 'N-404']), 0, 'a purchase with a concept or an unknown id gets none');
+});
+
+test('the advisor replaces only pieces worn somewhere, withdraws its replacements for unused ones, and puts capsule gaps into the saved set', () => {
+  const db = fixture();
+  const item = (id: string, title: string) => ({ id, rev: 1, category: 'tees' as const, title, status: 'confirmed' as const, photoIds: [], origin: 'candidate' as const, history: [], createdAt: at, updatedAt: at });
+  db.items.push(item('W-USED', 'Logo tee'), item('W-IDLE', 'Pink tee'), item('W-OLD', 'Old slides'));
+  db.looks[0].slots.top = [{ kind: 'item', id: 'W-USED' }];
+  db.capsules[0].pieces = [{ kind: 'item', id: 'W-USED' }, { kind: 'item', id: 'W-1' }];
+  db.needs.push({ id: 'N-OLD', rev: 1, title: 'Нові шльопанці', category: 'tees', priority: 'optional', description: '', why: '', fitCheck: '', status: 'open', origin: 'agent', replaces: 'W-OLD', createdAt: at, updatedAt: at });
+  const job = { id: 'J-adv', kind: 'advise' as const, lookVersion: 0, snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'running' as const, origin: 'site' as const, createdAt: at };
+  const logo = (id: string) => ({ id, score: 3, note: 'Логотип.', replace: 'великий логотип', replaceWith: `Однотонна футболка ${id}` });
+  const out = applyAdvice(db, job, { status: 'done', reason: '', items: [logo('W-USED'), logo('W-IDLE')], looks: [], newLooks: [], newCapsules: [],
+    newNeeds: [{ capsuleId: 'C-1', title: 'Темно-синій кардиган', category: 'knitwear', why: 'Теплий шар.' }] });
+  assert.deepEqual(db.needs.filter((n) => n.replaces).map((n) => n.replaces), ['W-USED'], 'no replacement for a piece in no look or set; the old one is withdrawn');
+  const cardigan = db.needs.find((n) => n.title === 'Темно-синій кардиган')!;
+  assert.ok(db.capsules[0].pieces!.some((r) => r.kind === 'need' && r.id === cardigan.id), 'the gap takes its free place in the saved set');
+  assert.deepEqual(out.createdNeedIds.sort(), [cardigan.id, db.needs.find((n) => n.replaces === 'W-USED')!.id].sort());
+  assert.equal(validateDb(db), null);
+});
+
+test('fit: measurement heuristic, profile validation, owner toggles and «Визначити по фігурі»', async () => {
+  const profile = (m: Partial<Record<'height' | 'chest' | 'waist' | 'hips' | 'shoulders', number>>) => {
+    const p = fixture().profile;
+    for (const [k, v] of Object.entries(m)) p.measurements[k as 'chest'].value = v;
+    return p;
+  };
+  const shaped = suggestFitFromMeasurements(profile({ chest: 100, waist: 82, height: 180 }))!;
+  assert.deepEqual([shaped.preferred, shaped.avoid, shaped.source], [['slim', 'tapered', 'tailored'], ['relaxed', 'oversized'], 'auto']);
+  assert.ok(suggestFitFromMeasurements(profile({ chest: 92, waist: 78, height: 186 }))!.avoid.includes('regular'), 'a narrow frame avoids regular cuts');
+  assert.deepEqual(suggestFitFromMeasurements(profile({ chest: 100, waist: 99 }))!.preferred, ['straight', 'regular', 'tailored']);
+  assert.equal(suggestFitFromMeasurements(profile({ chest: 100 })), null);
+  assert.doesNotMatch(shaped.bodySummary ?? '', /вага|weight|повн/i);
+
+  const db = fixture();
+  db.profile.fitProfile = { preferred: ['slim'], avoid: ['slim'], source: 'owner', updatedAt: at };
+  assert.match(validateDb(db) ?? '', /крій/);
+  db.profile.fitProfile = { preferred: ['baggy' as never], avoid: [], source: 'owner', updatedAt: at };
+  assert.match(validateDb(db) ?? '', /крій/);
+  db.profile.fitProfile = { preferred: ['slim'], avoid: ['regular'], source: 'robot' as never, updatedAt: at };
+  assert.match(validateDb(db) ?? '', /джерело/);
+  db.profile.fitProfile = { preferred: ['slim', 'tapered'], avoid: ['regular'], source: 'auto', updatedAt: at };
+  assert.equal(validateDb(db), null);
+  assert.equal(cleanFit(['slim', 'slim', 'x'], ['slim', 'oversized']).avoid.join(), 'oversized', 'preferred wins, unknown cuts dropped');
+
+  const { store, call, drained } = setup();
+  await assert.rejects(call('PATCH', '/api/profile', { fitProfile: { preferred: ['slim'], avoid: ['regular', 'baggy'] } }), /Некоректний формат крою/, 'an unknown cut is refused, not dropped');
+  let prof = await call('PATCH', '/api/profile', { rev: store.read().profile.rev, fitProfile: { preferred: ['slim', 'tapered'], avoid: ['tapered', 'regular'] } });
+  assert.deepEqual([prof.fitProfile.preferred, prof.fitProfile.avoid, prof.fitProfile.source], [['slim', 'tapered'], ['regular'], 'owner']);
+  await assert.rejects(call('POST', '/api/profile/analyze-fit'), /мірки грудей і талії/);
+  await call('PATCH', '/api/profile', { rev: store.read().profile.rev, measurements: { chest: { value: 100 }, waist: { value: 82 }, height: { value: 180 } } });
+  prof = (await call('POST', '/api/profile/analyze-fit')).profile;
+  assert.equal(prof.fitProfile.source, 'auto', 'measurements decide at once without a photo');
+  assert.ok(!store.read().jobs.some((j) => j.kind === 'fit_analysis'));
+  await store.mutate((d) => {
+    d.photos.push({ id: 'P-base', kind: 'base', path: 'assets/photos/base.jpeg', originalName: 'base.jpeg', source: 'upload', baseCandidate: { suitable: true }, createdAt: at });
+    d.profile.basePhotoIds = ['P-base'];
+  });
+  fs.mkdirSync(path.join(store.dataDir, 'assets/photos'), { recursive: true });
+  fs.writeFileSync(path.join(store.dataDir, 'assets/photos/base.jpeg'), SAMPLE_PNG);
+  const before = drained();
+  const { job } = await call('POST', '/api/profile/analyze-fit');
+  assert.equal(job.kind, 'fit_analysis');
+  assert.ok(drained() > before);
+  assert.equal((await call('POST', '/api/profile/analyze-fit')).job.id, job.id, 'one at a time');
+  // The figure is read from the full-length photo; the reply saves an automatic fit.
+  const engine = {
+    label: 'test', imageLabel: 'test',
+    json: async (req: { schema: object; prompt: string; images: string[] }) => {
+      assert.equal(req.schema, FIT_ANALYSIS_SCHEMA);
+      assert.deepEqual(req.images, [path.join(store.dataDir, 'assets/photos/base.jpeg')]);
+      assert.match(req.prompt, /Never comment on weight/);
+      return { reply: { status: 'done', reason: '', preferred: ['tapered'], avoid: ['oversized'], bodySummary: 'Довгі ноги.' } };
+    },
+    image: async () => { throw new Error('No image generation expected'); },
+  };
+  await createRunner(store, store.dataDir, '/usr/bin/false', { engine: engine as never }).drain();
+  const saved = store.read().profile.fitProfile!;
+  assert.deepEqual([saved.preferred, saved.avoid, saved.bodySummary], [['tapered'], ['oversized'], 'Довгі ноги.']);
+  assert.equal(validateDb(store.read()), null);
+});
+
+test('fit is a hard rule in shop searches and prompts: avoided cuts are excluded and dropped from results', async () => {
+  const db = fixture();
+  db.profile.fitProfile = { preferred: ['slim', 'tapered'], avoid: ['regular', 'oversized'], source: 'owner', updatedAt: at };
+  db.profile.preferences.fit = 'короткі рукави';
+  const search = { id: 'J-s', kind: 'shopsearch' as const, needId: 'N-1', lookVersion: 0, snapshot: { lookName: 'x', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'running' as const, origin: 'site' as const, createdAt: at };
+  const prompt = shopSearchPrompt(db, search);
+  assert.match(prompt, /preferred cuts — Slim, Tapered/);
+  assert.match(prompt, /NEVER these cuts — Regular, Oversized/);
+  assert.match(prompt, /Put the preferred cut in your search queries/);
+  assert.match(prompt, /Verify the cut on the product page/);
+  assert.ok(SHOP_SEARCH_SCHEMA.properties.products.items.required.includes('fit'));
+  const shoes = structuredClone(db);
+  shoes.needs[0].category = 'shoes';
+  assert.doesNotMatch(shopSearchPrompt(shoes, search), /NEVER these cuts/, 'shoes have no cut');
+  const job = { ...search, kind: 'advise' as const };
+  assert.match(advisePrompt(db, job, []), /NEVER these cuts — Regular, Oversized/);
+  assert.match(analyzePrompt(db, { ...search, kind: 'analyze' as const }, []), /preferred cuts — Slim, Tapered/);
+  assert.match(discoverPrompt(db, { ...search, kind: 'discover' as const }), /NEVER these cuts/);
+  const look = { id: 'J-t', lookId: 'L-1', lookVersion: 1, snapshot: { lookName: 'Look', slots: snapshotSlots(db, db.looks[0].slots), basePhotoIds: ['P-1'], basePhotoPaths: ['assets/photos/a.jpeg'] }, instructions: '', state: 'queued' as const, origin: 'site' as const, createdAt: at };
+  assert.match(buildPrompt(look, '/tmp/r.png', undefined, fitPromptBlock(db)), /Proposed \(to buy\) garments follow the person's cut/);
+
+  const fp = db.profile.fitProfile;
+  assert.equal(violatesAvoidedFit('Regular Fit', 'Oxford shirt', 'shirts', fp), true);
+  assert.equal(violatesAvoidedFit('', 'Classic Fit chinos', 'trousers', fp), true);
+  assert.equal(violatesAvoidedFit('', 'Oversized tee', 'tees', fp), true);
+  assert.equal(violatesAvoidedFit('Slim Fit', 'Oxford shirt', 'shirts', fp), false);
+  assert.equal(violatesAvoidedFit('Slim Tapered', 'Classic Oxford Shirt', 'shirts', fp), false, 'a model name word is not a cut');
+  assert.equal(violatesAvoidedFit('Regular Tapered', '', 'trousers', fp), false, 'a preferred cut beside a loose word');
+  assert.equal(violatesAvoidedFit('Regular Fit', 'Sneaker', 'shoes', fp), false, 'shoes are not filtered');
+  assert.equal(violatesAvoidedFit('Skinny', '', 'trousers', { ...fp, avoid: ['skinny'] }), true);
+
+  const product = (model: string, fit: string, url: string) => ({ store: 'Zara', brand: 'Zara', model, sku: '', url, imageUrl: '', price: '29.9', currency: 'EUR', inTower: false, size: 'M', sizeBasis: '', fit, matchScore: 9, matchNote: 'x' });
+  const out = applyShopSearch(db, search, { status: 'done', reason: '', products: [product('Milk tee', 'Regular Fit', 'https://example.com/a'), product('Milk slim tee', 'Slim Fit', 'https://example.com/b'), product('Boxy milk tee', '', 'https://example.com/c')] });
+  assert.equal(out.created.length, 1);
+  const saved = db.products.find((p) => p.id === out.created[0])!;
+  assert.deepEqual([saved.model, saved.fit], ['Milk slim tee', 'Slim Fit']);
+  assert.deepEqual(out.images, [{ productId: saved.id, url: '', productUrl: 'https://example.com/b' }], 'without an image address the product page is tried');
+  const none = applyShopSearch(db, search, { status: 'done', reason: '', products: [product('Wide tee', 'Oversized', 'https://example.com/d')] });
+  assert.equal(none.note, 'Знайдені варіанти не того крою');
+  assert.equal(pageImage('<head><meta property="og:image:width" content="800"><meta content="/img/p.avif?x=1&amp;y=2" property="og:image"></head>', 'https://shop.example/p/1'), 'https://shop.example/img/p.avif?x=1&y=2');
+  assert.equal(pageImage('<meta name="twitter:image" content="http://insecure.example/a.jpg">', 'https://shop.example/'), null);
+});
+
+// ── Review fixes (28.11, adversarial review) ─────────────────────────────────────────────────────────
+
+test('SSRF: private addresses are refused in every IPv6 spelling, including IPv4 hidden inside IPv6', () => {
+  for (const ip of ['127.0.0.1', '10.1.2.3', '100.64.0.1', '169.254.169.254', '172.16.0.1', '192.168.1.1', '0.0.0.0', '224.0.0.1',
+    '::', '::1', '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', '::FFFF:A9FE:A9FE', '::ffff:10.0.0.1',
+    '::127.0.0.1', '::ffff:0:7f00:1', '64:ff9b::7f00:1', '64:ff9b::10.0.0.1', '64:ff9b:1::1', '2002:7f00:1::1', 'fc00::1', 'fd12:3456::1',
+    'fe80::1', 'fe80::1%en0', 'febf::1', 'ff02::1', '2001:db8::1', 'not-an-ip']) {
+    assert.equal(privateAddress(ip), true, ip);
+  }
+  for (const ip of ['93.184.216.34', '8.8.8.8', '2606:4700::6810:84e5', '::ffff:93.184.216.34', '::ffff:5db8:d822', '64:ff9b::8.8.8.8', '2a00:1450:4001::200e']) {
+    assert.equal(privateAddress(ip), false, ip);
+  }
+});
+
+test('SSRF: the fetch connects only to an address checked first, on every redirect, and closes skipped responses', async () => {
+  const lookup = async (host: string) => ({ 'shop.example': [{ address: '93.184.216.34', family: 4 }], 'mixed.example': [{ address: '93.184.216.35', family: 4 }, { address: '10.0.0.5', family: 4 }], 'mapped.example': [{ address: '::ffff:7f00:1', family: 6 }] }[host] ?? []);
+  assert.deepEqual(await publicAddress(new URL('https://shop.example/a'), lookup), { address: '93.184.216.34', family: 4 });
+  assert.equal(await publicAddress(new URL('https://mixed.example/a'), lookup), null, 'one private answer refuses the name (rebinding)');
+  assert.equal(await publicAddress(new URL('https://mapped.example/a'), lookup), null);
+  assert.equal(await publicAddress(new URL('http://shop.example/a'), lookup), null, 'https only');
+  assert.equal(await publicAddress(new URL('https://[::ffff:7f00:1]/a'), lookup), null);
+
+  // The socket lookup always answers with the checked address, in both callback forms.
+  const pinned = pinnedLookup({ address: '93.184.216.34', family: 4 }) as unknown as (h: string, o: unknown, cb: (...a: unknown[]) => void) => void;
+  pinned('evil.example', {}, (err, address, family) => assert.deepEqual([err, address, family], [null, '93.184.216.34', 4]));
+  pinned('evil.example', { all: true }, (err, list) => assert.deepEqual([err, list], [null, [{ address: '93.184.216.34', family: 4 }]]));
+
+  const connected: string[] = [];
+  const bodies: Readable[] = [];
+  const request = async (u: URL, addr: { address: string }) => {
+    connected.push(`${u.hostname}@${addr.address}`);
+    const body = Readable.from([Buffer.from('x')]);
+    bodies.push(body);
+    if (u.hostname === 'shop.example' && u.pathname === '/hop') return { status: 302, url: u.href, headers: { contentType: '', contentLength: 0, location: 'https://mixed.example/secret' }, body };
+    if (u.pathname === '/loop') return { status: 301, url: u.href, headers: { contentType: '', contentLength: 0, location: '/loop' }, body };
+    return { status: 200, url: u.href, headers: { contentType: 'text/plain', contentLength: 1 }, body };
+  };
+  assert.equal(await publicGet('https://shop.example/hop', '*/*', { lookup, request }), null, 'a redirect to a private address is refused');
+  assert.deepEqual(connected, ['shop.example@93.184.216.34'], 'never connects to the redirect target');
+  assert.ok(bodies[0].destroyed, 'the redirect response stream is closed');
+  connected.length = 0;
+  assert.equal(await publicGet('https://shop.example/loop', '*/*', { lookup, request }), null);
+  assert.equal(connected.length, 4, 'at most 3 redirects');
+  const ok = await publicGet('https://shop.example/ok', '*/*', { lookup, request });
+  assert.equal(ok?.status, 200);
+});
+
+test('product photos: a throwing direct image still tries the page og:image; every image is decoded within bounds, AVIF becomes JPEG', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capsula-img-'));
+  const avif = await sharp(await texturedPng(200, 150)).avif().toBuffer();
+  const seen: string[] = [];
+  const respond = (url: string, contentType: string, buf: Buffer): PublicResponse => ({ status: 200, url, headers: { contentType, contentLength: buf.length }, body: Readable.from([buf]) });
+  const get = async (url: string) => {
+    seen.push(url);
+    if (url === 'https://cdn.shop.example/p.jpg') throw new Error('ECONNRESET');
+    if (url === 'https://shop.example/p/1') return respond(url, 'text/html; charset=utf-8', Buffer.from('<html><head><meta property="og:image" content="/img/p.avif"></head><body>'));
+    if (url === 'https://shop.example/img/p.avif') return respond(url, 'image/avif', avif);
+    return null;
+  };
+  const rel = await fetchProductImage(dir, dir, 'S-1', 'https://cdn.shop.example/p.jpg', 'https://shop.example/p/1', get);
+  assert.deepEqual(seen, ['https://cdn.shop.example/p.jpg', 'https://shop.example/p/1', 'https://shop.example/img/p.avif']);
+  assert.equal(rel, path.join('media', 'products', 'S-1.jpg'));
+  assert.equal((await sharp(path.join(dir, rel!)).metadata()).format, 'jpeg');
+
+  const png = await texturedPng(120, 90);
+  assert.deepEqual((await normalizeProductImage(png))?.type, 'png', 'jpg/png/webp keep their bytes');
+  assert.equal(await normalizeProductImage(Buffer.from('definitely not an image')), null);
+  const jpeg = await sharp(png).jpeg().toBuffer();
+  assert.equal(await normalizeProductImage(jpeg.subarray(0, Math.floor(jpeg.length / 2))), null, 'a truncated file is refused');
+  assert.equal(await normalizeProductImage(await sharp({ create: { width: 6001, height: 8, channels: 3, background: '#fff' } }).png().toBuffer()), null, 'wider than 6000 px is refused');
+  // A non-image response is closed and the fallback is tried; nothing at all saves nothing.
+  const html = Readable.from([Buffer.from('<html>')]);
+  assert.equal(await fetchProductImage(dir, dir, 'S-2', 'https://cdn.shop.example/x', undefined, async (url) => ({ status: 200, url, headers: { contentType: 'text/html', contentLength: 6 }, body: html })), null);
+  assert.ok(html.destroyed);
+});
+
+test('perceptual dedup: a dHash collision of a different picture is a new photo with its own bytes; same bytes never hash', async () => {
+  const png = await texturedPng(160, 120);
+  const brighter = await sharp(png).linear(0.5, 110).png().toBuffer();
+  const [a, b] = await Promise.all([computeDhash(png), computeDhash(brighter)]);
+  assert.ok(dhashDistance(a!, b!) <= DHASH_MAX_DISTANCE, 'the dHashes collide');
+  assert.equal(await sameVisualPhoto(png, brighter), false, 'the colours differ: not the same photo');
+  assert.equal(await sameVisualPhoto(png, await sharp(png).resize(120, 90).jpeg({ quality: 75 }).toBuffer()), true, 're-encoded and resized is the same');
+  assert.equal(await sameVisualPhoto(png, await sharp(png).extract({ left: 0, top: 0, width: 160, height: 100 }).png().toBuffer()), false, 'another aspect ratio');
+  assert.equal(await sameVisualPhoto(png, Buffer.from('nope')), false);
+
+  const { dir, store } = setup();
+  const ctx = { store, projectRoot: dir, drain: () => {} };
+  const first = await upload(ctx, new URLSearchParams({ kind: 'item' }), png, 'a.png');
+  const other = await upload(ctx, new URLSearchParams({ kind: 'item', item: 'W-2' }), brighter, 'b.png');
+  assert.notEqual(other.id, first.id, 'a colliding but different picture is not hijacked');
+  assert.ok(store.read().items.find((i) => i.id === 'W-2')!.photoIds.includes(other.id));
+  assert.equal(fs.readdirSync(path.join(dir, 'media/uploads')).length, 2, 'its bytes are kept');
+  // Byte-exact uploads resolve before any perceptual work: no hash is computed or backfilled.
+  await store.mutate((db) => void delete db.photos.find((p) => p.id === first.id)!.dhash);
+  const same = await upload(ctx, new URLSearchParams({ kind: 'item' }), png, 'a-again.png');
+  assert.equal(same.id, first.id);
+  assert.equal(store.read().photos.find((p) => p.id === first.id)!.dhash, undefined, 'the sha256 fast path skips hashing');
+  // A hash is backfilled only for a visible photo whose file is still there.
+  await store.mutate((db) => void (db.photos.find((p) => p.id === other.id)!.archivedAt = at));
+  await upload(ctx, new URLSearchParams({ kind: 'item' }), await texturedPng(160, 120, 300), 'c.png');
+  const db = store.read();
+  assert.match(db.photos.find((p) => p.id === first.id)!.dhash ?? '', /^[0-9a-f]{16}$/);
+  assert.equal(validateDb(db), null);
+});
+
+test('a HEIC that cannot be converted leaves neither the original nor a partial JPEG', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'capsula-heic-'));
+  const fake = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypheic'), Buffer.alloc(64, 7)]);
+  await assert.rejects(saveUpload(dir, dir, 'P-heic', fake), { status: 422 });
+  assert.deepEqual(fs.readdirSync(path.join(dir, 'media/uploads')), []);
+});
+
+test('cleared need texts stay empty strings; prompts survive blank and legacy need records', async () => {
+  const { store, call } = setup();
+  const need = await call('PATCH', '/api/needs/N-1', { description: '', why: '   ', fitCheck: '' });
+  assert.deepEqual([need.description, need.why, need.fitCheck], ['', '', '']);
+  await assert.rejects(call('PATCH', '/api/needs/N-1', { title: ' ' }), { status: 400 });
+  const db = store.read();
+  assert.equal(validateDb(db), null);
+  // A legacy record without the fields.
+  const legacy = db.needs[0] as unknown as Record<string, unknown>;
+  delete legacy.description;
+  delete legacy.why;
+  delete legacy.fitCheck;
+  db.items[0].status = 'confirmed';
+  const job = (kind: Job['kind']): Job => ({ id: 'J-x', kind, needId: 'N-1', inputPhotoIds: ['P-1'], lookVersion: 0, snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'queued', origin: 'site', createdAt: at });
+  assert.match(intakePrompt(db, job('intake'), ['a.jpeg']), /N-1 \| футболки \| Молочна футболка \| — \| —/);
+  assert.match(advisePrompt(db, job('advise'), []), /N-1 \| tees \| Молочна футболка \| — \| —/);
+  assert.match(shopSearchPrompt(db, job('shopsearch')), /Recommendation: Молочна футболка\n/);
+  assert.doesNotThrow(() => snapshotSlots(db, db.looks[0].slots));
+});
+
+test('the advisor keeps a replacement the owner built on (look, set, chosen product); a withdrawal strips sets and bumps them', () => {
+  const advise: Job = { id: 'J-a', kind: 'advise', lookVersion: 0, snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'running', origin: 'site', createdAt: at };
+  const empty = { status: 'done', reason: '', items: [], looks: [], newLooks: [], newCapsules: [], newNeeds: [], coveredNeeds: [] };
+  const base = () => {
+    const db = fixture();
+    db.items.push({ id: 'W-IDLE', rev: 1, category: 'tees', title: 'Pink tee', status: 'confirmed', photoIds: [], origin: 'candidate', history: [], createdAt: at, updatedAt: at });
+    db.needs.push({ id: 'N-R', rev: 1, title: 'Navy tee', category: 'tees', priority: 'optional', description: '', why: 'logo', fitCheck: '', status: 'open', origin: 'agent', replaces: 'W-IDLE', createdAt: at, updatedAt: at });
+    db.products.push({ id: 'S-R', rev: 1, needId: 'N-R', store: 'S', brand: '', model: 'Navy', onlineAvailability: 'unknown', towerAvailability: 'unknown', status: 'option', createdAt: at, updatedAt: at });
+    return db;
+  };
+  // Unused item, nothing built on its replacement: withdrawn.
+  let db = base();
+  assert.equal(replacementHeld(db, db.needs[1]), false);
+  applyAdvice(db, advise, empty as never);
+  assert.ok(!db.needs.some((n) => n.id === 'N-R'));
+  // Placed in a saved look (as itself or as its product), in a capsule set, or a product chosen: kept.
+  for (const place of ['look', 'product-look', 'set', 'chosen'] as const) {
+    db = base();
+    if (place === 'look') db.looks[0].slots.top = [{ kind: 'need', id: 'N-R' }];
+    if (place === 'product-look') db.looks[0].slots.top = [{ kind: 'product', id: 'S-R' }];
+    if (place === 'set') db.capsules[0].pieces = [{ kind: 'item', id: 'W-1' }, { kind: 'need', id: 'N-1' }, { kind: 'need', id: 'N-R' }];
+    if (place === 'chosen') db.products[0].status = 'chosen';
+    assert.equal(replacementHeld(db, db.needs[1]), true, place);
+    applyAdvice(db, advise, { ...empty, items: [{ id: 'W-IDLE', score: 8, note: 'ok', replace: '', replaceWith: '' }] } as never);
+    assert.ok(db.needs.some((n) => n.id === 'N-R'), `kept when ${place}`);
+    assert.equal(validateDb(db), null);
+  }
+  // The owner keeps the old item: the purchase goes from the look, the set pieces and base, and the capsule is bumped.
+  db = base();
+  db.looks[0].slots.top = [{ kind: 'need', id: 'N-R' }];
+  db.capsules[0].pieces = [{ kind: 'item', id: 'W-1' }, { kind: 'need', id: 'N-R' }];
+  db.capsules[0].base = [{ kind: 'need', id: 'N-R' }];
+  const rev = db.capsules[0].rev;
+  assert.deepEqual(keepItem(db, db.items.find((i) => i.id === 'W-IDLE')!), ['L-1']);
+  assert.ok(!db.needs.some((n) => n.id === 'N-R') && !db.products.some((p) => p.id === 'S-R'));
+  assert.deepEqual(db.capsules[0].pieces, [{ kind: 'item', id: 'W-1' }]);
+  assert.equal(db.capsules[0].base, undefined);
+  assert.ok(db.capsules[0].rev > rev, 'the capsule set changed');
+  assert.equal(validateDb(db), null);
+});
+
+test('visual dedup gives one confirmed item to at most one garment; text-only confidence is ignored', async () => {
+  assert.match(visualDedupPrompt([], []), /give each itemId to at most one garment/);
+  assert.match(visualDedupPrompt([], []), /NO logo, print, pattern or hardware on either side contradicts/);
+  const { dir, store } = setup();
+  const png = await sharp({ create: { width: 24, height: 24, channels: 3, background: '#eee' } }).png().toBuffer();
+  await store.mutate((db) => {
+    const cover = testPackshot(db, 'P-milk');
+    fs.mkdirSync(path.join(dir, 'media'), { recursive: true });
+    fs.writeFileSync(path.join(dir, cover.path), png);
+    db.items.push({ id: 'W-milk', rev: 1, category: 'tees', title: 'Молочна футболка', color: 'молочний', status: 'confirmed', photoIds: [], packshotId: cover.id, origin: 'candidate', history: [], createdAt: at, updatedAt: at });
+  });
+  const ctx = { store, projectRoot: dir, drain: () => {} };
+  let visual: unknown[] = [];
+  let garments: unknown[] = [];
+  const engine = {
+    label: 'test', imageLabel: 'test',
+    json: async ({ schema }: { schema: object }) => schema === INTAKE_SCHEMA
+      ? { reply: { status: 'done', photoType: 'garments_only', garments } }
+      : { reply: { matches: visual } },
+    image: async () => { throw new Error('No image generation expected'); },
+  };
+  const tee = (title: string, extra = {}) => ({ title, category: 'tees', color: 'білий', notes: '', duplicateOf: '', coversNeed: '', ...extra });
+  garments = [tee('Біла футболка'), tee('Ще одна біла футболка')];
+  visual = [{ garmentIndex: 0, itemId: 'W-milk', confidence: 'high', reason: 'виріз' }, { garmentIndex: 1, itemId: 'W-milk', confidence: 'high', reason: 'колір' }];
+  const up1 = await upload(ctx, new URLSearchParams({ kind: 'intake', intent: 'garments' }), png, 'two.png');
+  await createRunner(store, dir, '/usr/bin/false', { engine: engine as never, canStart: (j) => j.kind === 'intake' }).drain();
+  let db = store.read();
+  assert.ok(db.items.find((i) => i.id === 'W-milk')!.photoIds.includes(up1.id), 'the first garment attaches');
+  const second = db.items.find((i) => i.title === 'Ще одна біла футболка')!;
+  assert.equal(second.possibleDuplicateOf, 'W-milk', 'the second is only a possible duplicate, its own card');
+  // The text reply cannot claim a visual confirmation.
+  garments = [tee('Третя футболка', { duplicateOf: 'W-milk', duplicateConfidence: 'high' })];
+  visual = [];
+  await upload(ctx, new URLSearchParams({ kind: 'intake', intent: 'garments' }), await sharp({ create: { width: 24, height: 24, channels: 3, background: '#ccc' } }).png().toBuffer(), 'three.png');
+  await createRunner(store, dir, '/usr/bin/false', { engine: engine as never, canStart: (j) => j.kind === 'intake' }).drain();
+  db = store.read();
+  assert.equal(db.items.find((i) => i.title === 'Третя футболка')?.possibleDuplicateOf, 'W-milk');
+  assert.equal(validateDb(db), null);
+});
+
+test('an upload burst ends with one advisor run on error or waiting too, and none when nothing changed', async () => {
+  const intake = (id: string, state: Job['state'], finishedAt?: string, created: string[] = []): Job => ({ id, kind: 'intake', inputPhotoIds: ['P-1'], lookVersion: 0, snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state, origin: 'site', createdAt: at, finishedAt, createdItemIds: created });
+  const db = fixture();
+  db.items[0].status = 'confirmed';
+  db.jobs.push(intake('J-1', 'done', '2026-11-17T00:01:00.000Z', ['W-1']), intake('J-2', 'queued'));
+  assert.equal(finishIntakeBurst(db, db.jobs[0]), null, 'another intake is still queued');
+  db.jobs[1].state = 'error';
+  db.jobs[1].finishedAt = '2026-11-17T00:02:00.000Z';
+  assert.equal(finishIntakeBurst(db, db.jobs[1])?.kind, 'advise', 'a failed last photo still finishes the burst');
+  db.jobs.find((j) => j.kind === 'advise')!.state = 'done';
+  db.jobs.push(intake('J-3', 'done', '2026-11-18T00:00:00.000Z', []), intake('J-4', 'needs_data', '2026-11-18T00:01:00.000Z'));
+  db.jobs.find((j) => j.kind === 'advise')!.createdAt = '2026-11-17T00:03:00.000Z';
+  assert.equal(finishIntakeBurst(db, db.jobs.at(-1)!), null, 'a burst that changed nothing spends no advisor run');
+
+  // In the runner: the last upload fails, the burst still gets its run.
+  const { dir, store } = setup();
+  await store.mutate((d) => {
+    d.items[0].status = 'confirmed';
+    d.jobs.push(intake('J-ok', 'done', '2026-11-20T00:00:00.000Z', ['W-1']), { ...intake('J-bad', 'queued'), batch: true });
+  });
+  const engine = { label: 'test', imageLabel: 'test', json: async () => ({ reply: { status: 'error', reason: 'не видно', photoType: 'other', garments: [] } }), image: async () => { throw new Error('none'); } };
+  await createRunner(store, dir, '/usr/bin/false', { engine: engine as never, canStart: (j) => j.kind === 'intake' }).drain();
+  const after = store.read();
+  assert.equal(after.jobs.find((j) => j.id === 'J-bad')!.state, 'error');
+  assert.equal(after.jobs.filter((j) => j.kind === 'advise').length, 1);
+});
+
+test('upload run=0 queues without starting the runner (batch uploads start it on the last photo)', async () => {
+  const { dir, store } = setup();
+  let drained = 0;
+  const ctx = { store, projectRoot: dir, drain: () => void drained++ };
+  await upload(ctx, new URLSearchParams({ kind: 'intake', intent: 'garments', batch: '1', run: '0' }), await texturedPng(100, 80, 10), 'a.png');
+  assert.equal(drained, 0);
+  await upload(ctx, new URLSearchParams({ kind: 'intake', intent: 'garments', batch: '1' }), await texturedPng(100, 80, 900), 'b.png');
+  assert.equal(drained, 1);
+  assert.equal(store.read().jobs.filter((j) => j.kind === 'intake' && j.state === 'queued').length, 2);
+});
+
+test('try-ons: a shop photo upload wakes a waiting look; a need offers fallback pictures; waiting jobs stay until a replacement starts', async () => {
+  const db0 = fixture();
+  for (const id of ['P-a', 'P-b', 'P-c', 'P-d']) db0.photos.push({ id, kind: 'product', path: `media/products/${id}.jpg`, originalName: `${id}.jpg`, source: 'generated', createdAt: at });
+  const product = (id: string, photoId: string, matchScore: number, status: 'option' | 'chosen' = 'option') => ({ id, rev: 1, needId: 'N-1', store: 'S', brand: '', model: id, photoId, matchScore, onlineAvailability: 'unknown' as const, towerAvailability: 'unknown' as const, status, createdAt: at, updatedAt: at });
+  db0.products.push(product('S-a', 'P-a', 9), product('S-b', 'P-b', 3, 'chosen'), product('S-c', 'P-c', 7), product('S-d', 'P-d', 5));
+  db0.needs[0].conceptPhotoId = testPackshot(db0, 'P-concept').id;
+  assert.deepEqual(needGarmentPhotos(db0, db0.needs[0]).map((p) => p.id), ['P-concept', 'P-b', 'P-a', 'P-c'], 'concept, chosen, then by score; at most 4');
+
+  const { dir, store, call } = setup();
+  await store.mutate((d) => {
+    d.photos.push({ id: 'P-base', kind: 'base', path: 'assets/photos/base.jpeg', originalName: 'base.jpeg', source: 'upload', createdAt: at });
+    d.profile.basePhotoIds = ['P-base'];
+    d.products.push({ id: 'S-1', rev: 1, needId: 'N-1', store: 'S', brand: '', model: 'Tee', onlineAvailability: 'unknown', towerAvailability: 'unknown', status: 'option', createdAt: at, updatedAt: at });
+    queueNewLookRenders(d, ['L-1']);
+  });
+  const waiting = currentTryon(store.read(), 'L-1')!;
+  assert.equal(waiting.state, 'needs_data');
+  // Nothing new to draw from: the waiting job stays as it is, no duplicate.
+  await store.mutate((d) => void assert.equal(resumeWaitingTryonsForRef(d, 'need', 'N-1').length, 0));
+  assert.deepEqual(store.read().jobs.filter((j) => j.lookId === 'L-1').map((j) => j.id), [waiting.id]);
+  // The fresh-snapshot check of a running attempt sees only growth.
+  const started = slotPhotoPaths(waiting.snapshot.slots);
+  assert.equal(fullerSnapshot(store.read(), waiting, started), null);
+
+  let drained = 0;
+  const shopPhoto = await upload({ store, projectRoot: dir, drain: () => void drained++ }, new URLSearchParams({ kind: 'product', product: 'S-1' }), await texturedPng(120, 160), 'tee.png');
+  const db = store.read();
+  const resumed = currentTryon(db, 'L-1')!;
+  assert.equal(resumed.state, 'queued', 'the shop photo woke the look');
+  assert.ok(!db.jobs.some((j) => j.id === waiting.id), 'the waiting job went once the replacement was queued');
+  assert.deepEqual(resumed.snapshot.slots.find((s) => s.kind === 'need')!.originalPhotoPaths, [shopPhoto.path]);
+  assert.ok(drained > 0);
+  const fuller = fullerSnapshot(db, { ...waiting, lookVersion: db.looks[0].version }, started);
+  assert.deepEqual(fuller?.find((s) => s.kind === 'need')?.originalPhotoPaths, [shopPhoto.path], 'a running attempt would start again with the new picture');
+  assert.equal(fullerSnapshot(db, { ...waiting, lookVersion: db.looks[0].version }, slotPhotoPaths(fuller!)), null, 'and only once');
+  assert.equal(validateDb(db), null);
+  void call;
+});
+
+test('cover undo restores a capsule set changed without any look; the advisor covers only confirmed items with a reason', () => {
+  const db = fixture();
+  db.looks[0].slots.top = [];
+  db.looks[0].versions[0].slots.top = [];
+  db.capsules[0].pieces = [{ kind: 'item', id: 'W-1' }, { kind: 'need', id: 'N-1' }];
+  db.items.push({ id: 'W-TEE', rev: 1, category: 'tees', title: 'Молочна футболка', status: 'confirmed', photoIds: [], origin: 'manual', history: [], createdAt: at, updatedAt: at });
+  const cover = coverNeed(db, 'N-1', 'W-TEE', false);
+  assert.deepEqual(cover.looks, []);
+  assert.deepEqual(db.needs[0].coveredCapsuleIds, ['C-1']);
+  assert.deepEqual(db.capsules[0].pieces, [{ kind: 'item', id: 'W-1' }, { kind: 'item', id: 'W-TEE' }]);
+  assert.equal(validateDb(db), null);
+  uncoverNeed(db, 'N-1', false);
+  assert.deepEqual(db.capsules[0].pieces, [{ kind: 'item', id: 'W-1' }, { kind: 'need', id: 'N-1' }], 'the set gets the purchase back');
+  assert.equal(db.needs[0].coveredCapsuleIds, undefined);
+  coverNeed(db, 'N-1', 'W-TEE', false);
+  db.needs[0].coveredCapsuleIds = ['C-404'];
+  assert.match(validateDb(db) ?? '', /немає капсули/);
+  db.needs[0].coveredCapsuleIds = ['C-1'];
+  deleteCapsule(db, 'C-1');
+  assert.equal(db.needs[0].coveredCapsuleIds, undefined, 'a deleted capsule leaves the record');
+  assert.equal(validateDb(db), null);
+
+  const advise: Job = { id: 'J-a', kind: 'advise', lookVersion: 0, snapshot: { lookName: '', slots: [], basePhotoIds: [], basePhotoPaths: [] }, instructions: '', state: 'running', origin: 'site', createdAt: at };
+  const reply = (coveredNeeds: unknown[]) => ({ status: 'done', reason: '', items: [], looks: [], newLooks: [], newCapsules: [], newNeeds: [], coveredNeeds }) as never;
+  const fresh = fixture();
+  fresh.items.push({ id: 'W-NEW', rev: 1, category: 'tees', title: 'Молочна футболка', status: 'needs_confirmation', photoIds: [], origin: 'intake', history: [], createdAt: at, updatedAt: at });
+  assert.deepEqual(applyAdvice(fresh, advise, reply([{ itemId: 'W-NEW', needId: 'N-1', reason: 'та сама' }])).covered, [], 'an unconfirmed item does not close a purchase');
+  fresh.items.at(-1)!.status = 'confirmed';
+  assert.deepEqual(applyAdvice(fresh, advise, reply([{ itemId: 'W-NEW', needId: 'N-1', reason: '  ' }])).covered, [], 'no reason, no cover');
+  assert.deepEqual(applyAdvice(fresh, advise, reply([{ itemId: 'W-NEW', needId: 'N-1', reason: 'Та сама молочна футболка.' }])).covered, [{ itemId: 'W-NEW', needId: 'N-1', reason: 'Та сама молочна футболка.' }]);
+});
+
+test('fit analysis: a fresh draft body crop first, the photo frozen at queue time, measurements when it is gone, and the owner\'s newer edit wins', async () => {
+  const db = fixture();
+  const hashed = (p: string) => ({ path: p, sha256: 'a'.repeat(64) });
+  db.profile.identity = { body: hashed('media/identity/body.png') } as never;
+  db.onboarding = { identityDraft: { body: hashed('media/identity/draft-body.png') } } as never;
+  assert.equal(fitPhotoPath(db), 'media/identity/draft-body.png');
+  const queued = queueFitAnalysis(db)!;
+  assert.deepEqual(queued.snapshot.basePhotoPaths, ['media/identity/draft-body.png'], 'the photo is frozen into the job');
+  delete db.onboarding;
+  assert.equal(fitPhotoPath(db), 'media/identity/body.png');
+
+  // An owner edit after the job was queued is never overwritten, by a manual run either.
+  const job = { instructions: '', createdAt: '2026-11-20T00:00:00.000Z' };
+  db.profile.fitProfile = { preferred: ['slim'], avoid: ['regular'], source: 'owner', updatedAt: '2026-11-20T00:05:00.000Z' };
+  assert.equal(applyFitAnalysis(db, { preferred: ['relaxed'], avoid: ['slim'] }, job), 'Крій уже вибрано власноруч');
+  assert.deepEqual(db.profile.fitProfile.preferred, ['slim']);
+  db.profile.fitProfile.updatedAt = '2026-11-19T00:00:00.000Z';
+  applyFitAnalysis(db, { preferred: ['tapered'], avoid: ['oversized'] }, job);
+  assert.deepEqual([db.profile.fitProfile.preferred, db.profile.fitProfile.source], [['tapered'], 'auto'], 'an older owner choice yields to the run the owner asked for');
+  db.profile.fitProfile = { preferred: ['slim'], avoid: [], source: 'owner', updatedAt: at };
+  assert.equal(applyFitAnalysis(db, { preferred: ['relaxed'], avoid: [] }, { instructions: 'auto', createdAt: '2026-12-01T00:00:00.000Z' }), 'Крій уже вибрано власноруч', 'auto never overrides the owner');
+
+  // The frozen photo is gone: the measurements decide, without calling the model.
+  const { dir, store } = setup();
+  await store.mutate((d) => {
+    for (const [k, v] of [['chest', 100], ['waist', 82], ['height', 180]] as const) d.profile.measurements[k].value = v;
+    d.jobs.push({ id: 'J-fit', kind: 'fit_analysis', lookVersion: 0, snapshot: { lookName: 'Крій', slots: [], basePhotoIds: [], basePhotoPaths: ['media/identity/missing.png'] }, instructions: '', state: 'queued', origin: 'site', createdAt: at });
+  });
+  const engine = { label: 'test', imageLabel: 'test', json: async () => { throw new Error('no model call expected'); }, image: async () => { throw new Error('none'); } };
+  await createRunner(store, dir, '/usr/bin/false', { engine: engine as never }).drain();
+  const after = store.read();
+  assert.equal(after.jobs.find((j) => j.id === 'J-fit')!.state, 'done');
+  assert.deepEqual(after.profile.fitProfile?.preferred, ['slim', 'tapered', 'tailored']);
+});
+
+test('avoided cuts: negations, hem/collar details and European cut names are read correctly; malformed fit is a 400', async () => {
+  const fit = (avoid: Parameters<typeof violatesAvoidedFit>[3] extends infer F ? F : never, preferred = ['slim'] as const) => ({ preferred: [...preferred], avoid: avoid as never, source: 'owner' as const, updatedAt: at });
+  const noRegular = fit(['regular'] as never);
+  assert.equal(violatesAvoidedFit('', 'Non-Regular Fit Oxford Shirt', 'shirts', noRegular), false, 'a negated cut is not that cut');
+  assert.equal(violatesAvoidedFit('not regular', 'Oxford Shirt', 'shirts', noRegular), false);
+  assert.equal(violatesAvoidedFit('Regular Fit', 'Oxford Shirt', 'shirts', noRegular), true);
+  const noStraight = fit(['straight'] as never);
+  assert.equal(violatesAvoidedFit('', 'Straight Hem Shirt', 'shirts', noStraight), false, 'a hem is not the cut');
+  assert.equal(violatesAvoidedFit('', 'Сорочка з прямим низом', 'shirts', noStraight), false);
+  assert.equal(violatesAvoidedFit('Relaxed collar', 'Polo', 'shirts', fit(['relaxed'] as never)), false);
+  assert.equal(violatesAvoidedFit('Ravni kroj', 'Hlače', 'trousers', noStraight), true, 'Croatian straight cut');
+  assert.equal(violatesAvoidedFit('', 'Chino Gerade Passform', 'trousers', noStraight), true, 'German straight cut');
+  assert.equal(violatesAvoidedFit('', 'Jeans gerader Schnitt', 'trousers', noStraight), true);
+  assert.equal(violatesAvoidedFit('Uski kroj', 'Košulja', 'shirts', fit(['slim'] as never, ['tapered'] as never)), true);
+  assert.equal(violatesAvoidedFit('Konisch', 'Hose', 'trousers', fit(['tapered'] as never)), true);
+  assert.equal(violatesAvoidedFit('Klassisch', 'Hemd', 'shirts', noRegular), true);
+  assert.equal(violatesAvoidedFit('Komotni kroj', 'Hlače', 'trousers', fit(['relaxed'] as never)), true);
+
+  const { store, call } = setup();
+  for (const bad of [{ preferred: 'slim' }, { avoid: ['slim', 7] }, { preferred: ['baggy'] }, { bodySummary: 42 }]) {
+    await assert.rejects(call('PATCH', '/api/profile', { fitProfile: bad }), { status: 400, message: 'Некоректний формат крою' });
+  }
+  assert.equal(store.read().profile.fitProfile, undefined, 'nothing was cleared or saved');
+  const saved = await call('PATCH', '/api/profile', { fitProfile: { preferred: ['slim'], bodySummary: ' Довгі ноги. ' } });
+  assert.deepEqual([saved.fitProfile.preferred, saved.fitProfile.avoid, saved.fitProfile.bodySummary], [['slim'], [], 'Довгі ноги.']);
 });

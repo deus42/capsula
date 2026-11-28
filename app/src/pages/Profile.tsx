@@ -1,13 +1,14 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Camera, Check, CircleCheck, Copy, Heart, Link2, Loader2, LocateFixed, MapPin, Minus, Plus, Ruler, Store, Trash2, TriangleAlert, UserRound, Users, X } from 'lucide-react';
-import type { MeasureKey, QuotaKind, QuotaStatus } from '../api.ts';
+import type { FitType, MeasureKey, QuotaKind, QuotaStatus } from '../api.ts';
+import { FIT_TYPES } from '../../server/schema.ts';
 import { api, thumb } from '../api.ts';
 import { go, useApp, useDb } from '../store.tsx';
-import { Badge, ConfirmButton, PageHead, PhotoPicker, SubNav } from '../components/ui.tsx';
+import { Badge, ConfirmButton, JobBar, PageHead, PhotoPicker, SubNav } from '../components/ui.tsx';
 import { useIntake } from './Home.tsx';
 import { InfoMark } from './Glossary.tsx';
-import { MEASURES, fmtDay, plainShopName, shopLocation, wardrobeBrands } from '../lib.ts';
+import { FIT_LABEL, MEASURES, fmtDay, plainShopName, shopLocation, wardrobeBrands } from '../lib.ts';
 import { LOOKS, currentLanguage, plural, t } from '../i18n.ts';
 
 const BrandSizing = lazy(() => import('./BrandSizing.tsx').then((module) => ({ default: module.BrandSizing })));
@@ -301,7 +302,20 @@ function Preferences() {
   const { act } = useApp();
   const prof = db.profile;
   const [prefs, setPrefs] = useState(prof.preferences);
-  useEffect(() => setPrefs(prof.preferences), [prof.rev]);
+  const latestPrefs = useRef(prefs);
+  latestPrefs.current = prefs;
+  // A text being edited survives toggles elsewhere on the page (each saves and bumps the profile).
+  const dirty = useRef(new Set<keyof typeof prefs>());
+  useEffect(() => setPrefs((current) => {
+    const next = { ...prof.preferences };
+    for (const k of dirty.current) next[k] = current[k];
+    return next;
+  }), [prof.rev]);
+  const savePrefs = async () => {
+    const sent = { ...latestPrefs.current };
+    const saved = await act(() => api('PATCH', '/api/profile', { rev: prof.rev, preferences: sent }), t('Побажання збережено'));
+    if (saved) for (const k of [...dirty.current]) if (latestPrefs.current[k] === sent[k]) dirty.current.delete(k);
+  };
   const fields = [
     ['comfort', t('Комфорт'), t('Як має відчуватися одяг протягом дня.')],
     ['materials', t('Матеріали'), t('Тканини, яким віддаєш перевагу або яких уникаєш.')],
@@ -316,8 +330,32 @@ function Preferences() {
     { label: t('Півкуля'), key: 'hemisphere', current: prof.hemisphere ?? 'north', options: [['north', t('Північна')], ['south', t('Південна')]] },
     { label: t('Окуляри'), key: 'allowEyewear', current: prof.allowEyewear ? 'yes' : 'no', options: [['no', t('Ні')], ['yes', t('Так')]] },
   ];
+  // «Крій» and «Уникати крою» save at once; a cut chosen in one list leaves the other.
+  const fit = prof.fitProfile;
+  const fitJob = db.jobs.filter((j) => j.kind === 'fit_analysis').sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
+  const fitBusy = fitJob?.state === 'running' || fitJob?.state === 'queued';
+  // Quick taps build on each other (the last choice sent, not the last one saved) and save without rev, like «Мірки».
+  const fitChoice = useRef({ preferred: fit?.preferred ?? [], avoid: fit?.avoid ?? [] });
+  const fitInFlight = useRef(0);
+  useEffect(() => {
+    if (fitInFlight.current === 0) fitChoice.current = { preferred: prof.fitProfile?.preferred ?? [], avoid: prof.fitProfile?.avoid ?? [] };
+  }, [prof.rev]);
+  const toggleFit = (list: 'preferred' | 'avoid', cut: FitType) => {
+    const next = { preferred: new Set(fitChoice.current.preferred), avoid: new Set(fitChoice.current.avoid) };
+    if (next[list].has(cut)) next[list].delete(cut);
+    else {
+      next[list].add(cut);
+      next[list === 'preferred' ? 'avoid' : 'preferred'].delete(cut);
+    }
+    const payload = { preferred: FIT_TYPES.filter((f) => next.preferred.has(f)), avoid: FIT_TYPES.filter((f) => next.avoid.has(f)) };
+    fitChoice.current = payload;
+    fitInFlight.current += 1;
+    void act(() => api('PATCH', '/api/profile', { fitProfile: payload })).finally(() => {
+      fitInFlight.current -= 1;
+    });
+  };
   return (
-    <Section actions={<button className="btn primary" onClick={() => void act(() => api('PATCH', '/api/profile', { rev: prof.rev, preferences: prefs }), t('Побажання збережено'))}>{t('Зберегти')}</button>}>
+    <Section actions={<button className="btn primary" onClick={() => void savePrefs()}>{t('Зберегти')}</button>}>
       <div className="pref-rows">
         {rows.map((r) => (
           <div key={r.key} className="pref-row">
@@ -329,12 +367,33 @@ function Preferences() {
             </div>
           </div>
         ))}
+        {(['preferred', 'avoid'] as const).map((list) => (
+          <div key={list} className="pref-row">
+            <span>{list === 'preferred' ? t('Крій') : t('Уникати крою')}</span>
+            <div className="filters start">
+              {FIT_TYPES.map((cut) => {
+                const on = Boolean(fit?.[list].includes(cut));
+                return <button key={cut} className={on ? 'on' : ''} aria-pressed={on} onClick={() => toggleFit(list, cut)}>{FIT_LABEL[cut]}</button>;
+              })}
+            </div>
+          </div>
+        ))}
+        <div className="pref-row">
+          <span />
+          <div className="fit-auto">
+            <button className="btn sm quiet" disabled={fitBusy} onClick={() => void act(() => api('POST', '/api/profile/analyze-fit'))}>{t('Визначити по фігурі')}</button>
+            {fitBusy && fitJob ? <JobBar job={fitJob} /> : fitJob?.state === 'error' ? <span className="small muted">{t('Не вдалося визначити крій')}</span> : fit?.bodySummary ? <span className="small muted">{fit.bodySummary}</span> : null}
+          </div>
+        </div>
       </div>
       <div className="grid-form">
         {fields.map(([k, label]) => (
           <label key={k} className="field">
             <span>{label}</span>
-            <textarea className="textarea" value={prefs[k]} onChange={(e) => setPrefs((p) => ({ ...p, [k]: e.target.value }))} />
+            <textarea className="textarea" value={prefs[k]} onChange={(e) => {
+              dirty.current.add(k);
+              setPrefs((p) => ({ ...p, [k]: e.target.value }));
+            }} />
           </label>
         ))}
       </div>

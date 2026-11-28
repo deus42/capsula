@@ -8,6 +8,7 @@ import { focusLine, replyLanguage } from './person.ts';
 import { hiddenLookIds, lookKeys } from '../src/rating.ts';
 import { isBlockedEyewear, weakPiece } from '../src/lib.ts';
 import { alreadySeen, refusedPieces } from '../src/look-memory.ts';
+import { fitPromptBlock } from './fit.ts';
 
 export const CATEGORY_UK: Record<Category, string> = {
   outerwear: 'верхній одяг', knitwear: 'худі й трикотаж', shirts: 'сорочки й поло', tees: 'футболки', dresses: 'сукні',
@@ -66,39 +67,88 @@ export const VISUAL_DEDUP_SCHEMA = {
   },
 };
 
-export function visualDedupPrompt(garments: IntakeReply['garments'], candidates: Item[]) {
+/**
+ * The visual check of one contact sheet. `include` picks the garments compared on it (their indices stay those of
+ * the whole upload); a garment the text pass already named carries that id so the picture can confirm it.
+ */
+export function visualDedupPrompt(garments: IntakeReply['garments'], candidates: Item[], include: (garment: IntakeReply['garments'][number], index: number) => boolean = (g) => !g.duplicateOf) {
   return [
     'Compare the first attachment (new upload) with the second (numbered wardrobe contact sheet). Find the same physical garment in both. Return JSON only.',
-    'Match garments within the same category using distinctive construction, hardware, seams, texture, pattern and logos. Colour and category alone are insufficient. Ignore faces, poses and backgrounds.',
+    'Match garments within the same category using distinctive construction, hardware, seams, texture, pattern and logos. Colour and category alone are insufficient when a distinctive detail is visible. Ignore faces, poses and backgrounds.',
     'Allow for a mirror photo reversing left and right, and for changes in lighting or logo wear. Check the logo shape and placement after accounting for mirroring.',
-    'Return at most one match per garment. Use its zero-based garmentIndex and the exact itemId from the sheet legend. Use high for a distinctive match, possible for a plausible visual match with some details hidden, and omit weak matches. Briefly state the visible evidence in reason.',
+    'Basic or partly hidden garments (a plain tee under an open jacket, a plain knit): high only when ALL hold — the colour family matches allowing for lighting (cream, milk and white read alike indoors; light blue can read white), the silhouette and cut match (neckline, sleeve, length, fit), the visible details match, and NO logo, print, pattern or hardware on either side contradicts the other. Anything less is possible at most.',
+    'Two distinct garments in the upload are never the same wardrobe item: give each itemId to at most one garment.',
+    'Return at most one match per garment. Use its zero-based garmentIndex and the exact itemId from the sheet legend. Use high for a distinctive match or a basic garment matching as above, possible for a plausible visual match with some details hidden, and omit weak matches. Briefly state the visible evidence in reason.',
     'Garments in the upload:',
-    ...garments.map((g, index) => g.duplicateOf ? '' : `${index} | ${g.category} | ${g.title} | ${g.color} | ${g.notes}`).filter(Boolean),
+    ...garments.map((g, index) => include(g, index) ? `${index} | ${g.category} | ${g.title} | ${g.color} | ${g.notes}${g.duplicateOf ? ` | text match: ${g.duplicateOf}` : ''}` : '').filter(Boolean),
     'Contact sheet legend (cell number | itemId | category | title):',
-    ...candidates.map((item, index) => `${index + 1} | ${item.id} | ${item.category} | ${item.title}`),
+    ...candidates.map((item, index) => `${index + 1} | ${item.id} | ${item.category} | ${item.title}${item.color ? ` | ${item.color}` : ''}`),
   ].join('\n');
 }
 
-const garmentWords = (text: string) => new Set(text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word.length >= 3));
+// Ukrainian endings (longest first) so «біла», «білий» and «білого» meet as «біл»; English plurals likewise.
+const ENDINGS = ['ого', 'ому', 'ими', 'іми', 'ій', 'ий', 'ая', 'яя', 'ою', 'ею', 'ої', 'ей', 'их', 'іх', 'ім', 'им', 'ом', 'ем', 'ам', 'ям', 'ах', 'ях', 'es', 'а', 'я', 'е', 'є', 'и', 'і', 'у', 'ю', 'о', 'ь', 's'];
+export function stem(word: string) {
+  const w = word.toLowerCase();
+  if (w.length < 4) return w;
+  for (const end of ENDINGS) if (w.endsWith(end) && w.length - end.length >= 3) return w.slice(0, -end.length);
+  return w;
+}
+const garmentWords = (text: string) => new Set(text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word.length >= 3).map(stem));
 const sharedWords = (a: Set<string>, b: Set<string>) => [...a].filter((word) => b.has(word)).length;
 
-/** Prioritise likely references before making the bounded contact sheet. Vision still decides the match. */
+/** Colour families: names that one garment gets under different light (cream ≈ white, sky ≈ blue). `light` joins pale shades across families. */
+const COLOUR_FAMILIES: [string, RegExp][] = [
+  ['white', /біл|молочн|кремов|вершков|екрю|айвор|white|cream|ivory|ecru|milk|off[\s-]?white/],
+  ['blue', /син|блакитн|голуб|індиго|navy|blue|indigo|sky|cobalt|azure/],
+  ['brown', /коричнев|бежев|пісочн|кемел|тауп|шоколад|горіхов|brown|beige|sand|camel|taupe|tan\b|chocolate|cognac|коньячн/],
+  ['black', /чорн|black/],
+  ['grey', /сір|графіт|антрацит|grey|gray|charcoal|graphite|anthracite/],
+  ['green', /зелен|оливк|оливков|хакі|olive|green|khaki|sage/],
+  ['red', /червон|рожев|бордов|бордо|малинов|red|pink|burgundy|wine|rose/],
+  ['yellow', /жовт|помаранч|гірчичн|yellow|orange|mustard/],
+  ['light', /світл|блід|молочн|кремов|вершков|екрю|айвор|блакитн|голуб|бежев|пісочн|light|pale|sky|cream|ivory|ecru|beige|sand/],
+];
+export function colourFamilies(text: string) {
+  const t = text.toLowerCase();
+  return new Set(COLOUR_FAMILIES.filter(([, re]) => re.test(t)).map(([family]) => family));
+}
+const familyScore = (a: Set<string>, b: Set<string>) => [...a].reduce((n, f) => n + (b.has(f) ? (f === 'light' ? 1 : 3) : 0), 0);
+
+/** A garment a contact sheet should check: not named yet, or named by text as a confirmed item the picture must confirm. */
+export const needsVisualCheck = (db: DB, garment: IntakeReply['garments'][number]) =>
+  !garment.duplicateOf || db.items.find((i) => i.id === garment.duplicateOf)?.status === 'confirmed';
+
+/**
+ * Likely references per category of the garments still to check, best first: colour family, shared word stems,
+ * confirmed items on ties. A text-named confirmed item leads its category. Vision still decides the match.
+ */
+export function intakeComparisonGroups(db: DB, garments: IntakeReply['garments']): Map<string, Item[]> {
+  const checked = garments.filter((g) => needsVisualCheck(db, g));
+  const named = new Set(checked.map((g) => g.duplicateOf).filter(Boolean));
+  const groups = new Map<string, Item[]>();
+  for (const category of new Set(checked.map((g) => g.category))) {
+    const wanted = checked.filter((g) => g.category === category).map((g) => ({
+      title: garmentWords(`${g.title} ${g.notes ?? ''}`),
+      colour: garmentWords(g.color),
+      families: colourFamilies(`${g.color} ${g.title}`),
+    }));
+    const lead = ownedItems(db).filter((item) => item.category === category && named.has(item.id));
+    const ranked = ownedItems(db).filter((item) => item.category === category && !named.has(item.id)).map((item) => {
+      const title = garmentWords([item.title, item.brand, item.model].filter(Boolean).join(' '));
+      const colour = garmentWords(item.color ?? '');
+      const families = colourFamilies(`${item.color ?? ''} ${item.title}`);
+      const score = Math.max(...wanted.map((g) => familyScore(families, g.families) + 2 * sharedWords(title, g.title) + sharedWords(colour, g.colour)));
+      return { item, score };
+    }).sort((a, b) => b.score - a.score || Number(b.item.status === 'confirmed') - Number(a.item.status === 'confirmed')).map(({ item }) => item);
+    groups.set(category, [...lead, ...ranked]);
+  }
+  return groups;
+}
+
+/** Every likely reference, category by category (see intakeComparisonGroups). */
 export function intakeComparisonCandidates(db: DB, garments: IntakeReply['garments']) {
-  const named = new Set(garments.map((garment) => garment.duplicateOf).filter(Boolean));
-  const unresolved = garments.filter((garment) => !garment.duplicateOf).map((garment) => ({
-    category: garment.category,
-    title: garmentWords(garment.title),
-    colour: garmentWords(garment.color),
-  }));
-  return ownedItems(db).flatMap((item) => {
-    if (named.has(item.id)) return [];
-    const matches = unresolved.filter(({ category }) => category === item.category);
-    if (!matches.length) return [];
-    const title = garmentWords([item.title, item.brand, item.model].filter(Boolean).join(' '));
-    const colour = garmentWords(item.color ?? '');
-    const score = Math.max(...matches.map((garment) => 2 * sharedWords(title, garment.title) + sharedWords(colour, garment.colour)));
-    return [{ item, score }];
-  }).sort((a, b) => b.score - a.score).map(({ item }) => item);
+  return [...intakeComparisonGroups(db, garments).values()].flat();
 }
 
 export const ANALYZE_SCHEMA = {
@@ -136,7 +186,7 @@ export function ownedItems(db: DB) {
 }
 
 const openNeedLines = (db: DB) =>
-  db.needs.filter((n) => n.status === 'open').map((n) => `${n.id} | ${CATEGORY_UK[n.category]} | ${n.title} | ${n.description}`).join('\n');
+  db.needs.filter((n) => n.status === 'open').map((n) => `${n.id} | ${CATEGORY_UK[n.category]} | ${n.title} | ${(n.description ?? '').replace(/\s+/g, ' ') || '—'} | ${(n.why ?? '').replace(/\s+/g, ' ') || '—'}`).join('\n');
 
 export function intakePrompt(db: DB, job: Job, photoNames: string[]) {
   const intent = job.intakeIntent ?? 'auto';
@@ -154,9 +204,10 @@ export function intakePrompt(db: DB, job: Job, photoNames: string[]) {
       'label: for photoType label, read the tag: brand, size, composition (as printed, keep original language) and itemId of the wardrobe item it most likely belongs to (empty string if unclear). For other photo types all label fields are empty strings.',
       'garments: for person_full_body, person_partial and garments_only list every distinct garment, pair of shoes and visible accessory of the main person or shown on its own (ignore other people, the phone, mirror and background). Only wearable items: clothing, shoes and fashion accessories (watch, glasses, cap/hat, belt, scarf, bag or backpack worn as part of the outfit). Never list shopping bags, phones, headphones/earbuds, keys or other objects. Skip anything barely visible that cannot be described reliably. For person_face, label and other: an empty array.',
       `For each: title in ${replyLanguage(db)} (short, descriptive: colour + type + visible brand only if the logo is clearly legible), category from the enum, colour in ${replyLanguage(db)}, notes in ${replyLanguage(db)} (visible construction, material look, uncertainty). Never guess sizes, exact models or composition.`,
+      'Colour under indoor and mirror light: correct for the white balance first (warm bulbs turn everything yellow, daylight through a window turns it blue). Compare the garment with things that are truly white nearby (walls, sockets, paper). Light blue / sky blue is NOT white: a shirt that reads pale blue against a white wall is light blue. Cream, ivory, milk and ecru are NOT pure white: a warm off-white tee is milk or cream. A fine blue-on-white pattern (pinstripe, micro-check, oxford weave) that reads light blue from a step away is named light blue, with the pattern in notes. Say «white» only for a clean, neutral white.',
       'Set sport to true for athletic, gym, cycling, swimming or running clothing or sports equipment; otherwise false.',
       'duplicateOf: check the existing wardrobe list before treating anything as new. Put a listed id (e.g. W-047) only when distinctive details visible here match that item\'s notes — hardware shape and colour (buckle, zip, buttons), texture, stitching, logo, pattern. The same type and colour alone is NOT enough: the owner may have several black belts, white tees or dark jackets. If the listed item is known only from a worn or mirror photo, or any visible detail differs, use an empty string — a new candidate the owner can merge is better than hiding a new item inside an old one.',
-      'coversNeed: the shopping list below holds things the owner was advised to buy. If this garment is the owner\'s own piece (worn, on a hanger, on the floor or laid flat — not a shop listing or screenshot) and it is what one of those entries asks for — same category, same garment type, same colour family — put that need id (e.g. N-10); a small logo or minor detail difference is fine, a different colour or garment type is not. Otherwise an empty string. One garment covers at most one need.',
+      'coversNeed: the shopping list below holds things the owner was advised to buy (id | category | title | description | why). If this garment is a physical piece the owner has — worn, on a hanger, on the floor, laid flat, or newly bought with a store tag or label still attached — and it is what one of those entries asks for (same category, same garment type, same colour family), put that need id (e.g. N-10); a small logo or minor detail difference is fine, a different colour or garment type is not. Skip only web-store screenshots and catalogue listings. Otherwise an empty string. One garment covers at most one need.',
       '',
       'Existing wardrobe:',
       wardrobeLines(db, ownedItems(db)),
@@ -223,6 +274,7 @@ export function analyzePrompt(db: DB, job: Job, attached: string[]) {
     'You are the Capsula stylist running unattended. Build outfits ONLY from the owner\'s existing wardrobe listed below and answer with JSON only (schema enforced).',
     focusLine(db),
     `Profile notes: ${Object.values(db.profile.preferences).filter(Boolean).join(' ')}`,
+    fitPromptBlock(db),
     job.instructions ? `Request from the owner: ${job.instructions}` : 'Request: a balanced set of everyday outfits for the current season.',
     completeBlock,
     '',
@@ -253,7 +305,8 @@ export interface IntakeReply {
   baseSuitable?: boolean;
   baseIssues?: string;
   label?: { itemId: string; brand: string; size: string; composition: string };
-  garments: { title: string; category: string; color: string; notes: string; duplicateOf: string; coversNeed?: string; sport?: boolean }[];
+  /** duplicateConfidence: set by the visual check; `high` means the picture confirmed the same physical garment. */
+  garments: { title: string; category: string; color: string; notes: string; duplicateOf: string; coversNeed?: string; sport?: boolean; duplicateConfidence?: 'high' | 'possible' }[];
 }
 
 export interface IntakeOutcome {
@@ -272,7 +325,8 @@ export interface IntakeOutcome {
  * existing unconfirmed candidate when the model says it is the same item;
  * labels attach to the item and fill only empty brand/size/composition.
  * A garment that is an open shopping recommendation is reported in `covers`.
- * Confirmed duplicates remain untouched until reviewed. Labels may fill their missing facts.
+ * A confirmed item gets the photo only when the picture confirmed it (`high`); a text-only or possible match
+ * becomes a new candidate marked possibleDuplicateOf. Labels may fill their missing facts.
  */
 export function applyIntake(db: DB, job: Job, reply: IntakeReply): IntakeOutcome {
   const at = now();
@@ -345,7 +399,8 @@ export function applyIntake(db: DB, job: Job, reply: IntakeReply): IntakeOutcome
     const dup =
       (g.duplicateOf ? db.items.find((i) => i.id === g.duplicateOf && i.category === category && i.status !== 'inactive' && !i.mergedInto) : undefined) ??
       db.items.find((i) => i.category === category && i.status === 'needs_confirmation' && !i.mergedInto && norm(i.title) === norm(title));
-    if (dup && dup.status === 'needs_confirmation' && photo) {
+    // A visually confirmed duplicate (high) takes the photo even when confirmed; «В окрему річ» undoes it.
+    if (dup && photo && (dup.status === 'needs_confirmation' || g.duplicateConfidence === 'high')) {
       const attached = !dup.photoIds.includes(photo.id);
       const sportAdded = Boolean(g.sport) && !dup.sport;
       if (attached) dup.photoIds.push(photo.id);
@@ -353,7 +408,7 @@ export function applyIntake(db: DB, job: Job, reply: IntakeReply): IntakeOutcome
       if (attached || sportAdded) {
         dup.rev += 1;
         dup.updatedAt = at;
-        if (attached) dup.history.push({ at, action: 'photo_added', note: `Та сама річ на новому фото (${job.id})` });
+        if (attached) dup.history.push({ at, action: 'photo_added', note: `Та сама річ на новому фото (${job.id})${g.duplicateConfidence === 'high' ? ', підтверджено за фото' : ''}` });
       }
       out.attachedTo.push(dup.id);
       covers(g, dup);

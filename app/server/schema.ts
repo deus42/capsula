@@ -35,6 +35,20 @@ export type ReworkReason = (typeof REWORK_REASONS)[number];
 export const MEASURE_KEYS = ['height', 'chest', 'waist', 'hips', 'shoulders', 'sleeve', 'inseam', 'foot'] as const;
 export type MeasureKey = (typeof MEASURE_KEYS)[number];
 
+/** Garment cuts the profile can prefer or avoid; shop searches and styling follow them. */
+export const FIT_TYPES = ['slim', 'tapered', 'tailored', 'straight', 'regular', 'relaxed', 'oversized', 'skinny'] as const;
+export type FitType = (typeof FIT_TYPES)[number];
+
+/** Structured fit: cuts to look for and cuts never to buy; `auto` comes from the figure or the measurements, `owner` from Profile. */
+export interface FitProfile {
+  preferred: FitType[];
+  avoid: FitType[];
+  /** One neutral line on the tailoring proportions it was based on. */
+  bodySummary?: string;
+  source: 'auto' | 'owner';
+  updatedAt: string;
+}
+
 /** The nearest physical store of a shop found in «Покупки» (owner, 19.11). */
 export interface StorePlace {
   key: string;
@@ -100,6 +114,8 @@ export interface Photo {
   observation?: string;
   /** SHA-256 of the uploaded original. */
   sha256?: string;
+  /** 64-bit perceptual difference hash of the upright image (16 hex), for re-encoded duplicate uploads. */
+  dhash?: string;
   archivedAt?: string;
   baseCandidate?: { suitable: boolean; issues?: string };
   /** Owner's check against the base-photo standard; null = not checked. */
@@ -179,6 +195,8 @@ export interface Need {
   coveredByItem?: string;
   /** Looks whose stand-in was replaced by the owner's own item (restored if the cover is undone). */
   coveredLookIds?: string[];
+  /** Capsules whose set (pieces or base) took the owner's item in its place (restored if the cover is undone). */
+  coveredCapsuleIds?: string[];
   /** Generated concept image of the desired type. */
   conceptPhotoId?: string;
   /** Advisor: this purchase replaces an owned item («замінить: …»). */
@@ -313,7 +331,7 @@ export interface SnapshotSlot {
 export interface Job {
   id: string;
   /** Missing kind means a try-on (records created before packshots). */
-  kind?: 'tryon' | 'packshot' | 'intake' | 'analyze' | 'shopsearch' | 'advise' | 'storefind' | 'discover' | 'wearreview' | 'identity_prep' | 'capsule_plan' | 'capsule_match';
+  kind?: 'tryon' | 'packshot' | 'intake' | 'analyze' | 'shopsearch' | 'advise' | 'storefind' | 'discover' | 'wearreview' | 'identity_prep' | 'capsule_plan' | 'capsule_match' | 'fit_analysis';
   lookId?: string;
   /** wearreview: the worn look whose real photos are read. */
   wearId?: string;
@@ -470,6 +488,8 @@ export interface Profile {
   hemisphere?: 'north' | 'south';
   /** Whether glasses/sunglasses may be used in looks and suggestions; unset/false keeps them out. */
   allowEyewear?: boolean;
+  /** «Крій» / «Уникати крою»: structured fit preferences enforced in shop searches and styling. */
+  fitProfile?: FitProfile;
 }
 
 export const LANGUAGES = ['uk', 'en'] as const;
@@ -621,6 +641,7 @@ export function validateDb(db: unknown): string | null {
     if (p.archivedAt !== undefined && typeof p.archivedAt !== 'string') return `Фото ${p.id}: некоректна дата архівування`;
     if (p.referenceRole && (p.referenceRole !== 'face' || p.source === 'generated' || p.inspiration)) return `Фото ${p.id}: референс обличчя повинен бути власним оригіналом`;
     if (p.kind === 'worn' && (p.source !== 'upload' || p.referenceRole || p.inspiration)) return `Фото ${p.id}: фото образу повинно бути власним завантаженням`;
+    if (p.dhash !== undefined && (typeof p.dhash !== 'string' || !/^[0-9a-f]{16}$/.test(p.dhash))) return `Фото ${p.id}: некоректний перцептивний хеш`;
   }
   const worn = new Set(d.photos.filter((p) => p.kind === 'worn').map((p) => p.id));
   if (d.wears !== undefined) {
@@ -656,6 +677,7 @@ export function validateDb(db: unknown): string | null {
     if (n.conceptPhotoId && !has('photos', n.conceptPhotoId)) return `Потреба ${n.id}: немає концепт-фото`;
     if (n.coveredByItem && !has('items', n.coveredByItem)) return `Потреба ${n.id}: немає речі, що її закриває`;
     for (const id of n.coveredLookIds ?? []) if (!has('looks', id)) return `Потреба ${n.id}: немає образу ${id}`;
+    if (n.coveredCapsuleIds !== undefined && (!Array.isArray(n.coveredCapsuleIds) || n.coveredCapsuleIds.some((id) => typeof id !== 'string' || !has('capsules', id)))) return `Потреба ${n.id}: немає капсули`;
   }
   for (const p of d.products) {
     if (!has('needs', p.needId)) return `Товар ${p.id}: немає потреби ${p.needId}`;
@@ -729,6 +751,15 @@ export function validateDb(db: unknown): string | null {
   if (d.profile.language !== undefined && !LANGUAGES.includes(d.profile.language)) return 'Профіль: невідома мова';
   if (d.profile.wardrobeFocus !== undefined && !WARDROBE_FOCUS.includes(d.profile.wardrobeFocus)) return 'Профіль: невідомий гардероб';
   if (d.profile.hemisphere !== undefined && d.profile.hemisphere !== 'north' && d.profile.hemisphere !== 'south') return 'Профіль: невідома півкуля';
+  if (d.profile.fitProfile !== undefined) {
+    const f = d.profile.fitProfile;
+    const valid = (list: unknown) => Array.isArray(list) && list.every((x) => FIT_TYPES.includes(x as FitType)) && new Set(list).size === list.length;
+    if (!f || typeof f !== 'object' || !valid(f.preferred) || !valid(f.avoid)) return 'Профіль: невідомий крій';
+    if (f.preferred.some((x) => f.avoid.includes(x))) return 'Профіль: крій не може бути водночас бажаним і небажаним';
+    if (f.source !== 'auto' && f.source !== 'owner') return 'Профіль: невідоме джерело крою';
+    if (f.bodySummary !== undefined && typeof f.bodySummary !== 'string') return 'Профіль: некоректний опис статури';
+    if (typeof f.updatedAt !== 'string' || !Number.isFinite(Date.parse(f.updatedAt))) return 'Профіль: некоректна дата крою';
+  }
   if (d.onboarding?.identityDraft) {
     const draft = d.onboarding.identityDraft;
     const fp = d.photos.find((p) => p.id === draft.sourcePhotoId);

@@ -97,7 +97,17 @@ export function useIntake(intent: 'garments' | 'person' | 'auto' = 'garments') {
         if (!files.length) return;
         setBusy(true);
         await act(async () => {
-          for (const f of files) await uploadFile(f, { kind: 'intake', intent, ...(files.length > 1 ? { batch: '1' } : {}) });
+          // Every photo of a batch is queued before the runner starts, so the burst ends with one advisor run.
+          let sent = 0;
+          try {
+            for (const [i, f] of files.entries()) {
+              await uploadFile(f, { kind: 'intake', intent, ...(files.length > 1 ? { batch: '1' } : {}), ...(i < files.length - 1 ? { run: '0' } : {}) });
+              sent += 1;
+            }
+          } finally {
+            // A failed upload partway: the photos already queued still get processed.
+            if (sent > 0 && sent < files.length) await api('POST', '/api/runner/run').catch(() => undefined);
+          }
         }, files.length > 1 ? t('Додано фото: {n}', { n: files.length }) : t('Фото додано'));
         setBusy(false);
         if (input.current) input.current.value = '';

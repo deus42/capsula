@@ -1,10 +1,15 @@
-import type { Capsule, Category, DB, Item, Job, Look, MeasureKey, Need, Period, Result, Season, SlotKey, SlotRef, Wear } from './api.ts';
+import type { Capsule, Category, DB, FitType, Item, Job, Look, MeasureKey, Need, Period, Result, Season, SlotKey, SlotRef, Wear } from './api.ts';
 import { hiddenLookIds, isCapsuleHidden } from './rating.ts';
 import { groupLookVariations } from './look-variation.ts';
 import { itemCoverOptions } from './item-images.ts';
 import { tooClose, withBuys } from './look-memory.ts';
 import { buysFitSet, capsulePieceRefs, combinationGains, fashionCapsules, inSavedSet } from './capsule-pieces.ts';
 import { LOOKS, currentLanguage, plural, t } from './i18n.ts';
+
+/** Garment cuts as shops name them (owner, 28.11): the same words in both languages. */
+export const FIT_LABEL: Record<FitType, string> = {
+  slim: 'Slim', tapered: 'Tapered', tailored: 'Tailored', straight: 'Straight', regular: 'Regular', relaxed: 'Relaxed', oversized: 'Oversized', skinny: 'Skinny',
+};
 
 export const CATEGORY_LABEL: Record<Category, string> = {
   outerwear: 'Верхній одяг',
@@ -185,7 +190,7 @@ export const lookBusy = (db: DB, lookId: string) => db.jobs.some((j) => (j.kind 
 export const lookJob = (db: DB, lookId: string, includeQueued = false) =>
   db.jobs.filter((j) => (j.kind ?? 'tryon') === 'tryon' && j.lookId === lookId && (j.state === 'running' || (includeQueued && j.state === 'queued'))).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
 
-const FALLBACK_SECONDS: Record<string, number> = { tryon: 140, packshot: 80, intake: 25, analyze: 60, shopsearch: 320, advise: 240, storefind: 240, discover: 120, wearreview: 60, identity_prep: 90, capsule_plan: 35, capsule_match: 45 };
+const FALLBACK_SECONDS: Record<string, number> = { tryon: 140, packshot: 80, intake: 25, analyze: 60, shopsearch: 320, advise: 240, storefind: 240, discover: 120, wearreview: 60, identity_prep: 90, capsule_plan: 35, capsule_match: 45, fit_analysis: 40 };
 
 /** How long a job of this kind usually takes here: the median of the last 20 finished ones (owner, 18.11). */
 export function expectedSeconds(db: DB, kind: Job['kind']) {

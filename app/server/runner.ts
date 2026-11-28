@@ -2,12 +2,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import type { DB, Job, SnapshotSlot } from './schema.ts';
+import type { DB, Item, Job, SnapshotSlot } from './schema.ts';
 import type { Store } from './store.ts';
 import { newId, now } from './store.ts';
 import { detectImageType, prewarm, resolveAllowed, thumbnail } from './media.ts';
-import { ANALYZE_SCHEMA, INTAKE_SCHEMA, VISUAL_DEDUP_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakeComparisonCandidates, intakePrompt, lookPieces, ownedItems, visualDedupPrompt, type IntakeReply } from './analysis.ts';
-import { coverNeed, queueMissingItemPackshots, queueNewLookRenders } from './routes.ts';
+import { ANALYZE_SCHEMA, INTAKE_SCHEMA, VISUAL_DEDUP_SCHEMA, analyzePrompt, applyAnalyze, applyIntake, intakeComparisonGroups, intakePrompt, lookPieces, needsVisualCheck, visualDedupPrompt, type IntakeReply } from './analysis.ts';
+import { coverNeed, queueChangedLookRenders, queueMissingItemPackshots, queueMissingNeedPackshots, queueNewLookRenders, resumeWaitingTryonsForRef, snapshotSlots } from './routes.ts';
+import { isEyewear } from '../src/lib.ts';
 import { DISCOVER_SCHEMA, applyDiscover, discoverPrompt } from './discover.ts';
 import { SHOP_SEARCH_SCHEMA, STORE_FIND_SCHEMA, applyShopSearch, applyStoreFind, fetchProductImage, queueStoreFind, shopSearchPrompt, storeFindPrompt } from './shop-search.ts';
 import { ADVISE_SCHEMA, adviceDue, advisePrompt, applyAdvice, itemsToRate, queueAdvice, seenRevs } from './advisor.ts';
@@ -17,9 +18,12 @@ import { apiImagePrompt, type OpenAIEngine } from './openai-engine.ts';
 import { WEAR_REVIEW_SCHEMA, applyWearReview, pinnedRender, wearPhotos, wearReviewPrompt } from './wear-review.ts';
 import { HEAD_BOUNDS_PROMPT, HEAD_BOUNDS_SCHEMA, applyIdentityDraft, buildPortraitPrompt, prepareBodyCrop } from './identity-prep.ts';
 import { CAPSULE_MATCH_SCHEMA, CAPSULE_PLAN_SCHEMA, applyCapsuleMatch, applyCapsulePlan, capsuleMatchPrompt, capsulePlanPrompt, matchableItems } from './onboarding.ts';
+import { FIT_ANALYSIS_SCHEMA, applyFitAnalysis, fitAnalysisPrompt, fitPhotoPath, fitPromptBlock, queueFitAnalysis, suggestFitFromMeasurements } from './fit.ts';
 
 const SLOT_LABEL: Record<string, string> = { top: 'Top', layer: 'Outer layer', bottom: 'Bottom', shoes: 'Shoes', accessories: 'Accessory' };
 const JOB_TIMEOUT_MS = 15 * 60 * 1000;
+/** Cells of one visual duplicate contact sheet. */
+const SHEET_CELLS = 9;
 const BUNDLED_CODEX = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex';
 
 /**
@@ -131,8 +135,45 @@ export function pickRefs(job: Job, isPackshot: boolean, resolve: (p: string) => 
   return { identity, garments };
 }
 
-export function buildPrompt(job: Job, resultFile: string, refs?: ImageRefs) {
-  if (job.kind === 'packshot') return buildPackshotPrompt(job, resultFile, refs);
+/** Every garment picture a frozen selection can use. */
+export const slotPhotoPaths = (slots: SnapshotSlot[]) => new Set(slots.flatMap((s) => [...s.photoPaths, ...(s.originalPhotoPaths ?? [])]));
+
+/**
+ * The current look's selection when it now has garment pictures the attempt did not start with (a concept packshot
+ * or shop photo finished meanwhile), else null. It only grows, so an attempt is re-queued at most once per new picture.
+ */
+export function fullerSnapshot(db: DB, job: Job, startedWith: Set<string>): SnapshotSlot[] | null {
+  const look = db.looks.find((l) => l.id === job.lookId);
+  if (!look || look.version !== job.lookVersion) return null;
+  let fresh: SnapshotSlot[];
+  try {
+    fresh = snapshotSlots(db, look.slots);
+  } catch {
+    return null;
+  }
+  if (job.snapshot.identity?.noGlasses) fresh = fresh.filter((slot) => !isEyewear(slot.title));
+  const paths = slotPhotoPaths(fresh);
+  return paths.size > startedWith.size && [...paths].some((p) => !startedWith.has(p)) ? fresh : null;
+}
+
+/**
+ * One advisor run per burst of uploads: queued when the burst's last intake ends — done, failed or waiting — and
+ * only when an intake since the last advisor run changed the wardrobe (created or attached an item; a covered
+ * purchase always comes with one). A burst that changed nothing spends no advisor run.
+ */
+export function finishIntakeBurst(db: DB, job: Job): Job | null {
+  if (job.kind !== 'intake') return null;
+  if (db.jobs.some((x) => x.kind === 'intake' && x.id !== job.id && (x.state === 'queued' || x.state === 'running'))) return null;
+  const lastAdvice = db.jobs.filter((x) => x.kind === 'advise').map((x) => x.createdAt).sort().at(-1) ?? '';
+  const burst = db.jobs.filter((x) => x.kind === 'intake' && x.state === 'done' && (x.finishedAt ?? '') > lastAdvice && (x.createdItemIds?.length || x.attachedItemIds?.length));
+  if (!burst.length) return null;
+  const created = burst.reduce((n, x) => n + (x.createdItemIds?.length ?? 0), 0);
+  return queueAdvice(db, `Нові речі з фото: ${created}`);
+}
+
+/** `fit`: the profile's fit rule (fitPromptBlock), applied to pieces still to buy. */
+export function buildPrompt(job: Job, resultFile: string, refs?: ImageRefs, fit = '') {
+  if (job.kind === 'packshot') return buildPackshotPrompt(job, resultFile, refs, fit);
   const pinned = job.snapshot.identity;
   const framing = job.snapshot.slots.some((slot) => slot.slot === 'shoes')
     ? 'full length from head to shoes with balanced ~8% white margin above the head and below the shoes'
@@ -166,6 +207,7 @@ export function buildPrompt(job: Job, resultFile: string, refs?: ImageRefs) {
     `Outfit "${job.snapshot.lookName}" — exactly these pieces, nothing else visible:`,
     'Garment photographs take precedence over descriptions for visible colour, cut, panel and stripe placement, closures and details. If any garment photo was taken in a mirror, orient chest logos, pockets, plackets and lettering naturally as worn in real life, never horizontally mirrored. Wear garments naturally for the style (e.g. casual polos and tees untucked unless a belt or tuck fits a tailored look; outer layers neatly framed so inner pieces remain visible).',
     outfit || '- (no pieces listed)',
+    fit && job.snapshot.slots.some((s) => !s.owned && s.slot !== 'shoes' && s.slot !== 'accessories') ? `Proposed (to buy) garments follow the person's cut. ${fit}` : '',
     '',
     job.instructions ? `Owner instructions: ${job.instructions}` : '',
     'Do not make them younger, slimmer, taller or more muscular; no beauty retouching or face replacement. Calm, quality, minimal branding; natural fabric drape.',
@@ -184,7 +226,7 @@ const PACKSHOT_SHAPE: Record<SnapshotSlot['slot'], string> = {
   accessories: 'Show the original accessory in a natural display position with enough angle and light to show its shape, thickness and hardware.',
 };
 
-export function buildPackshotPrompt(job: Job, resultFile: string, refs?: ImageRefs) {
+export function buildPackshotPrompt(job: Job, resultFile: string, refs?: ImageRefs, fit = '') {
   const s = job.snapshot.slots[0];
   const fromPhotos = s.photoPaths.length > 0;
   const references = [...(refs?.garments ?? []), ...(refs?.packshotStyle ? [refs.packshotStyle] : [])];
@@ -197,6 +239,8 @@ export function buildPackshotPrompt(job: Job, resultFile: string, refs?: ImageRe
     fromPhotos
       ? `The first ${refs?.garments.length ?? s.photoPaths.length} images are the item sources, whether worn, held, hung or laid flat. Find the named item and isolate it from the person, other clothing, phone, hanger and background. Preserve its colour, cut, fabric texture, seams, closures and visible logo placement. Reconstruct hidden parts conservatively and do not invent branding.`
       : 'No photo exists: render a plain, unbranded, high-quality example of this garment type exactly as described.',
+    fromPhotos ? 'Colour comes from the source photo pixels, not from the title or notes: when the text says white but the garment reads light blue, sky blue, cream, ivory or milk in the photo, keep that exact shade. Correct only an obvious warm or cool lighting cast; never bleach a pale blue or cream garment to pure white.' : '',
+    !fromPhotos && fit && s.slot !== 'shoes' && s.slot !== 'accessories' ? `Cut: ${fit}` : '',
     refs?.packshotStyle ? 'The LAST image is a studio style reference only. Follow its three-dimensional presentation, framing and lighting. Do not copy any part of its garment, including colour, collar, closure, logo or cut.' : '',
     job.instructions ? `Owner instructions: ${job.instructions}` : '',
     `Required shape: ${PACKSHOT_SHAPE[s.slot]}`,
@@ -340,48 +384,75 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     return reply;
   }
 
-  async function matchIntakeGarments(db: DB, jobDir: string, upload: string, garments: IntakeReply['garments']) {
-    if (!upload || !fs.existsSync(upload)) return;
-    const candidates = intakeComparisonCandidates(db, garments);
-
-    const selected: { item: (typeof candidates)[number]; file: string }[] = [];
-    for (const item of candidates) {
-      for (const id of [item.packshotId, ...item.photoIds]) {
-        const photo = db.photos.find((p) => p.id === id);
-        if (!photo || photo.archivedAt || photo.kind === 'worn' || photo.kind === 'label' || photo.referenceRole || photo.inspiration) continue;
-        try {
-          const file = resolveAllowed(projectRoot, store.dataDir, photo.path);
-          if (!fs.existsSync(file)) continue;
-          selected.push({ item, file });
-          break;
-        } catch {
-          // An unavailable source does not rule out the item's other photos.
-        }
+  /** The first readable catalogue picture or own photo of an item for the contact sheet. */
+  function sheetFile(db: DB, item: Item): string | undefined {
+    for (const id of [item.packshotId, ...item.photoIds]) {
+      const photo = db.photos.find((p) => p.id === id);
+      if (!photo || photo.archivedAt || photo.kind === 'worn' || photo.kind === 'label' || photo.referenceRole || photo.inspiration) continue;
+      try {
+        const file = resolveAllowed(projectRoot, store.dataDir, photo.path);
+        if (fs.existsSync(file)) return file;
+      } catch {
+        // An unavailable source does not rule out the item's other photos.
       }
-      if (selected.length === 6) break;
     }
-    if (!selected.length) return;
+    return undefined;
+  }
 
-    const sheet = path.join(jobDir, 'visual-dedup.png');
-    try {
-      await buildContactSheet(jobDir, selected.map(({ file }) => file), sheet);
-      const request = { prompt: visualDedupPrompt(garments, selected.map(({ item }) => item)), schema: VISUAL_DEDUP_SCHEMA, images: [upload, sheet] };
-      const answer = opts.engine
-        ? (await opts.engine.json({ ...request, logFile: path.join(jobDir, 'visual-dedup.log') })).reply
-        : await codexJson(jobDir, db.settings, 'visual-dedup', request);
-      if (!Array.isArray(answer?.matches)) return;
-      for (const confidence of ['high', 'possible']) {
-        for (const match of answer.matches) {
-          if (match?.confidence !== confidence || !Number.isInteger(match.garmentIndex)) continue;
-          const garment = garments[match.garmentIndex];
-          if (!garment || garment.duplicateOf || !selected.some(({ item }) => item.id === match.itemId && item.category === garment.category)) continue;
-          garment.duplicateOf = match.itemId;
-        }
+  /**
+   * The visual duplicate check: up to SHEET_CELLS likely items per category of the garments still to check (a
+   * text match on a confirmed item included, so the picture can confirm it). One sheet when they all fit,
+   * otherwise one per category so no category crowds out another. Reads the wardrobe as it is now.
+   */
+  async function matchIntakeGarments(jobDir: string, settings: DB['settings'], upload: string, garments: IntakeReply['garments']) {
+    if (!upload || !fs.existsSync(upload)) return;
+    const db = store.read();
+    const picked = new Map<string, { item: Item; file: string }[]>();
+    for (const [category, items] of intakeComparisonGroups(db, garments)) {
+      const chosen: { item: Item; file: string }[] = [];
+      for (const item of items) {
+        const file = sheetFile(db, item);
+        if (file) chosen.push({ item, file });
+        if (chosen.length === SHEET_CELLS) break;
       }
-    } catch {
-      // The secondary visual check is optional. Keep the primary intake result.
-    } finally {
-      fs.rmSync(sheet, { force: true });
+      if (chosen.length) picked.set(category, chosen);
+    }
+    const total = [...picked.values()].reduce((n, list) => n + list.length, 0);
+    if (!total) return;
+    const sheets = total <= SHEET_CELLS ? [[...picked.keys()]] : [...picked.keys()].map((category) => [category]);
+    // One wardrobe item is confirmed (high) for at most one garment of the upload; a second one is only possible.
+    const claimed = new Set<string>();
+    for (const [n, categories] of sheets.entries()) {
+      const selected = categories.flatMap((category) => picked.get(category)!);
+      const eligible = new Set(garments.flatMap((g, index) => categories.includes(g.category) && needsVisualCheck(db, g) && !g.duplicateConfidence ? [index] : []));
+      if (!eligible.size) continue;
+      const name = sheets.length > 1 ? `visual-dedup-${n + 1}` : 'visual-dedup';
+      const sheet = path.join(jobDir, `${name}.png`);
+      try {
+        await buildContactSheet(jobDir, selected.map(({ file }) => file), sheet);
+        const request = { prompt: visualDedupPrompt(garments, selected.map(({ item }) => item), (_g, index) => eligible.has(index)), schema: VISUAL_DEDUP_SCHEMA, images: [upload, sheet] };
+        const answer = opts.engine
+          ? (await opts.engine.json({ ...request, logFile: path.join(jobDir, `${name}.log`) })).reply
+          : await codexJson(jobDir, settings, name, request);
+        if (!Array.isArray(answer?.matches)) continue;
+        for (const confidence of ['high', 'possible'] as const) {
+          for (const match of answer.matches) {
+            if (match?.confidence !== confidence || !Number.isInteger(match.garmentIndex) || !eligible.has(match.garmentIndex)) continue;
+            const garment = garments[match.garmentIndex];
+            if (!garment || garment.duplicateConfidence || !selected.some(({ item }) => item.id === match.itemId && item.category === garment.category)) continue;
+            const level = confidence === 'high' && claimed.has(match.itemId) ? 'possible' : confidence;
+            // Only a confident picture overrules the text pass's own pick.
+            if (garment.duplicateOf && garment.duplicateOf !== match.itemId && level !== 'high') continue;
+            garment.duplicateOf = match.itemId;
+            garment.duplicateConfidence = level;
+            if (level === 'high') claimed.add(match.itemId);
+          }
+        }
+      } catch {
+        // The secondary visual check is optional. Keep the primary intake result.
+      } finally {
+        fs.rmSync(sheet, { force: true });
+      }
     }
   }
 
@@ -420,6 +491,31 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     } else if (job.kind === 'discover') {
       prompt = discoverPrompt(db0, job);
       schema = DISCOVER_SCHEMA;
+    } else if (job.kind === 'fit_analysis') {
+      // The figure only: the photo frozen at queue time (draft or pinned body crop, else a full-length base photo).
+      const rel = job.snapshot.basePhotoPaths[0] ?? fitPhotoPath(db0);
+      let file: string | undefined;
+      try {
+        file = rel ? resolveAllowed(projectRoot, store.dataDir, rel) : undefined;
+      } catch {
+        file = undefined;
+      }
+      if (!file || !fs.existsSync(file)) {
+        // Without a readable figure the measurements decide, before the job is called an error.
+        const fallback = suggestFitFromMeasurements(db0.profile);
+        if (!fallback) throw Error('Немає фото на повний зріст для визначення крою');
+        await store.mutate((db) => {
+          const j = db.jobs.find((x) => x.id === jobId);
+          if (!j || (j.state !== 'queued' && j.state !== 'running')) return;
+          j.state = 'done';
+          j.finishedAt = now();
+          j.stateNote = applyFitAnalysis(db, fallback, j);
+        });
+        return;
+      }
+      images.push(file);
+      prompt = fitAnalysisPrompt(db0);
+      schema = FIT_ANALYSIS_SCHEMA;
     } else if (job.kind === 'capsule_plan') {
       prompt = capsulePlanPrompt(db0, job);
       schema = CAPSULE_PLAN_SCHEMA;
@@ -515,17 +611,20 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     ];
     const started = await store.mutate((db) => {
       const j = db.jobs.find((x) => x.id === jobId)!;
-      if (deferArchivedIntake(db, j)) return false;
+      if (deferArchivedIntake(db, j)) {
+        finishIntakeBurst(db, j);
+        return false;
+      }
       j.state = 'running';
       j.startedAt = now();
-      j.stateNote = job.kind === 'intake' ? (job.intakeIntent === 'person' ? 'Перевіряю фото для примірок…' : 'Розпізнаю речі на фото…') : job.kind === 'shopsearch' ? 'Шукаю варіанти в магазинах…' : job.kind === 'storefind' ? 'Шукаю найближчі магазини…' : job.kind === 'discover' ? 'Шукаю нові образи…' : job.kind === 'capsule_plan' ? 'Підбираю капсули за запитом…' : job.kind === 'capsule_match' ? 'Розкладаю гардероб по капсулах…' : job.kind === 'advise' ? 'Порадник оцінює гардероб…' : job.kind === 'wearreview' ? 'Стиліст дивиться фото образу…' : 'Складаю образи з твоїх речей…';
+      j.stateNote = job.kind === 'intake' ? (job.intakeIntent === 'person' ? 'Перевіряю фото для примірок…' : 'Розпізнаю речі на фото…') : job.kind === 'shopsearch' ? 'Шукаю варіанти в магазинах…' : job.kind === 'storefind' ? 'Шукаю найближчі магазини…' : job.kind === 'discover' ? 'Шукаю нові образи…' : job.kind === 'capsule_plan' ? 'Підбираю капсули за запитом…' : job.kind === 'capsule_match' ? 'Розкладаю гардероб по капсулах…' : job.kind === 'advise' ? 'Порадник оцінює гардероб…' : job.kind === 'fit_analysis' ? 'Визначаю крій по фігурі…' : job.kind === 'wearreview' ? 'Стиліст дивиться фото образу…' : 'Складаю образи з твоїх речей…';
       j.logPath = path.relative(projectRoot, logFile);
       return true;
     });
     if (!started) return;
     let exit: { code: number | null; err?: string };
     let reply: Record<string, unknown> | null = null;
-    let productImages: { productId: string; url: string }[] = [];
+    let productImages: { productId: string; url: string; productUrl?: string }[] = [];
     if (opts.engine) {
       // OpenAI API (accounts mode): the same schema, images attached, web search for the shop searches.
       const out = await opts.engine.json({ prompt, schema, images, webSearch: job.kind === 'shopsearch' || job.kind === 'storefind', logFile });
@@ -539,22 +638,26 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         reply = null;
       }
     }
+    // The confidence of a duplicate comes only from the visual check below, never from the text reply.
+    if (job.kind === 'intake' && reply && Array.isArray(reply.garments)) for (const g of reply.garments as IntakeReply['garments']) if (g && typeof g === 'object') delete g.duplicateConfidence;
     if (job.kind === 'intake' && job.intakeIntent !== 'person' && reply && reply.status !== 'error'
       && reply.photoType !== 'person_face' && reply.photoType !== 'label' && Array.isArray(reply.garments) && reply.garments.length) {
-      await matchIntakeGarments(db0, jobDir, images[0], reply.garments);
+      await matchIntakeGarments(jobDir, settings, images[0], reply.garments);
     }
     await store.mutate((db) => {
       const j = db.jobs.find((x) => x.id === jobId)!;
-      if (deferArchivedIntake(db, j)) return;
+      if (deferArchivedIntake(db, j)) return void finishIntakeBurst(db, j);
       j.finishedAt = now();
       if (!reply) {
         j.state = 'error';
         j.stateNote = exit.err || `Codex не повернув відповідь (код ${String(exit.code)}) — див. журнал`;
+        finishIntakeBurst(db, j);
         return;
       }
       if (reply.status === 'error') {
         j.state = 'error';
         j.stateNote = String(reply.reason || 'Codex не зміг виконати аналіз');
+        finishIntakeBurst(db, j);
         return;
       }
       if (j.kind === 'wearreview') {
@@ -564,9 +667,28 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         return;
       }
       if (j.kind === 'advise') {
-        j.state = 'done';
-        j.stateNote = applyAdvice(db, j, reply as never, adviseRevs.get(jobId));
+        const out = applyAdvice(db, j, reply as never, adviseRevs.get(jobId));
         adviseRevs.delete(jobId);
+        // Owned pieces that already are an open purchase close it; changed looks get try-ons, new purchases a picture.
+        const changed = [...out.modifiedLookIds];
+        let closed = 0;
+        for (const c of out.covered) {
+          try {
+            changed.push(...coverNeed(db, c.needId, c.itemId, false).looks);
+            closed += 1;
+          } catch {
+            /* a stale or mismatched cover only leaves the recommendation open */
+          }
+        }
+        queueChangedLookRenders(db, changed, opts.autoTryOn);
+        queueMissingNeedPackshots(db, out.createdNeedIds);
+        j.state = 'done';
+        j.stateNote = [out.note, closed ? `закрито покупок: ${closed}` : ''].filter(Boolean).join(' · ');
+        return;
+      }
+      if (j.kind === 'fit_analysis') {
+        j.state = 'done';
+        j.stateNote = applyFitAnalysis(db, reply as never, j);
         return;
       }
       if (j.kind === 'discover') {
@@ -604,12 +726,13 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         // A label photo joins its item too, so the upload card links to it.
         j.attachedItemIds = [...new Set([...outcome.attachedTo, ...(outcome.labelFor ? [outcome.labelFor] : [])])];
         queueMissingItemPackshots(db, [...outcome.created, ...outcome.attachedTo]);
-        if (!j.batch && (outcome.created.length || outcome.covers.length)) queueAdvice(db, `Нові речі з фото: ${outcome.created.length}`);
+        // A known piece with a new real photo wakes the try-ons that waited for it.
+        for (const id of outcome.attachedTo) resumeWaitingTryonsForRef(db, 'item', id, opts.autoTryOn);
         // An upload that is an open recommendation leaves the shopping list and replaces the stand-in in looks and renders.
         const covered: string[] = [];
         for (const c of outcome.covers) {
           try {
-            const res = coverNeed(db, c.needId, c.itemId);
+            const res = coverNeed(db, c.needId, c.itemId, opts.autoTryOn);
             covered.push(`закриває покупку «${res.need.title}»${res.looks.length ? `, образів оновлено: ${res.looks.length}` : ''}`);
           } catch {
             /* a stale or mismatched cover only leaves the recommendation open */
@@ -617,6 +740,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         }
         j.state = 'done';
         j.stateNote = [outcome.note, ...covered].join(' · ');
+        finishIntakeBurst(db, j);
         return;
       }
       const capsuleId = applyAnalyze(db, j, reply as never);
@@ -635,15 +759,18 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     cleanupJobDir(jobDir);
     // Product photos come from the shops' pages; the server fetches them after the reply is saved.
     for (const img of productImages) {
-      const rel = await fetchProductImage(projectRoot, store.dataDir, img.productId, img.url);
+      const rel = await fetchProductImage(projectRoot, store.dataDir, img.productId, img.url, img.productUrl);
       if (!rel) continue;
-      await store.mutate((db) => {
+      const woke = await store.mutate((db) => {
         const p = db.products.find((x) => x.id === img.productId);
-        if (!p || p.photoId) return;
-        const photo = { id: newId('P'), kind: 'product' as const, path: rel, originalName: path.basename(rel), source: 'generated' as const, note: `Фото з ${new URL(img.url).hostname}`, createdAt: now() };
+        if (!p || p.photoId) return 0;
+        const photo = { id: newId('P'), kind: 'product' as const, path: rel, originalName: path.basename(rel), source: 'generated' as const, note: `Фото з ${new URL(img.url || img.productUrl!).hostname}`, createdAt: now() };
         db.photos.push(photo);
         p.photoId = photo.id;
+        // Try-ons waiting for a picture of this purchase can start with the shop photo.
+        return resumeWaitingTryonsForRef(db, 'need', p.needId, opts.autoTryOn).length + resumeWaitingTryonsForRef(db, 'product', p.id, opts.autoTryOn).length;
       });
+      if (woke) nudge();
     }
   }
 
@@ -740,6 +867,8 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
       applyIdentityDraft(db, j, { faceRel, bodyRel, projectRoot, dataDir: store.dataDir, notes: reply.notes });
       j.state = 'done';
       j.stateNote = 'Опора готова — перевір «Це я?»';
+      // The new headless body crop shows the figure: its cut is read unless the owner chose the cuts.
+      if (db.profile.fitProfile?.source !== 'owner') queueFitAnalysis(db, true);
     });
     if (image) cleanupJobDir(jobDir);
   }
@@ -747,7 +876,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
   async function runOne(jobId: string) {
     const db0 = store.read();
     const job = db0.jobs.find((j) => j.id === jobId)!;
-    if (job.kind === 'intake' || job.kind === 'analyze' || job.kind === 'shopsearch' || job.kind === 'advise' || job.kind === 'storefind' || job.kind === 'discover' || job.kind === 'wearreview' || job.kind === 'capsule_plan' || job.kind === 'capsule_match') return runAnalysis(jobId);
+    if (job.kind === 'intake' || job.kind === 'analyze' || job.kind === 'shopsearch' || job.kind === 'advise' || job.kind === 'storefind' || job.kind === 'discover' || job.kind === 'wearreview' || job.kind === 'capsule_plan' || job.kind === 'capsule_match' || job.kind === 'fit_analysis') return runAnalysis(jobId);
     if (job.kind === 'identity_prep') return runIdentityPrep(jobId);
     const isPackshot = job.kind === 'packshot';
     if (!isPackshot && (db0.profile.identity?.disabledReason || job.snapshot.identity?.disabledReason)) throw Error(db0.profile.identity?.disabledReason || job.snapshot.identity!.disabledReason);
@@ -764,6 +893,8 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
     if (isPackshot) {
       refs = pickRefs(job, true, resolve);
     } else {
+      // The garment pictures this attempt starts with; a later one (packshot, shop photo) may arrive while it runs.
+      const startedWith = slotPhotoPaths(job.snapshot.slots);
       const identityJob = { ...job, snapshot: { ...job.snapshot, slots: [] } };
       verifyReferenceFiles(identityJob, resolve);
       const { identity } = pickRefs(identityJob, false, resolve);
@@ -784,6 +915,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
           : await codexJson(jobDir, settings, 'face-check', { prompt: FACE_CHECK_PROMPT, schema: FACE_CHECK_SCHEMA, images: files });
         return (reply?.faces as boolean[] | undefined) ?? files.map(() => true);
       };
+      let requeued = false;
       const prepared = await prepareGarmentCrops({ slots: job.snapshot.slots, projectRoot, mediaDir, jobDir, resolve, locate: (request) => locateGarments(jobDir, settings, request), faceCheck });
       const canRender = await store.mutate((db) => {
         const current = db.jobs.find((j) => j.id === jobId);
@@ -804,12 +936,25 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
           }
         });
         if (!prepared.missing.length && prepared.slots.length) return true;
+        // A picture that arrived while this attempt ran: start again with the fuller set instead of waiting.
+        const fresh = prepared.missing.length ? fullerSnapshot(db, current, startedWith) : null;
+        if (fresh) {
+          current.snapshot.slots = fresh;
+          current.state = 'queued';
+          delete current.startedAt;
+          current.stateNote = 'Нові фото речей — пробую ще раз';
+          requeued = true;
+          return false;
+        }
         current.state = 'needs_data';
         current.finishedAt = now();
         current.stateNote = prepared.missing.length ? `Потрібні окремі фото речей: ${[...new Set(prepared.missing)].join(', ')}.` : 'Додай речі до образу.';
         return false;
       });
-      if (!canRender) return;
+      if (!canRender) {
+        if (requeued) nudge();
+        return;
+      }
       job.snapshot.slots = prepared.slots;
       verifyReferenceFiles(job, resolve);
       const garmentCards = await fitGarmentCards(prepared.slots, MAX_IMAGE_REFS - identity.length, jobDir, path.join(mediaDir, 'garments.png'), resolve);
@@ -821,7 +966,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
       refs.packshotStyle = upperStyle;
     }
     const uniqueImages = [...refs.identity, ...refs.garments, ...(refs.packshotStyle ? [refs.packshotStyle] : [])];
-    const built = buildPrompt(job, resultFile, refs);
+    const built = buildPrompt(job, resultFile, refs, fitPromptBlock(db0));
     const prompt = shell || opts.engine ? built : collectedImagePrompt(built);
     fs.writeFileSync(path.join(jobDir, 'references.json'), JSON.stringify({ ...refs, contract: job.snapshot.identity }, null, 2));
     fs.writeFileSync(path.join(jobDir, 'prompt.txt'), prompt);
@@ -922,6 +1067,8 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
           need.conceptPhotoId = photo.id;
           need.rev += 1;
           need.updatedAt = now();
+          // Looks waiting for this purchase's picture can now be tried on.
+          resumeWaitingTryonsForRef(db, 'need', need.id, opts.autoTryOn);
         }
         j.state = 'done';
         j.stateNote = 'Packshot готовий';
@@ -968,6 +1115,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
             j.state = 'error';
             j.stateNote = (e as Error).message;
             j.finishedAt = now();
+            finishIntakeBurst(db, j);
           }
         })
         .catch(() => undefined);
@@ -1008,7 +1156,7 @@ export function createRunner(store: Store, projectRoot: string, codexBin = findC
         // What the owner starts by hand (photo intake, analyzer) goes first, then try-ons, then packshots.
         // Shop searches take minutes: they come after uploads and «Підібрати», one at a time, so a slot stays free.
         // The advisor is background text work: after try-ons, alongside packshots.
-        const batch = (k?: string) => (k === 'intake' || k === 'analyze' || k === 'discover' || k === 'wearreview' || k === 'identity_prep' || k === 'capsule_plan' || k === 'capsule_match' ? 0 : k === 'shopsearch' || k === 'storefind' ? 0.5 : k === 'packshot' || k === 'advise' ? 2 : 1);
+        const batch = (k?: string) => (k === 'intake' || k === 'analyze' || k === 'discover' || k === 'wearreview' || k === 'identity_prep' || k === 'capsule_plan' || k === 'capsule_match' || k === 'fit_analysis' ? 0 : k === 'shopsearch' || k === 'storefind' ? 0.5 : k === 'packshot' || k === 'advise' ? 2 : 1);
         const queued = db.jobs
           .filter((j) => j.state === 'queued' && !active.has(j.id) && (!opts.canStart || opts.canStart(j)))
           // Within try-ons the newest request goes first, so a picture the owner just asked for does not wait behind a batch.

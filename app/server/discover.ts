@@ -3,6 +3,7 @@
 // «Ні / Додати» (db.suggestions, source «search»); the pieces to buy become purchases only on «Додати».
 // Every candidate passes the look memory; text only, never pictures.
 import type { Category, DB, Job, SlotKey, Slots, Suggestion } from './schema.ts';
+import { fitPromptBlock } from './fit.ts';
 import { CATEGORIES, emptySlots } from './schema.ts';
 import { HttpError, newId, now } from './store.ts';
 import { focusLine, replyLanguage } from './person.ts';
@@ -102,6 +103,7 @@ export function discoverPrompt(db: DB, job: Job) {
     focusLine(db),
     eyewearBlocked(db) ? 'No eyewear of any kind.' : '',
     `Profile — comfort: ${prefs.comfort || '—'}; materials: ${prefs.materials || '—'}; fit: ${prefs.fit || '—'}; branding: ${prefs.branding || '—'}.`,
+    fitPromptBlock(db),
     job.instructions ? `The owner asks: ${job.instructions}` : `No request: start with the capsules of the current period and the ones with the fewest looks.`,
     required.length ? `Every look MUST contain these owned pieces: ${required.join(', ')}.` : '',
     required.length ? 'For picked pieces, use a weather period of their capsule. A capsule for another period is valid unless the owner explicitly asks for a particular period or weather.' : '',

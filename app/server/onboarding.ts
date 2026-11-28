@@ -2,6 +2,7 @@
 // - capsule_plan: proposes 2–4 distinct fashion capsules from the person's free-text request → human review → db.capsules
 // - capsule_match: matches confirmed wardrobe items + targeted gaps into closed sets → human review → capsule.pieces + db.needs
 import type { Capsule, CapsuleDraft, CapsuleMatchDraft, Category, DB, Job, Need, Period, Season, SlotRef } from './schema.ts';
+import { fitPromptBlock } from './fit.ts';
 import { CATEGORIES, PERIODS, SEASONS } from './schema.ts';
 import { HttpError, newId, now } from './store.ts';
 import { focusLine, replyLanguage } from './person.ts';
@@ -243,6 +244,7 @@ export function capsuleMatchPrompt(db: DB, job: Job, attached: string[]): string
     `You are the Capsula wardrobe architect worker running unattended. Answer with JSON only (schema enforced). Write all text in ${lang}.`,
     focusLine(db),
     `Profile preferences — comfort: ${prefs.comfort || '—'}; materials: ${prefs.materials || '—'}; fit: ${prefs.fit || '—'}; branding: ${prefs.branding || '—'}.`,
+    fitPromptBlock(db),
     '',
     'Task: match the person\'s existing wardrobe items onto their fashion capsules as COMPACT CLOSED SETS.',
     `Standard capsules hold up to ${CAPSULE_LIMITS.garments} garments (outerwear + knitwear + shirts + tees + dresses + trousers + shorts + skirts), ${CAPSULE_LIMITS.shoes} pairs of shoes, and ${CAPSULE_LIMITS.accessories} accessories. Multisport capsules may specify 4 accessories. Follow the limits shown per capsule below, counting ownedItemIds and missing purchases together.`,
@@ -352,11 +354,12 @@ export interface ApprovedSetInput {
 }
 
 /** Commits human-reviewed closed sets onto capsules and creates/reuses approved shopping Needs. */
-export function approveSets(db: DB, sets: ApprovedSetInput[]): { capsules: number; needsCreated: number } {
+export function approveSets(db: DB, sets: ApprovedSetInput[]): { capsules: number; needsCreated: number; needIds: string[] } {
   if (!Array.isArray(sets) || !sets.length) throw new HttpError(400, 'Немає наборів для затвердження');
   const at = now();
   let capsules = 0;
   let needsCreated = 0;
+  const needIds: string[] = [];
 
   for (const s of sets) {
     const capsule = db.capsules.find((c) => c.id === s.capsuleId);
@@ -395,6 +398,7 @@ export function approveSets(db: DB, sets: ApprovedSetInput[]): { capsules: numbe
         db.needs.push(need);
         needsCreated += 1;
       }
+      needIds.push(need.id);
       const ref: SlotRef = { kind: 'need', id: need.id };
       if (!seen.has(pieceKey(ref))) {
         seen.add(pieceKey(ref));
@@ -415,5 +419,5 @@ export function approveSets(db: DB, sets: ApprovedSetInput[]): { capsules: numbe
   delete db.onboarding.matchDrafts;
   delete db.onboarding.unmatchedItemIds;
   db.onboarding.step = Math.max(db.onboarding.step ?? 4, 5) as 1 | 2 | 3 | 4 | 5;
-  return { capsules, needsCreated };
+  return { capsules, needsCreated, needIds: [...new Set(needIds)] };
 }

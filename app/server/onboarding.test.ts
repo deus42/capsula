@@ -72,11 +72,18 @@ test('Step 1 (identity_prep): headless body crop + studio portrait stay in draft
   const portraitOut = await makePng(256, 320, '#f2f1ee');
   let headChecks = 0;
   let faceChecks = 0;
+  let fitChecks = 0;
   const engine = {
     label: 'gpt-text',
     imageLabel: 'gpt-image',
-    json: async (req: { prompt: string }) => {
+    json: async (req: { prompt: string; images: string[] }) => {
       if (req.prompt.includes('headBottom')) { headChecks++; return { reply: { hasPerson: true, headBottom: 0.2 } }; }
+      if (req.prompt.includes('tailoring worker')) {
+        fitChecks++;
+        assert.match(req.images[0], /media\/identity\/.*\/body\.png$/, 'the fit is read from the headless body crop only');
+        assert.match(req.prompt, /Never comment on weight/);
+        return { reply: { status: 'done', reason: '', preferred: ['slim', 'tapered'], avoid: ['regular', 'tapered'], bodySummary: 'Плечі ширші за стегна.' } };
+      }
       faceChecks++;
       return { reply: { faces: [false] } };
     },
@@ -101,6 +108,8 @@ test('Step 1 (identity_prep): headless body crop + studio portrait stay in draft
   assert.equal(db.jobs.find((j) => j.id === job.id)?.state, 'done', db.jobs.find((j) => j.id === job.id)?.stateNote ?? '');
   assert.equal(headChecks, 1, 'head location ran once');
   assert.equal(faceChecks, 1, 'headless face check ran once');
+  assert.equal(fitChecks, 1, 'the new body crop queued one figure-based fit analysis');
+  assert.deepEqual(db.profile.fitProfile && { ...db.profile.fitProfile, updatedAt: undefined }, { preferred: ['slim', 'tapered'], avoid: ['regular'], bodySummary: 'Плечі ширші за стегна.', source: 'auto', updatedAt: undefined }, 'preferred and avoided cuts stay disjoint');
   assert.equal(db.profile.identity, undefined, 'generated portrait never enters profile.identity before human approval');
   const draft = db.onboarding?.identityDraft;
   assert.ok(draft, 'candidate identity saved in onboarding.identityDraft');
@@ -243,7 +252,7 @@ test('Steps 2–4: capsule_plan → approve → batch intake & triage → capsul
   await createRunner(store, dir, '/usr/bin/false', { engine }).drain();
   db = store.read();
   assert.equal(db.items.length, 6);
-  assert.equal(db.jobs.some((j) => j.kind === 'advise'), false, 'batch=1 intake defers per-photo advise runs');
+  assert.equal(db.jobs.filter((j) => j.kind === 'advise').length, 1, 'a batch upload queues one advisor run after its last photo, not one per photo');
   assert.equal(db.items.every((i) => i.status === 'needs_confirmation'), true);
   assert.equal(db.items.every((i) => Boolean(i.packshotId)), true, 'every recognized item got a packshot');
 
@@ -275,6 +284,7 @@ test('Steps 2–4: capsule_plan → approve → batch intake & triage → capsul
   assert.equal(approvedSets.capsules, 2);
   assert.equal(approvedSets.needsCreated, 2);
   db = store.read();
+  assert.deepEqual(db.jobs.filter((j) => j.kind === 'packshot' && j.needId).map((j) => j.needId).sort(), approvedSets.needIds.slice().sort(), 'every approved set purchase gets its concept picture');
   assert.equal(validateDb(db), null);
   assert.equal(db.capsules[0].pieces?.length, 5, '4 owned + 1 missing need');
   assert.equal(db.capsules[0].base?.length, 2);

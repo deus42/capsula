@@ -6,7 +6,8 @@ import { useApp, useDb } from '../store.tsx';
 import { Badge, CategoryIcon, ConfirmButton, Empty, Img, JobBar, Modal, UploadButton } from '../components/ui.tsx';
 import { activeLocale, distinctLooks, fmtDay, itemArt, looksUsing, plainShopName, purchasePlan, purchaseRanking, shopLocation, shopStores, siteLooks, storeKey } from '../lib.ts';
 import { TermInfo } from './Glossary.tsx';
-import { t } from '../i18n.ts';
+import { combinationGains } from '../capsule-pieces.ts';
+import { plural, t } from '../i18n.ts';
 
 const STALE_DAYS = 14;
 
@@ -176,7 +177,7 @@ function ProductLine({ p, need, best, where }: { p: Product; need: Need; best: b
       <span className="pl-img">{photo ? <Img path={photo.path} w={160} /> : concept ? <Img path={concept.path} w={160} /> : <CategoryIcon category={need.category} size={18} />}</span>
       <span className="pl-main">
         {p.url ? <a className="pl-name" href={p.url} target="_blank" rel="noreferrer">{name}</a> : <b className="pl-name">{name}</b>}
-        <span className="pl-sub">{[shop, p.recommendedSize ? `${t('розмір')} ${p.recommendedSize}` : ''].filter(Boolean).join(' · ')}{p.recommendedSize && p.sizeBasis && <TermInfo texts={[]} notes={[{ title: t('Підстава розміру'), text: p.sizeBasis }]} />}</span>
+        <span className="pl-sub">{[shop, p.fit, p.recommendedSize ? `${t('розмір')} ${p.recommendedSize}` : ''].filter(Boolean).join(' · ')}{p.recommendedSize && p.sizeBasis && <TermInfo texts={[]} notes={[{ title: t('Підстава розміру'), text: p.sizeBasis }]} />}</span>
       </span>
       {where?.href
         ? <a className="pl-where" href={where.href} target="_blank" rel="noreferrer"><MapPin size={13} />{where.line}</a>
@@ -273,6 +274,8 @@ function CoverModal({ need, onClose }: { need: Need; onClose: () => void }) {
 }
 
 /** «пасує до 5 образів · завершує 2» (owner, 19.11): what the spend really gives; «завершує» only when it completes something (20.11). */
+/** «+12 поєднань»: the outfit combinations a set purchase adds to its capsules. */
+const GAIN = { one: '+{n} поєднання', few: '+{n} поєднання', many: '+{n} поєднань' };
 const planLine = (p: { fits: number; completes: number }) => `${t(p.fits === 1 ? 'пасує до {n} образу' : 'пасує до {n} образів', { n: p.fits })}${p.completes ? ` · ${t('завершує {n}', { n: p.completes })}` : ''}`;
 /** When one purchase is not enough: the rest of the smallest set and the look it makes wearable. */
 const planWith = (p: ReturnType<typeof purchasePlan>) => (p.with ? t('ще {others} — і готовий «{look}»', { others: p.with.others.join(', '), look: p.with.look.name }) : '');
@@ -286,6 +289,8 @@ function NeedCard({ need, top = false, places }: { need: Need; top?: boolean; pl
   // Found variants, best match first.
   const products = db.products.filter((p) => p.needId === need.id).sort((a, b) => (b.matchScore ?? -1) - (a.matchScore ?? -1));
   const plan = purchasePlan(db, need.id);
+  // A purchase of a capsule's set with no look yet still says what it unlocks.
+  const gain = need.status === 'open' ? combinationGains(db).get(need.id) ?? 0 : 0;
   const shopPhoto = products.map((p) => db.photos.find((x) => p.photoId && x.id === p.photoId)).find((x) => x !== undefined);
   const searches = db.jobs.filter((j) => j.kind === 'shopsearch' && j.needId === need.id);
   const waitJob = searches.find((j) => j.state === 'running') ?? searches.find((j) => j.state === 'queued');
@@ -338,6 +343,7 @@ function NeedCard({ need, top = false, places }: { need: Need; top?: boolean; pl
               {replaces && <span>{t('замінить')} <a href={`/wardrobe/${replaces.id}`}>{replaces.title}</a></span>}
               {covered && <span>{bought ? t('куплено') : t('своя річ')}: <a href={`/wardrobe/${covered.id}`}>{covered.title}</a></span>}
               {need.status === 'open' && plan.fits > 0 && <span>{planLine(plan)}</span>}
+              {need.status === 'open' && !looks.length && gain > 0 && <span>{plural(gain, GAIN)}</span>}
             </span>
             {need.status === 'open' && plan.with && <span className="need-line">{planWith(plan)}</span>}
             {looks.length > 0 && (
